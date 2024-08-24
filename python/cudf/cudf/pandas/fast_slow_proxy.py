@@ -11,6 +11,7 @@ import pickle
 import types
 import warnings
 from collections.abc import Iterator
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from enum import IntEnum
 from typing import Any, Callable, Literal, Mapping
 
@@ -870,6 +871,36 @@ def _assert_fast_slow_eq(left, right):
         assert_eq(left, right)
 
 
+def run_parallel_ops(fast_func, slow_func, *args, **kwargs):
+    from .module_accelerator import disable_module_accelerator
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        slow_future = executor.submit(
+            slow_func,
+            disable_module_accelerator,
+            fast_func,
+            *args[0],
+            **kwargs["slow"],
+        )
+        fast_future = executor.submit(fast_func, *args[1], **kwargs["fast"])
+
+        done, not_done = wait(
+            [slow_future, fast_future], return_when=FIRST_COMPLETED
+        )
+
+        result = done.pop().result()
+
+        for future in not_done:
+            future.cancel()
+
+        return result
+
+
+def execute_with_context(cm, func, *args, **kwargs):
+    with cm():
+        return func(*args, **kwargs)
+
+
 def _fast_slow_function_call(
     func: Callable,
     /,
@@ -884,6 +915,16 @@ def _fast_slow_function_call(
     Wrap the result in a fast-slow proxy if it is a type we know how
     to wrap.
     """
+    if _env_get_bool("CUDF_PANDAS_DUAL_MEMORY_MODE", False):
+        fast_args, fast_kwargs = _fast_arg(args), _fast_arg(kwargs)
+        slow_args, slow_kwargs = _slow_arg(args), _slow_arg(kwargs)
+        args = [slow_args, fast_args]
+        kwargs = {"slow": slow_kwargs, "fast": fast_kwargs}
+        result = run_parallel_ops(func, execute_with_context, *args, **kwargs)
+        fast = False
+        print(result, type(result))
+
+        return _maybe_wrap_result(result, func, *args, **kwargs), fast
     from .module_accelerator import disable_module_accelerator
 
     fast = False
