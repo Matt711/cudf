@@ -32,11 +32,13 @@ cdef extern from "cudf/interop.hpp" nogil:
 
 cdef extern from "cudf/interop.hpp" namespace "cudf" \
         nogil:
-    cdef unique_ptr[table] from_dlpack(const DLManagedTensor* tensor
-                                       ) except +
+    cdef unique_ptr[table] from_dlpack(
+        const DLManagedTensor* managed_tensor
+    ) except +
 
-    DLManagedTensor* to_dlpack(table_view input_table
-                               ) except +
+    DLManagedTensor* to_dlpack(
+        const table_view& input
+    ) except +
 
     cdef cppclass column_metadata:
         column_metadata() except +
@@ -70,8 +72,8 @@ cdef extern from *:
 
     ArrowArray* to_arrow_host_raw(
       cudf::table_view const& tbl,
-      rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-      rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource()) {
+      rmm::cuda_stream_view stream       = cudf::get_default_stream(),
+      rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref()) {
       // Assumes the sync event is null and the data is already on the host.
       ArrowArray *arr = new ArrowArray();
       auto device_arr = cudf::to_arrow_host(tbl, stream, mr);

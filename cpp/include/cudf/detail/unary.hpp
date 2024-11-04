@@ -20,10 +20,10 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/export.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
-#include <rmm/resource_ref.hpp>
 
 #include <thrust/transform.h>
 
@@ -59,7 +59,7 @@ std::unique_ptr<column> true_if(InputIterator begin,
   auto output_mutable_view = output->mutable_view();
   auto output_data         = output_mutable_view.data<bool>();
 
-  thrust::transform(rmm::exec_policy(stream), begin, end, output_data, p);
+  thrust::transform(rmm::exec_policy_nosync(stream), begin, end, output_data, p);
 
   return output;
 }

@@ -10,6 +10,7 @@ import pytest
 
 import cudf
 from cudf import Series
+from cudf.core._compat import PANDAS_CURRENT_SUPPORTED_VERSION, PANDAS_VERSION
 from cudf.core.dtypes import Decimal32Dtype, Decimal64Dtype, Decimal128Dtype
 from cudf.testing import _utils as utils, assert_eq
 from cudf.testing._utils import NUMERIC_TYPES, expect_warning_if, gen_rand
@@ -61,8 +62,7 @@ def test_sum_string():
 )
 @pytest.mark.parametrize("nelem", params_sizes)
 def test_sum_decimal(dtype, nelem):
-    np.random.seed(0)
-    data = [str(x) for x in gen_rand("int64", nelem) / 100]
+    data = [str(x) for x in gen_rand("int64", nelem, seed=0) / 100]
 
     expected = pd.Series([Decimal(x) for x in data]).sum()
     got = cudf.Series(data).astype(dtype).sum()
@@ -72,15 +72,13 @@ def test_sum_decimal(dtype, nelem):
 
 @pytest.mark.parametrize("dtype,nelem", params)
 def test_product(dtype, nelem):
-    np.random.seed(0)
+    rng = np.random.default_rng(seed=0)
     dtype = cudf.dtype(dtype).type
     if cudf.dtype(dtype).kind in {"u", "i"}:
         data = np.ones(nelem, dtype=dtype)
         # Set at most 30 items to [0..2) to keep the value within 2^32
         for _ in range(30):
-            data[np.random.randint(low=0, high=nelem, size=1)] = (
-                np.random.uniform() * 2
-            )
+            data[rng.integers(low=0, high=nelem, size=1)] = rng.uniform() * 2
     else:
         data = gen_rand(dtype, nelem)
 
@@ -103,7 +101,6 @@ def test_product(dtype, nelem):
     ],
 )
 def test_product_decimal(dtype):
-    np.random.seed(0)
     data = [str(x) for x in gen_rand("int8", 3) / 10]
 
     expected = pd.Series([Decimal(x) for x in data]).product()
@@ -152,7 +149,6 @@ def test_sum_of_squares(dtype, nelem):
     ],
 )
 def test_sum_of_squares_decimal(dtype):
-    np.random.seed(0)
     data = [str(x) for x in gen_rand("int8", 3) / 10]
 
     expected = pd.Series([Decimal(x) for x in data]).pow(2).sum()
@@ -185,7 +181,6 @@ def test_min(dtype, nelem):
 )
 @pytest.mark.parametrize("nelem", params_sizes)
 def test_min_decimal(dtype, nelem):
-    np.random.seed(0)
     data = [str(x) for x in gen_rand("int64", nelem) / 100]
 
     expected = pd.Series([Decimal(x) for x in data]).min()
@@ -218,7 +213,6 @@ def test_max(dtype, nelem):
 )
 @pytest.mark.parametrize("nelem", params_sizes)
 def test_max_decimal(dtype, nelem):
-    np.random.seed(0)
     data = [str(x) for x in gen_rand("int64", nelem) / 100]
 
     expected = pd.Series([Decimal(x) for x in data]).max()
@@ -255,7 +249,8 @@ def test_sum_boolean():
 
 
 def test_date_minmax():
-    np_data = np.random.normal(size=10**3)
+    rng = np.random.default_rng(seed=0)
+    np_data = rng.normal(size=10**3)
     gdf_data = Series(np_data)
 
     np_casted = np_data.astype("datetime64[ms]")
@@ -341,6 +336,10 @@ def test_any_all_axis_none(data, op):
         "mean",
         "median",
     ],
+)
+@pytest.mark.skipif(
+    PANDAS_VERSION < PANDAS_CURRENT_SUPPORTED_VERSION,
+    reason="Warning not given on older versions of pandas",
 )
 def test_reductions_axis_none_warning(op):
     df = cudf.DataFrame({"a": [1, 2, 3], "b": [10, 2, 3]})

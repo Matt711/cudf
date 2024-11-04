@@ -18,7 +18,6 @@
 #include <cudf/scalar/scalar_factories.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/resource_ref.hpp>
 
 namespace cudf {
 // Create a strings-type column from array of pointer/size pairs

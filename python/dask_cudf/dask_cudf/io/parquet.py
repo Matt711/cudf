@@ -23,7 +23,6 @@ from cudf.core.column import CategoricalColumn, as_column
 from cudf.io import write_to_dataset
 from cudf.io.parquet import _apply_post_filters, _normalize_filters
 from cudf.utils.dtypes import cudf_dtype_from_pa_type
-from cudf.utils.ioutils import _ROW_GROUP_SIZE_BYTES_DEFAULT
 
 
 class CudfEngine(ArrowDatasetEngine):
@@ -341,9 +340,7 @@ class CudfEngine(ArrowDatasetEngine):
                 return_metadata=return_metadata,
                 statistics=kwargs.get("statistics", "ROWGROUP"),
                 int96_timestamps=kwargs.get("int96_timestamps", False),
-                row_group_size_bytes=kwargs.get(
-                    "row_group_size_bytes", _ROW_GROUP_SIZE_BYTES_DEFAULT
-                ),
+                row_group_size_bytes=kwargs.get("row_group_size_bytes", None),
                 row_group_size_rows=kwargs.get("row_group_size_rows", None),
                 max_page_size_bytes=kwargs.get("max_page_size_bytes", None),
                 max_page_size_rows=kwargs.get("max_page_size_rows", None),
@@ -365,7 +362,7 @@ class CudfEngine(ArrowDatasetEngine):
                     statistics=kwargs.get("statistics", "ROWGROUP"),
                     int96_timestamps=kwargs.get("int96_timestamps", False),
                     row_group_size_bytes=kwargs.get(
-                        "row_group_size_bytes", _ROW_GROUP_SIZE_BYTES_DEFAULT
+                        "row_group_size_bytes", None
                     ),
                     row_group_size_rows=kwargs.get(
                         "row_group_size_rows", None
@@ -386,6 +383,12 @@ class CudfEngine(ArrowDatasetEngine):
             metadata_path = fs.sep.join([path, "_metadata"])
             _meta = []
             if append and fmd is not None:
+                # Convert to bytes: <https://github.com/rapidsai/cudf/issues/17177>
+                if isinstance(fmd, pq.FileMetaData):
+                    with BytesIO() as myio:
+                        fmd.write_metadata_file(myio)
+                        myio.seek(0)
+                        fmd = np.frombuffer(myio.read(), dtype="uint8")
                 _meta = [fmd]
             _meta.extend([parts[i][0]["meta"] for i in range(len(parts))])
             _meta = (

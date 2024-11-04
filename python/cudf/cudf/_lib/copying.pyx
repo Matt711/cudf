@@ -2,13 +2,13 @@
 
 import pickle
 
-from libc.stdint cimport uint8_t, uintptr_t
+from libc.stdint cimport uint8_t
 from libcpp cimport bool
-from libcpp.memory cimport make_shared, shared_ptr, unique_ptr
+from libcpp.memory cimport unique_ptr
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
 
-from rmm._lib.device_buffer cimport DeviceBuffer
+from rmm.pylibrmm.device_buffer cimport DeviceBuffer
 
 import pylibcudf
 
@@ -20,7 +20,6 @@ from cudf._lib.column cimport Column
 from cudf._lib.scalar import as_device_scalar
 
 from cudf._lib.scalar cimport DeviceScalar
-from cudf._lib.utils cimport table_view_from_table
 
 from cudf._lib.reduce import minmax
 from cudf.core.abc import Serializable
@@ -30,14 +29,11 @@ from libcpp.memory cimport make_unique
 cimport pylibcudf.libcudf.contiguous_split as cpp_contiguous_split
 from pylibcudf.libcudf.column.column cimport column
 from pylibcudf.libcudf.column.column_view cimport column_view
-from pylibcudf.libcudf.lists.gather cimport (
-    segmented_gather as cpp_segmented_gather,
-)
-from pylibcudf.libcudf.lists.lists_column_view cimport lists_column_view
 from pylibcudf.libcudf.scalar.scalar cimport scalar
 from pylibcudf.libcudf.types cimport size_type
 
 from cudf._lib.utils cimport columns_from_pylibcudf_table, data_from_table_view
+import pylibcudf as plc
 
 # workaround for https://github.com/cython/cython/issues/3885
 ctypedef const scalar constscalar
@@ -339,26 +335,6 @@ def get_element(Column input_column, size_type index):
     )
 
 
-@acquire_spill_lock()
-def segmented_gather(Column source_column, Column gather_map):
-    cdef shared_ptr[lists_column_view] source_LCV = (
-        make_shared[lists_column_view](source_column.view())
-    )
-    cdef shared_ptr[lists_column_view] gather_map_LCV = (
-        make_shared[lists_column_view](gather_map.view())
-    )
-    cdef unique_ptr[column] c_result
-
-    with nogil:
-        c_result = move(
-            cpp_segmented_gather(
-                source_LCV.get()[0], gather_map_LCV.get()[0])
-        )
-
-    result = Column.from_unique_ptr(move(c_result))
-    return result
-
-
 cdef class _CPackedColumns:
 
     @staticmethod
@@ -376,29 +352,34 @@ cdef class _CPackedColumns:
             or input_table.index.stop != len(input_table)
             or input_table.index.step != 1
         ):
-            input_table_view = table_view_from_table(input_table)
+            columns = input_table._index._columns + input_table._columns
             p.index_names = input_table._index_names
         else:
-            input_table_view = table_view_from_table(
-                input_table, ignore_index=True)
+            columns = input_table._columns
 
         p.column_names = input_table._column_names
         p.column_dtypes = {}
-        for name, col in input_table._data.items():
+        for name, col in input_table._column_labels_and_values:
             if isinstance(col.dtype, cudf.core.dtypes._BaseDtype):
                 p.column_dtypes[name] = col.dtype
 
-        p.c_obj = move(cpp_contiguous_split.pack(input_table_view))
+        p.c_obj = plc.contiguous_split.pack(
+            plc.Table(
+                [
+                    col.to_pylibcudf(mode="read") for col in columns
+                ]
+            )
+        )
 
         return p
 
     @property
     def gpu_data_ptr(self):
-        return int(<uintptr_t>self.c_obj.gpu_data.get()[0].data())
+        return self.c_obj.gpu_data_ptr
 
     @property
     def gpu_data_size(self):
-        return int(<size_t>self.c_obj.gpu_data.get()[0].size())
+        return self.c_obj.gpu_data_size
 
     def serialize(self):
         header = {}
@@ -416,10 +397,10 @@ cdef class _CPackedColumns:
 
         header["column-names"] = self.column_names
         header["index-names"] = self.index_names
-        if self.c_obj.metadata.get()[0].data() != NULL:
+        if self.c_obj.c_obj.get().metadata.get()[0].data() != NULL:
             header["metadata"] = list(
-                <uint8_t[:self.c_obj.metadata.get()[0].size()]>
-                self.c_obj.metadata.get()[0].data()
+                <uint8_t[:self.c_obj.c_obj.get().metadata.get()[0].size()]>
+                self.c_obj.c_obj.get().metadata.get()[0].data()
             )
 
         column_dtypes = {}
@@ -445,6 +426,10 @@ cdef class _CPackedColumns:
             size=gpu_data.nbytes
         )
 
+        # p.c_obj = plc.contiguous_split.PackedColumns(
+        #     dbuf,
+        #     <vector[uint8_t]>header.get("metadata", [])
+        # )
         cdef cpp_contiguous_split.packed_columns data
         data.metadata = move(
             make_unique[vector[uint8_t]](
@@ -452,8 +437,7 @@ cdef class _CPackedColumns:
             )
         )
         data.gpu_data = move(dbuf.c_obj)
-
-        p.c_obj = move(data)
+        p.c_obj.c_obj = make_unique[cpp_contiguous_split.packed_columns](move(data))
         p.column_names = header["column-names"]
         p.index_names = header["index-names"]
 
@@ -469,7 +453,7 @@ cdef class _CPackedColumns:
 
     def unpack(self):
         output_table = cudf.DataFrame._from_data(*data_from_table_view(
-            cpp_contiguous_split.unpack(self.c_obj),
+            plc.contiguous_split.unpack(self.c_obj).view(),
             self,
             self.column_names,
             self.index_names

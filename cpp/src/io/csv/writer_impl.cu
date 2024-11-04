@@ -27,6 +27,7 @@
 #include <cudf/detail/copy.hpp>
 #include <cudf/detail/fill.hpp>
 #include <cudf/detail/null_mask.hpp>
+#include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/io/data_sink.hpp>
 #include <cudf/io/detail/csv.hpp>
 #include <cudf/null_mask.hpp>
@@ -38,11 +39,10 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
-#include <rmm/mr/device/per_device_resource.hpp>
-#include <rmm/resource_ref.hpp>
 
 #include <thrust/execution_policy.h>
 #include <thrust/host_vector.h>
@@ -406,13 +406,8 @@ void write_chunked(data_sink* out_sink,
     out_sink->device_write(ptr_all_bytes, total_num_bytes, stream);
   } else {
     // copy the bytes to host to write them out
-    thrust::host_vector<char> h_bytes(total_num_bytes);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(h_bytes.data(),
-                                  ptr_all_bytes,
-                                  total_num_bytes * sizeof(char),
-                                  cudaMemcpyDefault,
-                                  stream.value()));
-    stream.synchronize();
+    auto const h_bytes = cudf::detail::make_host_vector_sync(
+      device_span<char const>{ptr_all_bytes, total_num_bytes}, stream);
 
     out_sink->host_write(h_bytes.data(), total_num_bytes);
   }
@@ -436,7 +431,7 @@ void write_csv(data_sink* out_sink,
   // (even for tables with no rows)
   //
   write_chunked_begin(
-    out_sink, table, user_column_names, options, stream, rmm::mr::get_current_device_resource());
+    out_sink, table, user_column_names, options, stream, cudf::get_current_device_resource_ref());
 
   if (table.num_rows() > 0) {
     // no need to check same-size columns constraint; auto-enforced by table_view
@@ -470,7 +465,7 @@ void write_csv(data_sink* out_sink,
 
     // convert each chunk to CSV:
     //
-    column_to_strings_fn converter{options, stream, rmm::mr::get_current_device_resource()};
+    column_to_strings_fn converter{options, stream, cudf::get_current_device_resource_ref()};
     for (auto&& sub_view : vector_views) {
       // Skip if the table has no rows
       if (sub_view.num_rows() == 0) continue;
@@ -505,13 +500,13 @@ void write_csv(data_sink* out_sink,
                                                     options_narep,
                                                     strings::separator_on_nulls::YES,
                                                     stream,
-                                                    rmm::mr::get_current_device_resource());
+                                                    cudf::get_current_device_resource_ref());
         return cudf::strings::detail::replace_nulls(
-          str_table_view.column(0), options_narep, stream, rmm::mr::get_current_device_resource());
+          str_table_view.column(0), options_narep, stream, cudf::get_current_device_resource_ref());
       }();
 
       write_chunked(
-        out_sink, str_concat_col->view(), options, stream, rmm::mr::get_current_device_resource());
+        out_sink, str_concat_col->view(), options, stream, cudf::get_current_device_resource_ref());
     }
   }
 }

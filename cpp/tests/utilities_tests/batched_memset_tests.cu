@@ -18,9 +18,10 @@
 #include <cudf_test/cudf_gtest.hpp>
 #include <cudf_test/type_lists.hpp>
 
+#include <cudf/detail/utilities/batched_memset.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
-#include <cudf/io/detail/batched_memset.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/device_uvector.hpp>
@@ -41,7 +42,7 @@ TEST(MultiBufferTestIntegral, BasicTest1)
 
   // Device init
   auto stream = cudf::get_default_stream();
-  auto mr     = rmm::mr::get_current_device_resource();
+  auto mr     = cudf::get_current_device_resource_ref();
 
   // Creating base vector for data and setting it to all 0xFF
   std::vector<std::vector<uint64_t>> expected;
@@ -77,7 +78,7 @@ TEST(MultiBufferTestIntegral, BasicTest1)
     });
 
   // Function Call
-  cudf::io::detail::batched_memset(memset_bufs, uint64_t{0}, stream);
+  cudf::detail::batched_memset(memset_bufs, uint64_t{0}, stream);
 
   // Set all buffer regions to 0 for expected comparison
   std::for_each(

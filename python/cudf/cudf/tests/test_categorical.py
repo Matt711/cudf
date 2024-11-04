@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 import cudf
+from cudf.core._compat import PANDAS_CURRENT_SUPPORTED_VERSION, PANDAS_VERSION
 from cudf.testing import assert_eq
 from cudf.testing._utils import NUMERIC_TYPES, assert_exceptions_equal
 
@@ -251,10 +252,10 @@ def test_cat_series_binop_error():
 @pytest.mark.parametrize("num_elements", [10, 100, 1000])
 def test_categorical_unique(num_elements):
     # create categorical series
-    np.random.seed(12)
+    rng = np.random.default_rng(seed=12)
     pd_cat = pd.Categorical(
         pd.Series(
-            np.random.choice(
+            rng.choice(
                 list(string.ascii_letters + string.digits), num_elements
             ),
             dtype="category",
@@ -278,12 +279,10 @@ def test_categorical_unique(num_elements):
 @pytest.mark.parametrize("nelem", [20, 50, 100])
 def test_categorical_unique_count(nelem):
     # create categorical series
-    np.random.seed(12)
+    rng = np.random.default_rng(seed=0)
     pd_cat = pd.Categorical(
         pd.Series(
-            np.random.choice(
-                list(string.ascii_letters + string.digits), nelem
-            ),
+            rng.choice(list(string.ascii_letters + string.digits), nelem),
             dtype="category",
         )
     )
@@ -858,6 +857,10 @@ def test_cat_from_scalar(scalar):
     assert_eq(ps, gs)
 
 
+@pytest.mark.skipif(
+    PANDAS_VERSION < PANDAS_CURRENT_SUPPORTED_VERSION,
+    reason="Does not warn on older versions of pandas",
+)
 def test_cat_groupby_fillna():
     ps = pd.Series(["a", "b", "c"], dtype="category")
     gs = cudf.from_pandas(ps)

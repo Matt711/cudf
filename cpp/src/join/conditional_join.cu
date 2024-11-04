@@ -21,16 +21,16 @@
 
 #include <cudf/ast/detail/expression_parser.hpp>
 #include <cudf/ast/expressions.hpp>
+#include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/join.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
-#include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/resource_ref.hpp>
 
 #include <optional>
 
@@ -82,7 +82,7 @@ std::unique_ptr<rmm::device_uvector<size_type>> conditional_join_anti_semi(
     join_size = *output_size;
   } else {
     // Allocate storage for the counter used to get the size of the join output
-    rmm::device_scalar<std::size_t> size(0, stream, mr);
+    cudf::detail::device_scalar<std::size_t> size(0, stream, mr);
     if (has_nulls) {
       compute_conditional_join_output_size<DEFAULT_JOIN_BLOCK_SIZE, true>
         <<<config.num_blocks, config.num_threads_per_block, shmem_size_per_block, stream.value()>>>(
@@ -95,7 +95,7 @@ std::unique_ptr<rmm::device_uvector<size_type>> conditional_join_anti_semi(
     join_size = size.value(stream);
   }
 
-  rmm::device_scalar<std::size_t> write_index(0, stream);
+  cudf::detail::device_scalar<std::size_t> write_index(0, stream);
 
   auto left_indices = std::make_unique<rmm::device_uvector<size_type>>(join_size, stream, mr);
 
@@ -198,7 +198,7 @@ conditional_join(table_view const& left,
     join_size = *output_size;
   } else {
     // Allocate storage for the counter used to get the size of the join output
-    rmm::device_scalar<std::size_t> size(0, stream, mr);
+    cudf::detail::device_scalar<std::size_t> size(0, stream, mr);
     if (has_nulls) {
       compute_conditional_join_output_size<DEFAULT_JOIN_BLOCK_SIZE, true>
         <<<config.num_blocks, config.num_threads_per_block, shmem_size_per_block, stream.value()>>>(
@@ -232,7 +232,7 @@ conditional_join(table_view const& left,
                      std::make_unique<rmm::device_uvector<size_type>>(0, stream, mr));
   }
 
-  rmm::device_scalar<std::size_t> write_index(0, stream);
+  cudf::detail::device_scalar<std::size_t> write_index(0, stream);
 
   auto left_indices  = std::make_unique<rmm::device_uvector<size_type>>(join_size, stream, mr);
   auto right_indices = std::make_unique<rmm::device_uvector<size_type>>(join_size, stream, mr);
@@ -343,7 +343,7 @@ std::size_t compute_conditional_join_output_size(table_view const& left,
   auto const shmem_size_per_block = parser.shmem_per_thread * config.num_threads_per_block;
 
   // Allocate storage for the counter used to get the size of the join output
-  rmm::device_scalar<std::size_t> size(0, stream, mr);
+  cudf::detail::device_scalar<std::size_t> size(0, stream, mr);
 
   // Determine number of output rows without actually building the output to simply
   // find what the size of the output will be.
@@ -377,16 +377,12 @@ conditional_inner_join(table_view const& left,
                        table_view const& right,
                        ast::expression const& binary_predicate,
                        std::optional<std::size_t> output_size,
+                       rmm::cuda_stream_view stream,
                        rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::conditional_join(left,
-                                  right,
-                                  binary_predicate,
-                                  detail::join_kind::INNER_JOIN,
-                                  output_size,
-                                  cudf::get_default_stream(),
-                                  mr);
+  return detail::conditional_join(
+    left, right, binary_predicate, detail::join_kind::INNER_JOIN, output_size, stream, mr);
 }
 
 std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
@@ -395,16 +391,12 @@ conditional_left_join(table_view const& left,
                       table_view const& right,
                       ast::expression const& binary_predicate,
                       std::optional<std::size_t> output_size,
+                      rmm::cuda_stream_view stream,
                       rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::conditional_join(left,
-                                  right,
-                                  binary_predicate,
-                                  detail::join_kind::LEFT_JOIN,
-                                  output_size,
-                                  cudf::get_default_stream(),
-                                  mr);
+  return detail::conditional_join(
+    left, right, binary_predicate, detail::join_kind::LEFT_JOIN, output_size, stream, mr);
 }
 
 std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
@@ -412,16 +404,12 @@ std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
 conditional_full_join(table_view const& left,
                       table_view const& right,
                       ast::expression const& binary_predicate,
+                      rmm::cuda_stream_view stream,
                       rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::conditional_join(left,
-                                  right,
-                                  binary_predicate,
-                                  detail::join_kind::FULL_JOIN,
-                                  {},
-                                  cudf::get_default_stream(),
-                                  mr);
+  return detail::conditional_join(
+    left, right, binary_predicate, detail::join_kind::FULL_JOIN, {}, stream, mr);
 }
 
 std::unique_ptr<rmm::device_uvector<size_type>> conditional_left_semi_join(
@@ -429,16 +417,12 @@ std::unique_ptr<rmm::device_uvector<size_type>> conditional_left_semi_join(
   table_view const& right,
   ast::expression const& binary_predicate,
   std::optional<std::size_t> output_size,
+  rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::conditional_join_anti_semi(left,
-                                            right,
-                                            binary_predicate,
-                                            detail::join_kind::LEFT_SEMI_JOIN,
-                                            output_size,
-                                            cudf::get_default_stream(),
-                                            mr);
+  return detail::conditional_join_anti_semi(
+    left, right, binary_predicate, detail::join_kind::LEFT_SEMI_JOIN, output_size, stream, mr);
 }
 
 std::unique_ptr<rmm::device_uvector<size_type>> conditional_left_anti_join(
@@ -446,64 +430,56 @@ std::unique_ptr<rmm::device_uvector<size_type>> conditional_left_anti_join(
   table_view const& right,
   ast::expression const& binary_predicate,
   std::optional<std::size_t> output_size,
+  rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::conditional_join_anti_semi(left,
-                                            right,
-                                            binary_predicate,
-                                            detail::join_kind::LEFT_ANTI_JOIN,
-                                            output_size,
-                                            cudf::get_default_stream(),
-                                            mr);
+  return detail::conditional_join_anti_semi(
+    left, right, binary_predicate, detail::join_kind::LEFT_ANTI_JOIN, output_size, stream, mr);
 }
 
 std::size_t conditional_inner_join_size(table_view const& left,
                                         table_view const& right,
                                         ast::expression const& binary_predicate,
+                                        rmm::cuda_stream_view stream,
                                         rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::compute_conditional_join_output_size(
-    left, right, binary_predicate, detail::join_kind::INNER_JOIN, cudf::get_default_stream(), mr);
+    left, right, binary_predicate, detail::join_kind::INNER_JOIN, stream, mr);
 }
 
 std::size_t conditional_left_join_size(table_view const& left,
                                        table_view const& right,
                                        ast::expression const& binary_predicate,
+                                       rmm::cuda_stream_view stream,
                                        rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::compute_conditional_join_output_size(
-    left, right, binary_predicate, detail::join_kind::LEFT_JOIN, cudf::get_default_stream(), mr);
+    left, right, binary_predicate, detail::join_kind::LEFT_JOIN, stream, mr);
 }
 
 std::size_t conditional_left_semi_join_size(table_view const& left,
                                             table_view const& right,
                                             ast::expression const& binary_predicate,
+                                            rmm::cuda_stream_view stream,
                                             rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::compute_conditional_join_output_size(left,
-                                                      right,
-                                                      binary_predicate,
-                                                      detail::join_kind::LEFT_SEMI_JOIN,
-                                                      cudf::get_default_stream(),
-                                                      mr);
+  return detail::compute_conditional_join_output_size(
+    left, right, binary_predicate, detail::join_kind::LEFT_SEMI_JOIN, stream, mr);
 }
 
 std::size_t conditional_left_anti_join_size(table_view const& left,
                                             table_view const& right,
                                             ast::expression const& binary_predicate,
+                                            rmm::cuda_stream_view stream,
                                             rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::compute_conditional_join_output_size(left,
-                                                      right,
-                                                      binary_predicate,
-                                                      detail::join_kind::LEFT_ANTI_JOIN,
-                                                      cudf::get_default_stream(),
-                                                      mr);
+  return detail::compute_conditional_join_output_size(
+    left, right, binary_predicate, detail::join_kind::LEFT_ANTI_JOIN, stream, mr);
 }
 
 }  // namespace cudf

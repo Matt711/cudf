@@ -20,11 +20,11 @@
 #include <cudf/io/json.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/export.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
-#include <rmm/resource_ref.hpp>
 
 #include <memory>
 
@@ -56,6 +56,7 @@ device_span<char> ingest_raw_input(device_span<char> buffer,
                                    compression_type compression,
                                    size_t range_offset,
                                    size_t range_size,
+                                   char delimiter,
                                    rmm::cuda_stream_view stream);
 
 /**

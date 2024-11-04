@@ -5,10 +5,10 @@ from __future__ import annotations
 import operator
 import pickle
 import warnings
-from collections.abc import Hashable
+from collections.abc import Hashable, MutableMapping
 from functools import cache, cached_property
 from numbers import Number
-from typing import TYPE_CHECKING, Any, Literal, MutableMapping, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import cupy
 import numpy as np
@@ -122,13 +122,13 @@ def _lexsorted_equal_range(
         sort_inds = None
         sort_vals = idx
     lower_bound = search_sorted(
-        [*sort_vals._data.columns],
+        list(sort_vals._columns),
         keys,
         side="left",
         ascending=sort_vals.is_monotonic_increasing,
     ).element_indexing(0)
     upper_bound = search_sorted(
-        [*sort_vals._data.columns],
+        list(sort_vals._columns),
         keys,
         side="right",
         ascending=sort_vals.is_monotonic_increasing,
@@ -285,6 +285,20 @@ class RangeIndex(BaseIndex, BinaryOperand):
     @_performance_tracking
     def name(self, value):
         self._name = value
+
+    @property
+    @_performance_tracking
+    def _column_names(self) -> tuple[Any]:
+        return (self.name,)
+
+    @property
+    @_performance_tracking
+    def _columns(self) -> tuple[ColumnBase]:
+        return (self._values,)
+
+    @property
+    def _column_labels_and_values(self) -> Iterable:
+        return zip(self._column_names, self._columns)
 
     @property  # type: ignore
     @_performance_tracking
@@ -1068,7 +1082,7 @@ class Index(SingleColumnFrame, BaseIndex, metaclass=IndexMeta):
             else:
                 inputs = {
                     name: (col, None, False, None)
-                    for name, col in self._data.items()
+                    for name, col in self._column_labels_and_values
                 }
 
             data = self._apply_cupy_ufunc_to_operands(

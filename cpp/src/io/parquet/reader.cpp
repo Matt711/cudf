@@ -16,8 +16,6 @@
 
 #include "reader_impl.hpp"
 
-#include <rmm/resource_ref.hpp>
-
 namespace cudf::io::parquet::detail {
 
 reader::reader() = default;

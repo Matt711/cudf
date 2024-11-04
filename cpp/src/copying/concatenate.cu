@@ -19,6 +19,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/detail/concatenate_masks.hpp>
 #include <cudf/detail/copy.hpp>
+#include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/get_value.cuh>
 #include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -32,11 +33,11 @@
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_checks.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
-#include <rmm/resource_ref.hpp>
 
 #include <thrust/advance.h>
 #include <thrust/binary_search.h>
@@ -82,7 +83,7 @@ auto create_device_views(host_span<column_view const> views, rmm::cuda_stream_vi
                  [](auto const& col) { return *col; });
 
   auto d_views =
-    make_device_uvector_async(device_views, stream, rmm::mr::get_current_device_resource());
+    make_device_uvector_async(device_views, stream, cudf::get_current_device_resource_ref());
 
   // Compute the partition offsets
   auto offsets = cudf::detail::make_host_vector<size_t>(views.size() + 1, stream);
@@ -94,7 +95,7 @@ auto create_device_views(host_span<column_view const> views, rmm::cuda_stream_vi
     [](auto const& col) { return col.size(); },
     thrust::plus{});
   auto d_offsets =
-    make_device_uvector_async(offsets, stream, rmm::mr::get_current_device_resource());
+    make_device_uvector_async(offsets, stream, cudf::get_current_device_resource_ref());
   auto const output_size = offsets.back();
 
   return std::make_tuple(
@@ -162,7 +163,7 @@ size_type concatenate_masks(device_span<column_device_view const> d_views,
                             size_type output_size,
                             rmm::cuda_stream_view stream)
 {
-  rmm::device_scalar<size_type> d_valid_count(0, stream);
+  cudf::detail::device_scalar<size_type> d_valid_count(0, stream);
   constexpr size_type block_size{256};
   cudf::detail::grid_1d config(output_size, block_size);
   concatenate_masks_kernel<block_size>
@@ -265,7 +266,7 @@ std::unique_ptr<column> fused_concatenate(host_span<column_view const> views,
   auto out_view     = out_col->mutable_view();
   auto d_out_view   = mutable_column_device_view::create(out_view, stream);
 
-  rmm::device_scalar<size_type> d_valid_count(0, stream);
+  cudf::detail::device_scalar<size_type> d_valid_count(0, stream);
 
   // Launch kernel
   constexpr size_type block_size{256};

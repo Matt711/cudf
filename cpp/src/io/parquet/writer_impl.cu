@@ -43,6 +43,7 @@
 #include <cudf/lists/detail/dremel.hpp>
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/table/table_device_view.cuh>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -182,10 +183,10 @@ struct aggregate_writer_metadata {
     std::vector<RowGroup> row_groups;
     std::vector<KeyValue> key_value_metadata;
     std::vector<OffsetIndex> offset_indexes;
-    std::vector<std::vector<uint8_t>> column_indexes;
+    std::vector<cudf::detail::host_vector<uint8_t>> column_indexes;
   };
   std::vector<per_file_metadata> files;
-  cuda::std::optional<std::vector<ColumnOrder>> column_orders = cuda::std::nullopt;
+  std::optional<std::vector<ColumnOrder>> column_orders = std::nullopt;
 };
 
 namespace {
@@ -471,7 +472,7 @@ struct leaf_schema_fn {
   std::enable_if_t<std::is_same_v<T, cudf::timestamp_ns>, void> operator()()
   {
     col_schema.type           = (timestamp_is_int96) ? Type::INT96 : Type::INT64;
-    col_schema.converted_type = cuda::std::nullopt;
+    col_schema.converted_type = std::nullopt;
     col_schema.stats_dtype    = statistics_dtype::dtype_timestamp64;
     if (timestamp_is_int96) {
       col_schema.ts_scale = -1000;  // negative value indicates division by absolute value
@@ -749,7 +750,7 @@ std::vector<schema_tree_node> construct_parquet_schema_tree(
           col_schema.type = Type::BYTE_ARRAY;
         }
 
-        col_schema.converted_type  = cuda::std::nullopt;
+        col_schema.converted_type  = std::nullopt;
         col_schema.stats_dtype     = statistics_dtype::dtype_byte_array;
         col_schema.repetition_type = col_nullable ? OPTIONAL : REQUIRED;
         col_schema.name = (schema[parent_idx].name == "list") ? "element" : col_meta.get_name();
@@ -1048,7 +1049,7 @@ parquet_column_view::parquet_column_view(schema_tree_node const& schema_node,
   // TODO(cp): Explore doing this for all columns in a single go outside this ctor. Maybe using
   // hostdevice_vector. Currently this involves a cudaMemcpyAsync for each column.
   _d_nullability = cudf::detail::make_device_uvector_async(
-    _nullability, stream, rmm::mr::get_current_device_resource());
+    _nullability, stream, cudf::get_current_device_resource_ref());
 
   _is_list = (_max_rep_level > 0);
 
@@ -1120,7 +1121,7 @@ void init_row_group_fragments(cudf::detail::hostdevice_2dvector<PageFragment>& f
                               rmm::cuda_stream_view stream)
 {
   auto d_partitions = cudf::detail::make_device_uvector_async(
-    partitions, stream, rmm::mr::get_current_device_resource());
+    partitions, stream, cudf::get_current_device_resource_ref());
   InitRowGroupFragments(frag, col_desc, d_partitions, part_frag_offset, fragment_size, stream);
   frag.device_to_host_sync(stream);
 }
@@ -1140,7 +1141,7 @@ void calculate_page_fragments(device_span<PageFragment> frag,
                               rmm::cuda_stream_view stream)
 {
   auto d_frag_sz = cudf::detail::make_device_uvector_async(
-    frag_sizes, stream, rmm::mr::get_current_device_resource());
+    frag_sizes, stream, cudf::get_current_device_resource_ref());
   CalculatePageFragments(frag, d_frag_sz, stream);
 }
 
@@ -1542,12 +1543,7 @@ void encode_pages(hostdevice_2dvector<EncColumnChunk>& chunks,
       d_chunks.flat_view(), {column_stats, pages.size()}, column_index_truncate_length, stream);
   }
 
-  auto h_chunks = chunks.host_view();
-  CUDF_CUDA_TRY(cudaMemcpyAsync(h_chunks.data(),
-                                d_chunks.data(),
-                                d_chunks.flat_view().size_bytes(),
-                                cudaMemcpyDefault,
-                                stream.value()));
+  chunks.device_to_host_async(stream);
 
   if (comp_stats.has_value()) {
     comp_stats.value() += collect_compression_statistics(comp_in, comp_res, stream);
@@ -1649,7 +1645,7 @@ std::vector<column_view> convert_decimal_columns_and_metadata(
       case type_id::DECIMAL32:
         // Convert data to decimal128 type
         d128_buffers.emplace_back(cudf::detail::convert_decimals_to_decimal128<int32_t>(
-          column, stream, rmm::mr::get_current_device_resource()));
+          column, stream, cudf::get_current_device_resource_ref()));
         // Update metadata
         metadata.set_decimal_precision(MAX_DECIMAL32_PRECISION);
         metadata.set_type_length(size_of(data_type{type_id::DECIMAL128, column.type().scale()}));
@@ -1664,7 +1660,7 @@ std::vector<column_view> convert_decimal_columns_and_metadata(
       case type_id::DECIMAL64:
         // Convert data to decimal128 type
         d128_buffers.emplace_back(cudf::detail::convert_decimals_to_decimal128<int64_t>(
-          column, stream, rmm::mr::get_current_device_resource()));
+          column, stream, cudf::get_current_device_resource_ref()));
         // Update metadata
         metadata.set_decimal_precision(MAX_DECIMAL64_PRECISION);
         metadata.set_type_length(size_of(data_type{type_id::DECIMAL128, column.type().scale()}));
@@ -1818,8 +1814,14 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
     auto const table_size  = std::reduce(column_sizes.begin(), column_sizes.end());
     auto const avg_row_len = util::div_rounding_up_safe<size_t>(table_size, input.num_rows());
     if (avg_row_len > 0) {
-      auto const rg_frag_size = util::div_rounding_up_safe(max_row_group_size, avg_row_len);
-      max_page_fragment_size  = std::min<size_type>(rg_frag_size, max_page_fragment_size);
+      // Ensure `rg_frag_size` is not bigger than size_type::max for default max_row_group_size
+      // value (=uint64::max) to avoid a sign overflow when comparing
+      auto const rg_frag_size =
+        std::min<size_t>(std::numeric_limits<size_type>::max(),
+                         util::div_rounding_up_safe(max_row_group_size, avg_row_len));
+      // Safe comparison as rg_frag_size fits in size_type
+      max_page_fragment_size =
+        std::min<size_type>(static_cast<size_type>(rg_frag_size), max_page_fragment_size);
     }
 
     // dividing page size by average row length will tend to overshoot the desired
@@ -1869,7 +1871,7 @@ auto convert_table_to_parquet_data(table_input_metadata& table_meta,
   part_frag_offset.push_back(part_frag_offset.back() + num_frag_in_part.back());
 
   auto d_part_frag_offset = cudf::detail::make_device_uvector_async(
-    part_frag_offset, stream, rmm::mr::get_current_device_resource());
+    part_frag_offset, stream, cudf::get_current_device_resource_ref());
   cudf::detail::hostdevice_2dvector<PageFragment> row_group_fragments(
     num_columns, num_fragments, stream);
 
@@ -2552,12 +2554,11 @@ void writer::impl::write_parquet_data_to_sink(
         } else {
           CUDF_EXPECTS(bounce_buffer.size() >= ck.compressed_size,
                        "Bounce buffer was not properly initialized.");
-          CUDF_CUDA_TRY(cudaMemcpyAsync(bounce_buffer.data(),
-                                        dev_bfr + ck.ck_stat_size,
-                                        ck.compressed_size,
-                                        cudaMemcpyDefault,
-                                        _stream.value()));
-          _stream.synchronize();
+          cudf::detail::cuda_memcpy(
+            host_span{bounce_buffer}.subspan(0, ck.compressed_size),
+            device_span<uint8_t const>{dev_bfr + ck.ck_stat_size, ck.compressed_size},
+            _stream);
+
           _out_sink[p]->host_write(bounce_buffer.data(), ck.compressed_size);
         }
 
@@ -2593,13 +2594,8 @@ void writer::impl::write_parquet_data_to_sink(
           auto const& column_chunk_meta = row_group.columns[i].meta_data;
 
           // start transfer of the column index
-          std::vector<uint8_t> column_idx;
-          column_idx.resize(ck.column_index_size);
-          CUDF_CUDA_TRY(cudaMemcpyAsync(column_idx.data(),
-                                        ck.column_index_blob,
-                                        ck.column_index_size,
-                                        cudaMemcpyDefault,
-                                        _stream.value()));
+          auto column_idx = cudf::detail::make_host_vector_async(
+            device_span<uint8_t const>{ck.column_index_blob, ck.column_index_size}, _stream);
 
           // calculate offsets while the column index is transferring
           int64_t curr_pg_offset = column_chunk_meta.data_page_offset;
@@ -2788,7 +2784,7 @@ std::unique_ptr<std::vector<uint8_t>> writer::merge_row_group_metadata(
   // See https://github.com/rapidsai/cudf/pull/14264#issuecomment-1778311615
   for (auto& se : md.schema) {
     if (se.logical_type.has_value() && se.logical_type.value().type == LogicalType::UNKNOWN) {
-      se.logical_type = cuda::std::nullopt;
+      se.logical_type = std::nullopt;
     }
   }
 

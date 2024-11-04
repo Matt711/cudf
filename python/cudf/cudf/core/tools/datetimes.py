@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import re
 import warnings
-from typing import Literal, Sequence
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,9 @@ from cudf._lib.strings.convert.convert_integers import (
 from cudf.api.types import is_integer, is_scalar
 from cudf.core import column
 from cudf.core.index import ensure_index
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 # https://github.com/pandas-dev/pandas/blob/2.2.x/pandas/core/tools/datetimes.py#L1112
 _unit_map = {
@@ -186,7 +189,7 @@ def to_datetime(
         if isinstance(arg, cudf.DataFrame):
             # we require at least Ymd
             required = ["year", "month", "day"]
-            req = list(set(required) - set(arg._data.names))
+            req = list(set(required) - set(arg._column_names))
             if len(req):
                 err_req = ",".join(req)
                 raise ValueError(
@@ -196,7 +199,7 @@ def to_datetime(
                 )
 
             # replace passed column name with values in _unit_map
-            got_units = {k: get_units(k) for k in arg._data.names}
+            got_units = {k: get_units(k) for k in arg._column_names}
             unit_rev = {v: k for k, v in got_units.items()}
 
             # keys we don't recognize

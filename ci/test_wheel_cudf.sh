@@ -10,8 +10,15 @@ RAPIDS_PY_WHEEL_NAME="cudf_${RAPIDS_PY_CUDA_SUFFIX}" rapids-download-wheels-from
 RAPIDS_PY_WHEEL_NAME="libcudf_${RAPIDS_PY_CUDA_SUFFIX}" rapids-download-wheels-from-s3 cpp ./dist
 RAPIDS_PY_WHEEL_NAME="pylibcudf_${RAPIDS_PY_CUDA_SUFFIX}" rapids-download-wheels-from-s3 python ./dist
 
+rapids-logger "Install cudf, pylibcudf, and test requirements"
+
+# generate constraints (possibly pinning to oldest support versions of dependencies)
+rapids-generate-pip-constraints py_test_cudf ./constraints.txt
+
 # echo to expand wildcard before adding `[extra]` requires for pip
 python -m pip install \
+    -v \
+    --constraint ./constraints.txt \
   "$(echo ./dist/cudf_${RAPIDS_PY_CUDA_SUFFIX}*.whl)[test]" \
   "$(echo ./dist/libcudf_${RAPIDS_PY_CUDA_SUFFIX}*.whl)" \
   "$(echo ./dist/pylibcudf_${RAPIDS_PY_CUDA_SUFFIX}*.whl)[test]"
@@ -25,6 +32,7 @@ rapids-logger "pytest pylibcudf"
 pushd python/pylibcudf/pylibcudf/tests
 python -m pytest \
   --cache-clear \
+  --numprocesses=8 \
   --dist=worksteal \
   .
 popd

@@ -28,7 +28,7 @@ from libcpp.memory cimport make_unique, unique_ptr
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
 
-from rmm._lib.device_buffer cimport DeviceBuffer
+from rmm.pylibrmm.device_buffer cimport DeviceBuffer
 
 from cudf._lib.types cimport (
     dtype_from_column_view,
@@ -599,7 +599,6 @@ cdef class Column:
             children=tuple(children)
         )
 
-    #  TODO: Actually support exposed data pointers.
     @staticmethod
     def from_pylibcudf(
         col, bint data_ptr_exposed=False
@@ -616,7 +615,7 @@ cdef class Column:
         col : pylibcudf.Column
             The object to copy.
         data_ptr_exposed : bool
-            This parameter is not yet supported
+            Whether the data buffer is exposed.
 
         Returns
         -------
@@ -639,16 +638,18 @@ cdef class Column:
         dtype = dtype_from_pylibcudf_column(col)
 
         return cudf.core.column.build_column(
-            data=as_buffer(col.data().obj) if col.data() is not None else None,
+            data=as_buffer(
+                col.data().obj, exposed=data_ptr_exposed
+            ) if col.data() is not None else None,
             dtype=dtype,
             size=col.size(),
             mask=as_buffer(
-                col.null_mask().obj
+                col.null_mask().obj, exposed=data_ptr_exposed
             ) if col.null_mask() is not None else None,
             offset=col.offset(),
             null_count=col.null_count(),
             children=tuple([
-                Column.from_pylibcudf(child)
+                Column.from_pylibcudf(child, data_ptr_exposed=data_ptr_exposed)
                 for child in col.children()
             ])
         )
@@ -687,15 +688,18 @@ cdef class Column:
         # special case for string column
         is_string_column = (cv.type().id() == libcudf_types.type_id.STRING)
         if is_string_column:
-            # get the size from offset child column (device to host copy)
-            offsets_column_index = 0
-            offset_child_column = cv.child(offsets_column_index)
-            if offset_child_column.size() == 0:
+            if cv.num_children() == 0:
                 base_nbytes = 0
             else:
-                chars_size = get_element(
-                    offset_child_column, offset_child_column.size()-1).value
-                base_nbytes = chars_size
+                # get the size from offset child column (device to host copy)
+                offsets_column_index = 0
+                offset_child_column = cv.child(offsets_column_index)
+                if offset_child_column.size() == 0:
+                    base_nbytes = 0
+                else:
+                    chars_size = get_element(
+                        offset_child_column, offset_child_column.size()-1).value
+                    base_nbytes = chars_size
 
         if data_ptr:
             if data_owner is None:

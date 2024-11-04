@@ -8,7 +8,7 @@ import textwrap
 import warnings
 from collections import abc
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Iterable, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import cupy as cp
 import numpy as np
@@ -27,6 +27,7 @@ from cudf.core._compat import PANDAS_LT_300
 from cudf.core.abc import Serializable
 from cudf.core.column.column import ColumnBase, StructDtype, as_column
 from cudf.core.column_accessor import ColumnAccessor
+from cudf.core.copy_types import GatherMap
 from cudf.core.join._join_helpers import _match_join_keys
 from cudf.core.mixins import Reducible, Scannable
 from cudf.core.multiindex import MultiIndex
@@ -35,6 +36,8 @@ from cudf.utils.performance_tracking import _performance_tracking
 from cudf.utils.utils import GetAttrGetItemMixin
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from cudf._typing import (
         AggType,
         DataFrameOrSeries,
@@ -74,6 +77,34 @@ def _is_row_of(chunk, obj):
         and len(chunk.index) == len(obj._column_names)
         and (chunk.index.to_pandas() == pd.Index(obj._column_names)).all()
     )
+
+
+NamedAgg = pd.NamedAgg
+
+
+NamedAgg.__doc__ = """
+Helper for column specific aggregation with control over output column names.
+
+Subclass of typing.NamedTuple.
+
+Parameters
+----------
+column : Hashable
+    Column label in the DataFrame to apply aggfunc.
+aggfunc : function or str
+    Function to apply to the provided column.
+
+Examples
+--------
+>>> df = cudf.DataFrame({"key": [1, 1, 2], "a": [-1, 0, 1], 1: [10, 11, 12]})
+>>> agg_a = cudf.NamedAgg(column="a", aggfunc="min")
+>>> agg_1 = cudf.NamedAgg(column=1, aggfunc=lambda x: x.mean())
+>>> df.groupby("key").agg(result_a=agg_a, result_1=agg_1)
+        result_a  result_1
+key
+1          -1      10.5
+2           1      12.0
+"""
 
 
 groupby_doc_template = textwrap.dedent(
@@ -450,6 +481,11 @@ class GroupBy(Serializable, Reducible, Scannable):
                 "instead of ``gb.get_group(name, obj=df)``.",
                 FutureWarning,
             )
+        if is_list_like(self._by):
+            if isinstance(name, tuple) and len(name) == 1:
+                name = name[0]
+            else:
+                raise KeyError(name)
         return obj.iloc[self.indices[name]]
 
     @_performance_tracking
@@ -723,22 +759,36 @@ class GroupBy(Serializable, Reducible, Scannable):
             ) and not libgroupby._is_all_scan_aggregate(normalized_aggs):
                 # Even with `sort=False`, pandas guarantees that
                 # groupby preserves the order of rows within each group.
-                left_cols = list(
-                    self.grouping.keys.drop_duplicates()._data.columns
-                )
-                right_cols = list(result_index._data.columns)
+                left_cols = list(self.grouping.keys.drop_duplicates()._columns)
+                right_cols = list(result_index._columns)
                 join_keys = [
-                    _match_join_keys(lcol, rcol, "left")
+                    _match_join_keys(lcol, rcol, "inner")
                     for lcol, rcol in zip(left_cols, right_cols)
                 ]
                 # TODO: In future, see if we can centralize
                 # logic else where that has similar patterns.
                 join_keys = map(list, zip(*join_keys))
-                _, indices = libcudf.join.join(
-                    *join_keys,
-                    how="left",
+                # By construction, left and right keys are related by
+                # a permutation, so we can use an inner join.
+                left_order, right_order = libcudf.join.join(
+                    *join_keys, how="inner"
                 )
-                result = result.take(indices)
+                # left order is some permutation of the ordering we
+                # want, and right order is a matching gather map for
+                # the result table. Get the correct order by sorting
+                # the right gather map.
+                (right_order,) = libcudf.sort.sort_by_key(
+                    [right_order],
+                    [left_order],
+                    [True],
+                    ["first"],
+                    stable=False,
+                )
+                result = result._gather(
+                    GatherMap.from_column_unchecked(
+                        right_order, len(result), nullify=False
+                    )
+                )
 
         if not self._as_index:
             result = result.reset_index()
@@ -1296,9 +1346,21 @@ class GroupBy(Serializable, Reducible, Scannable):
                 columns = values._columns
                 aggs_per_column = (aggs,) * len(columns)
         elif not aggs and kwargs:
-            column_names, aggs_per_column = kwargs.keys(), kwargs.values()
-            columns = tuple(self.obj._data[x[0]] for x in kwargs.values())
-            aggs_per_column = tuple(x[1] for x in kwargs.values())
+            column_names = kwargs.keys()
+
+            def _raise_invalid_type(x):
+                raise TypeError(
+                    f"Invalid keyword argument {x} of type {type(x)} was passed to agg"
+                )
+
+            columns, aggs_per_column = zip(
+                *(
+                    (self.obj._data[x[0]], x[1])
+                    if isinstance(x, tuple)
+                    else _raise_invalid_type(x)
+                    for x in kwargs.values()
+                )
+            )
         else:
             raise TypeError("Must provide at least one aggregation function.")
 
@@ -1443,7 +1505,7 @@ class GroupBy(Serializable, Reducible, Scannable):
                     # the column name should be, especially if we applied
                     # a nameless UDF.
                     result = result.to_frame(
-                        name=grouped_values._data.names[0]
+                        name=grouped_values._column_names[0]
                     )
                 else:
                     index_data = group_keys._data.copy(deep=True)
@@ -1592,7 +1654,7 @@ class GroupBy(Serializable, Reducible, Scannable):
             if func in {"sum", "product"}:
                 # For `sum` & `product`, boolean types
                 # will need to result in `int64` type.
-                for name, col in res._data.items():
+                for name, col in res._column_labels_and_values:
                     if col.dtype.kind == "b":
                         res._data[name] = col.astype("int")
             return res
@@ -2195,6 +2257,22 @@ class GroupBy(Serializable, Reducible, Scannable):
         return self.agg(func)
 
     @_performance_tracking
+    def nunique(self, dropna: bool = True):
+        """
+        Return number of unique elements in the group.
+
+        Parameters
+        ----------
+        dropna : bool, default True
+            Don't include NaN in the counts.
+        """
+
+        def func(x):
+            return getattr(x, "nunique")(dropna=dropna)
+
+        return self.agg(func)
+
+    @_performance_tracking
     def std(
         self,
         ddof=1,
@@ -2675,11 +2753,8 @@ class DataFrameGroupBy(GroupBy, GetAttrGetItemMixin):
     def _reduce_numeric_only(self, op: str):
         columns = list(
             name
-            for name in self.obj._data.names
-            if (
-                is_numeric_dtype(self.obj._data[name].dtype)
-                and name not in self.grouping.names
-            )
+            for name, dtype in self.obj._dtypes
+            if (is_numeric_dtype(dtype) and name not in self.grouping.names)
         )
         return self[columns].agg(op)
 
@@ -3169,7 +3244,7 @@ class _Grouping(Serializable):
         """
         # If the key columns are in `obj`, filter them out
         value_column_names = [
-            x for x in self._obj._data.names if x not in self._named_columns
+            x for x in self._obj._column_names if x not in self._named_columns
         ]
         value_columns = self._obj._data.select_by_label(value_column_names)
         return self._obj.__class__._from_data(value_columns)
@@ -3184,8 +3259,8 @@ class _Grouping(Serializable):
         self.names.append(by.name)
 
     def _handle_index(self, by):
-        self._key_columns.extend(by._data.columns)
-        self.names.extend(by._data.names)
+        self._key_columns.extend(by._columns)
+        self.names.extend(by._column_names)
 
     def _handle_mapping(self, by):
         by = cudf.Series(by.values(), index=by.keys())

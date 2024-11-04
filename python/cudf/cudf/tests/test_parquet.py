@@ -23,6 +23,7 @@ from pyarrow import parquet as pq
 
 import cudf
 from cudf._lib.parquet import read_parquet_chunked
+from cudf.core._compat import PANDAS_CURRENT_SUPPORTED_VERSION, PANDAS_VERSION
 from cudf.io.parquet import (
     ParquetDatasetWriter,
     ParquetWriter,
@@ -52,6 +53,7 @@ def datadir(datadir):
 
 @pytest.fixture(params=[1, 5, 10, 100000])
 def simple_pdf(request):
+    rng = np.random.default_rng(seed=0)
     types = [
         "bool",
         "int8",
@@ -71,7 +73,7 @@ def simple_pdf(request):
     # Create a pandas dataframe with random data of mixed types
     test_pdf = pd.DataFrame(
         {
-            f"col_{typ}": np.random.randint(0, nrows, nrows).astype(typ)
+            f"col_{typ}": rng.integers(0, nrows, nrows).astype(typ)
             for typ in types
         },
         # Need to ensure that this index is not a RangeIndex to get the
@@ -91,6 +93,7 @@ def simple_gdf(simple_pdf):
 
 
 def build_pdf(num_columns, day_resolution_timestamps):
+    rng = np.random.default_rng(seed=0)
     types = [
         "bool",
         "int8",
@@ -113,7 +116,7 @@ def build_pdf(num_columns, day_resolution_timestamps):
     # Create a pandas dataframe with random data of mixed types
     test_pdf = pd.DataFrame(
         {
-            f"col_{typ}": np.random.randint(0, nrows, nrows).astype(typ)
+            f"col_{typ}": rng.integers(0, nrows, nrows).astype(typ)
             for typ in types
         },
         # Need to ensure that this index is not a RangeIndex to get the
@@ -141,7 +144,7 @@ def build_pdf(num_columns, day_resolution_timestamps):
         },
     ]:
         data = [
-            np.random.randint(0, (0x7FFFFFFFFFFFFFFF / t["nsDivisor"]))
+            rng.integers(0, (0x7FFFFFFFFFFFFFFF / t["nsDivisor"]))
             for i in range(nrows)
         ]
         if day_resolution_timestamps:
@@ -151,11 +154,11 @@ def build_pdf(num_columns, day_resolution_timestamps):
         )
 
     # Create non-numeric categorical data otherwise parquet may typecast it
-    data = [ascii_letters[np.random.randint(0, 52)] for i in range(nrows)]
+    data = [ascii_letters[rng.integers(0, 52)] for i in range(nrows)]
     test_pdf["col_category"] = pd.Series(data, dtype="category")
 
     # Create non-numeric str data
-    data = [ascii_letters[np.random.randint(0, 52)] for i in range(nrows)]
+    data = [ascii_letters[rng.integers(0, 52)] for i in range(nrows)]
     test_pdf["col_str"] = pd.Series(data, dtype="str")
 
     return test_pdf
@@ -452,7 +455,9 @@ def test_parquet_read_filtered(tmpdir, rdg_seed):
                 dg.ColumnParameters(
                     40,
                     0.2,
-                    lambda: np.random.default_rng().integers(0, 100, size=40),
+                    lambda: np.random.default_rng(seed=None).integers(
+                        0, 100, size=40
+                    ),
                     True,
                 ),
             ],
@@ -1908,6 +1913,7 @@ def test_parquet_writer_dictionary_setting(use_dict, max_dict_size):
 @pytest.mark.parametrize("filename", ["myfile.parquet", None])
 @pytest.mark.parametrize("cols", [["b"], ["c", "b"]])
 def test_parquet_partitioned(tmpdir_factory, cols, filename):
+    rng = np.random.default_rng(seed=0)
     # Checks that write_to_dataset is wrapping to_parquet
     # as expected
     gdf_dir = str(tmpdir_factory.mktemp("gdf_dir"))
@@ -1916,8 +1922,8 @@ def test_parquet_partitioned(tmpdir_factory, cols, filename):
     pdf = pd.DataFrame(
         {
             "a": np.arange(0, stop=size, dtype="int64"),
-            "b": np.random.choice(list("abcd"), size=size),
-            "c": np.random.choice(np.arange(4), size=size),
+            "b": rng.choice(list("abcd"), size=size),
+            "c": rng.choice(np.arange(4), size=size),
         }
     )
     pdf.to_parquet(pdf_dir, index=False, partition_cols=cols)
@@ -1953,6 +1959,7 @@ def test_parquet_partitioned(tmpdir_factory, cols, filename):
 
 @pytest.mark.parametrize("kwargs", [{"nrows": 1}, {"skip_rows": 1}])
 def test_parquet_partitioned_notimplemented(tmpdir_factory, kwargs):
+    rng = np.random.default_rng(seed=0)
     # Checks that write_to_dataset is wrapping to_parquet
     # as expected
     pdf_dir = str(tmpdir_factory.mktemp("pdf_dir"))
@@ -1960,8 +1967,8 @@ def test_parquet_partitioned_notimplemented(tmpdir_factory, kwargs):
     pdf = pd.DataFrame(
         {
             "a": np.arange(0, stop=size, dtype="int64"),
-            "b": np.random.choice(list("abcd"), size=size),
-            "c": np.random.choice(np.arange(4), size=size),
+            "b": rng.choice(list("abcd"), size=size),
+            "c": rng.choice(np.arange(4), size=size),
         }
     )
     pdf.to_parquet(pdf_dir, index=False, partition_cols=["b"])
@@ -2126,6 +2133,7 @@ def test_parquet_writer_chunked_partitioned_context(tmpdir_factory):
 @pytest.mark.parametrize("cols", [None, ["b"]])
 @pytest.mark.parametrize("store_schema", [True, False])
 def test_parquet_write_to_dataset(tmpdir_factory, cols, store_schema):
+    rng = np.random.default_rng(seed=0)
     dir1 = tmpdir_factory.mktemp("dir1")
     dir2 = tmpdir_factory.mktemp("dir2")
     if cols is None:
@@ -2138,7 +2146,7 @@ def test_parquet_write_to_dataset(tmpdir_factory, cols, store_schema):
     gdf = cudf.DataFrame(
         {
             "a": np.arange(0, stop=size),
-            "b": np.random.choice(np.arange(4), size=size),
+            "b": rng.choice(np.arange(4), size=size),
         }
     )
     gdf.to_parquet(dir1, partition_cols=cols, store_schema=store_schema)
@@ -3034,6 +3042,10 @@ def test_parquet_reader_rle_boolean(datadir):
 #                a list column in a schema, the cudf reader was confusing
 #                nesting information between a list column and a subsequent
 #                string column, ultimately causing a crash.
+@pytest.mark.skipif(
+    PANDAS_VERSION < PANDAS_CURRENT_SUPPORTED_VERSION,
+    reason="Older versions of pandas do not have DataFrame.map()",
+)
 def test_parquet_reader_one_level_list2(datadir):
     # we are reading in a file containing binary types, but cudf returns
     # those as strings. so we have to massage the pandas data to get
@@ -3209,11 +3221,12 @@ def test_parquet_nested_struct_list():
 
 def test_parquet_writer_zstd():
     size = 12345
+    rng = np.random.default_rng(seed=0)
     expected = cudf.DataFrame(
         {
             "a": np.arange(0, stop=size, dtype="float64"),
-            "b": np.random.choice(list("abcd"), size=size),
-            "c": np.random.choice(np.arange(4), size=size),
+            "b": rng.choice(list("abcd"), size=size),
+            "c": rng.choice(np.arange(4), size=size),
         }
     )
 
@@ -3817,8 +3830,8 @@ def test_parquet_reader_with_mismatched_tables(store_schema):
     df1 = cudf.DataFrame(
         {
             "i32": cudf.Series([None, None, None], dtype="int32"),
-            "i64": cudf.Series([1234, None, 123], dtype="int64"),
-            "list": list([[1, 2], [None, 4], [5, 6]]),
+            "i64": cudf.Series([1234, 467, 123], dtype="int64"),
+            "list": list([[1, 2], None, [None, 6]]),
             "time": cudf.Series([1234, 123, 4123], dtype="datetime64[ms]"),
             "str": ["vfd", None, "ghu"],
             "d_list": list(
@@ -3833,14 +3846,14 @@ def test_parquet_reader_with_mismatched_tables(store_schema):
 
     df2 = cudf.DataFrame(
         {
-            "str": ["abc", "def", None],
+            "str": ["abc", "def", "ghi"],
             "i64": cudf.Series([None, 65, 98], dtype="int64"),
             "times": cudf.Series([1234, None, 4123], dtype="datetime64[us]"),
-            "list": list([[7, 8], [9, 10], [None, 12]]),
+            "list": list([[7, 8], [9, 10], [11, 12]]),
             "d_list": list(
                 [
                     [pd.Timedelta(minutes=4), None],
-                    [None, None],
+                    None,
                     [pd.Timedelta(minutes=6), None],
                 ]
             ),
@@ -3895,38 +3908,27 @@ def test_parquet_reader_with_mismatched_structs():
         {
             "a": 1,
             "b": {
-                "inner_a": 10,
-                "inner_b": {"inner_inner_b": 1, "inner_inner_a": 2},
+                "a_a": 10,
+                "b_b": {"b_b_b": 1, "b_b_a": 2},
             },
             "c": 2,
         },
         {
             "a": 3,
-            "b": {"inner_a": 30, "inner_b": {"inner_inner_a": 210}},
+            "b": {"b_a": 30, "b_b": {"b_b_a": 210}},
             "c": 4,
         },
-        {"a": 5, "b": {"inner_a": 50, "inner_b": None}, "c": 6},
+        {"a": 5, "b": {"b_a": 50, "b_b": None}, "c": 6},
         {"a": 7, "b": None, "c": 8},
-        {"a": None, "b": {"inner_a": None, "inner_b": None}, "c": None},
-        None,
-        {
-            "a": None,
-            "b": {
-                "inner_a": None,
-                "inner_b": {"inner_inner_b": None, "inner_inner_a": 10},
-            },
-            "c": 10,
-        },
+        {"a": 5, "b": {"b_a": None, "b_b": None}, "c": None},
     ]
 
     data2 = [
-        {"a": 1, "b": {"inner_b": {"inner_inner_a": None}}},
-        {"a": 3, "b": {"inner_b": {"inner_inner_a": 1}}},
-        {"a": 5, "b": {"inner_b": None}},
-        {"a": 7, "b": {"inner_b": {"inner_inner_b": 1, "inner_inner_a": 0}}},
-        {"a": None, "b": {"inner_b": None}},
+        {"a": 1, "b": {"b_b": {"b_b_a": None}}},
+        {"a": 5, "b": {"b_b": None}},
+        {"a": 7, "b": {"b_b": {"b_b_b": 1, "b_b_a": 0}}},
+        {"a": None, "b": {"b_b": None}},
         None,
-        {"a": None, "b": {"inner_b": {"inner_inner_a": 1}}},
     ]
 
     # cuDF tables from struct data
@@ -3944,20 +3946,20 @@ def test_parquet_reader_with_mismatched_structs():
     # Read the struct.b.inner_b.inner_inner_a column from parquet
     got = cudf.read_parquet(
         [buf1, buf2],
-        columns=["struct.b.inner_b.inner_inner_a"],
+        columns=["struct.b.b_b.b_b_a"],
         allow_mismatched_pq_schemas=True,
     )
     got = (
         cudf.Series(got["struct"])
         .struct.field("b")
-        .struct.field("inner_b")
-        .struct.field("inner_inner_a")
+        .struct.field("b_b")
+        .struct.field("b_b_a")
     )
 
     # Read with chunked reader
     got_chunked = read_parquet_chunked(
         [buf1, buf2],
-        columns=["struct.b.inner_b.inner_inner_a"],
+        columns=["struct.b.b_b.b_b_a"],
         chunk_read_limit=240,
         pass_read_limit=240,
         allow_mismatched_pq_schemas=True,
@@ -3965,8 +3967,8 @@ def test_parquet_reader_with_mismatched_structs():
     got_chunked = (
         cudf.Series(got_chunked["struct"])
         .struct.field("b")
-        .struct.field("inner_b")
-        .struct.field("inner_inner_a")
+        .struct.field("b_b")
+        .struct.field("b_b_a")
     )
 
     # Construct the expected series
@@ -3974,12 +3976,12 @@ def test_parquet_reader_with_mismatched_structs():
         [
             cudf.Series(df1["struct"])
             .struct.field("b")
-            .struct.field("inner_b")
-            .struct.field("inner_inner_a"),
+            .struct.field("b_b")
+            .struct.field("b_b_a"),
             cudf.Series(df2["struct"])
             .struct.field("b")
-            .struct.field("inner_b")
-            .struct.field("inner_inner_a"),
+            .struct.field("b_b")
+            .struct.field("b_b_a"),
         ]
     ).reset_index(drop=True)
 
@@ -4018,12 +4020,12 @@ def test_parquet_reader_with_mismatched_schemas_error():
         )
 
     data1 = [
-        {"a": 1, "b": {"inner_a": 1, "inner_b": 6}},
-        {"a": 3, "b": {"inner_a": None, "inner_b": 2}},
+        {"a": 1, "b": {"b_a": 1, "b_b": 6}},
+        {"a": 3, "b": {"b_a": None, "b_b": 2}},
     ]
     data2 = [
-        {"b": {"inner_a": 1}, "c": "str"},
-        {"b": {"inner_a": None}, "c": None},
+        {"b": {"b_a": 1}, "c": "str"},
+        {"b": {"b_a": None}, "c": None},
     ]
 
     # cuDF tables from struct data
@@ -4054,6 +4056,191 @@ def test_parquet_reader_with_mismatched_schemas_error():
     ):
         cudf.read_parquet(
             [buf1, buf2],
-            columns=["struct.b.inner_b"],
+            columns=["struct.b.b_b"],
             allow_mismatched_pq_schemas=True,
         )
+
+
+def test_parquet_reader_mismatched_nullability():
+    # Ensure that we can faithfully read the tables with mismatched nullabilities
+    df1 = cudf.DataFrame(
+        {
+            "timedelta": cudf.Series([12, 54, 1231], dtype="timedelta64[ms]"),
+            "duration_list": list(
+                [
+                    [
+                        [
+                            [pd.Timedelta(minutes=1), pd.Timedelta(minutes=2)],
+                            None,
+                            [pd.Timedelta(minutes=8), None],
+                        ],
+                        None,
+                    ],
+                    None,
+                    [
+                        [
+                            [pd.Timedelta(minutes=1), pd.Timedelta(minutes=2)],
+                            [pd.Timedelta(minutes=5), pd.Timedelta(minutes=3)],
+                            [pd.Timedelta(minutes=8), pd.Timedelta(minutes=4)],
+                        ]
+                    ],
+                ]
+            ),
+            "int64": cudf.Series([1234, None, 4123], dtype="int64"),
+            "int32": cudf.Series([1234, 123, 4123], dtype="int32"),
+            "list": list([[1, 2], [1, 2], [1, 2]]),
+            "datetime": cudf.Series([1234, 123, 4123], dtype="datetime64[ms]"),
+            "string": cudf.Series(["kitten", "puppy", "cub"]),
+        }
+    )
+
+    df2 = cudf.DataFrame(
+        {
+            "timedelta": cudf.Series(
+                [None, None, None], dtype="timedelta64[ms]"
+            ),
+            "duration_list": list(
+                [
+                    [
+                        [
+                            [pd.Timedelta(minutes=1), pd.Timedelta(minutes=2)],
+                            [pd.Timedelta(minutes=8), pd.Timedelta(minutes=1)],
+                        ],
+                    ],
+                    [
+                        [
+                            [pd.Timedelta(minutes=1), pd.Timedelta(minutes=2)],
+                            [pd.Timedelta(minutes=5), pd.Timedelta(minutes=3)],
+                            [pd.Timedelta(minutes=8), pd.Timedelta(minutes=4)],
+                        ]
+                    ],
+                    [
+                        [
+                            [pd.Timedelta(minutes=1), pd.Timedelta(minutes=2)],
+                            [pd.Timedelta(minutes=5), pd.Timedelta(minutes=3)],
+                            [pd.Timedelta(minutes=8), pd.Timedelta(minutes=4)],
+                        ]
+                    ],
+                ]
+            ),
+            "int64": cudf.Series([1234, 123, 4123], dtype="int64"),
+            "int32": cudf.Series([1234, None, 4123], dtype="int32"),
+            "list": list([[1, 2], None, [1, 2]]),
+            "datetime": cudf.Series(
+                [1234, None, 4123], dtype="datetime64[ms]"
+            ),
+            "string": cudf.Series(["kitten", None, "cub"]),
+        }
+    )
+
+    # Write tables to parquet with arrow schema for compatibility for duration column(s)
+    fname1 = BytesIO()
+    df1.to_parquet(fname1, store_schema=True)
+    fname2 = BytesIO()
+    df2.to_parquet(fname2, store_schema=True)
+
+    # Read tables back with cudf and arrow in either order and compare
+    assert_eq(
+        cudf.read_parquet([fname1, fname2]),
+        cudf.concat([df1, df2]).reset_index(drop=True),
+    )
+    assert_eq(
+        cudf.read_parquet([fname2, fname1]),
+        cudf.concat([df2, df1]).reset_index(drop=True),
+    )
+
+
+def test_parquet_reader_mismatched_nullability_structs(tmpdir):
+    data1 = [
+        {
+            "a": "a",
+            "b": {
+                "b_a": 10,
+                "b_b": {"b_b_b": 1, "b_b_a": 12},
+            },
+            "c": [1, 2],
+        },
+        {
+            "a": "b",
+            "b": {
+                "b_a": 30,
+                "b_b": {"b_b_b": 2, "b_b_a": 2},
+            },
+            "c": [3, 4],
+        },
+        {
+            "a": "c",
+            "b": {
+                "b_a": 50,
+                "b_b": {"b_b_b": 4, "b_b_a": 5},
+            },
+            "c": [5, 6],
+        },
+        {
+            "a": "d",
+            "b": {
+                "b_a": 135,
+                "b_b": {"b_b_b": 12, "b_b_a": 32},
+            },
+            "c": [7, 8],
+        },
+        {
+            "a": "e",
+            "b": {
+                "b_a": 1,
+                "b_b": {"b_b_b": 1, "b_b_a": 5},
+            },
+            "c": [9, 10],
+        },
+        {
+            "a": "f",
+            "b": {
+                "b_a": 32,
+                "b_b": {"b_b_b": 1, "b_b_a": 6},
+            },
+            "c": [11, 12],
+        },
+    ]
+
+    data2 = [
+        {
+            "a": "g",
+            "b": {
+                "b_a": 10,
+                "b_b": {"b_b_b": None, "b_b_a": 2},
+            },
+            "c": None,
+        },
+        {"a": None, "b": {"b_a": None, "b_b": None}, "c": [15, 16]},
+        {"a": "j", "b": None, "c": [8, 10]},
+        {"a": None, "b": {"b_a": None, "b_b": None}, "c": None},
+        None,
+        {
+            "a": None,
+            "b": {"b_a": None, "b_b": {"b_b_b": 1}},
+            "c": [18, 19],
+        },
+        {"a": None, "b": None, "c": None},
+    ]
+
+    pa_table1 = pa.Table.from_pydict({"struct": data1})
+    df1 = cudf.DataFrame.from_arrow(pa_table1)
+
+    pa_table2 = pa.Table.from_pydict({"struct": data2})
+    df2 = cudf.DataFrame.from_arrow(pa_table2)
+
+    # Write tables to parquet
+    buf1 = BytesIO()
+    df1.to_parquet(buf1)
+    buf2 = BytesIO()
+    df2.to_parquet(buf2)
+
+    # Read tables back with cudf and compare with expected.
+    assert_eq(
+        cudf.read_parquet([buf1, buf2]),
+        cudf.concat([df1, df2]).reset_index(drop=True),
+    )
+    assert_eq(
+        cudf.read_parquet([buf2, buf1]),
+        cudf.concat([df2, df1]).reset_index(drop=True),
+    )
