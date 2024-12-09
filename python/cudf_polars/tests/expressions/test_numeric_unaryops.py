@@ -89,3 +89,10 @@ def test_log(ldf, natural):
     q = ldf.select(expr)
 
     assert_gpu_result_equal(q, check_exact=False)
+
+
+def test_negate(ldf):
+    expr = -pl.col("a")
+    q = ldf.select(expr)
+
+    assert_gpu_result_equal(q)
