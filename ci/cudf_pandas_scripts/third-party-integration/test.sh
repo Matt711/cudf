@@ -31,6 +31,10 @@ main() {
 
     for lib in ${LIBS//,/ }; do
         lib=$(echo "$lib" | tr -d '""')
+        # TODO: Use tensorflow with CUDA 12
+        if [ "$lib" = "tensorflow" ]; then
+            continue
+        fi
         echo "Running tests for library $lib"
         CUDA_VERSION=$(if [ "$lib" = "tensorflow" ]; then echo "11.8"; else echo "${RAPIDS_CUDA_VERSION%.*}"; fi)
 
