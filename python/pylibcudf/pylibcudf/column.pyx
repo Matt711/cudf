@@ -15,7 +15,21 @@ from .scalar cimport Scalar
 from .types cimport DataType, size_of, type_id
 from .utils cimport int_to_bitmask_ptr, int_to_void_ptr
 
-import functools
+from functools import cache, singledispatchmethod
+
+try:
+    import numpy as np
+    np_error = None
+except ImportError as err:
+    np = None
+    np_error = err
+
+try:
+    import cupy as cp
+    cp_error = None
+except ImportError as err:
+    cp = None
+    cp_error = err
 
 __all__ = ["Column", "ListColumnView", "is_c_contiguous"]
 
@@ -321,6 +335,40 @@ cdef class Column:
             []
         )
 
+    @singledispatchmethod
+    @classmethod
+    def from_any(cls, obj):
+        if np_error is not None:
+            raise np_error
+        if cp_error is not None:
+            raise cp_error
+        raise TypeError(f"Cannot convert a {type(obj)} to a pylibcudf Column")
+
+    if np is not None:
+        @classmethod
+        def from_array_interface_obj(cls, object obj):
+            try:
+                obj.__array_interface__
+            except AttributeError:
+                raise ValueError(
+                    "Converting to a pylibcudf Column must be constructed "
+                    "from an object supporting the array interface"
+                )
+            return Column.from_cuda_array_interface_obj(
+                DeviceBuffer.to_device(
+                    np.asarray(obj).tobytes()
+                )
+            )
+
+        @from_any.register(np.ndarray)
+        def _(cls, obj):
+            return cls.from_array_interface_obj(obj)
+
+    if cp is not None:
+        @from_any.register(cp.ndarray)
+        def _(cls, obj):
+            return Column.from_cuda_array_interface_obj(obj)
+
     cpdef DataType type(self):
         """The type of data in the column."""
         return self._data_type
@@ -407,7 +455,7 @@ cdef class ListColumnView:
         return lists_column_view(self._column.view())
 
 
-@functools.cache
+@cache
 def _datatype_from_dtype_desc(desc):
     mapping = {
         'u1': type_id.UINT8,
