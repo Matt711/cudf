@@ -17,6 +17,7 @@ from .utils cimport int_to_bitmask_ptr, int_to_void_ptr
 
 from functools import cache, singledispatchmethod
 
+
 try:
     import numpy as np
     np_error = None
@@ -347,17 +348,9 @@ cdef class Column:
     if np is not None:
         @classmethod
         def from_array_interface_obj(cls, object obj):
-            try:
-                obj.__array_interface__
-            except AttributeError:
-                raise ValueError(
-                    "Converting to a pylibcudf Column must be constructed "
-                    "from an object supporting the array interface"
-                )
-            return Column.from_cuda_array_interface_obj(
-                DeviceBuffer.to_device(
-                    np.asarray(obj).tobytes()
-                )
+            raise NotImplementedError(
+                "Converting to a pylibcudf Column from an array "
+                "interface object is not yet implemented."
             )
 
         @from_any.register(np.ndarray)

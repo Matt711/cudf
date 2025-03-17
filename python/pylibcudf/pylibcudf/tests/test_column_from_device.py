@@ -1,6 +1,5 @@
 # Copyright (c) 2024-2025, NVIDIA CORPORATION.
 
-import numpy as np
 import pyarrow as pa
 import pytest
 from utils import assert_column_eq
@@ -79,9 +78,4 @@ def test_from_cuda_array_interface(
 
     res = plc.Column.from_cuda_array_interface_obj(iface_obj)
 
-    assert_column_eq(input_column, res)
-
-
-def test_from_array_interface_obj(input_column):
-    res = plc.Column.from_array_interface_obj(np.asarray(input_column))
     assert_column_eq(input_column, res)
