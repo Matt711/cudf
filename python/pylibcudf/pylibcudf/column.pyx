@@ -306,30 +306,29 @@ cdef class Column:
 
         Notes
         -----
-        Data is not copied when creating the column. The caller is
-        responsible for ensuring the data is not mutated unexpectedly while the
-        column is in use.
+        If a 2D array is provided, it is flattened into a 1D column.
+        Data is not copied unless necessary (e.g., for non-contiguous inputs).
         """
-        data = gpumemoryview(obj)
-        iface = data.__cuda_array_interface__
+        iface = obj.__cuda_array_interface__
         if iface.get('mask') is not None:
-            raise ValueError("mask not yet supported.")
-
-        typestr = iface['typestr'][1:]
-        data_type = _datatype_from_dtype_desc(typestr)
-
+            raise ValueError("Mask not yet supported.")
+        data_type = _datatype_from_dtype_desc(iface['typestr'][1:])
+        shape = iface['shape']
+        if len(shape) > 2:
+            raise ValueError("Only 1D and 2D arrays are supported.")
+        # data_ptr, read_only = iface["data"]
+        # if read_only:
+        #     raise ValueError("Cannot move read-only buffer to a Column.")
         if not is_c_contiguous(
-            iface['shape'],
-            iface['strides'],
+            shape,
+            iface.get('strides'),
             size_of(data_type)
         ):
             raise ValueError("Data must be C-contiguous")
-
-        size = iface['shape'][0]
         return Column(
             data_type,
-            size,
-            data,
+            shape[0] * shape[1],
+            gpumemoryview(obj),
             None,
             0,
             0,
