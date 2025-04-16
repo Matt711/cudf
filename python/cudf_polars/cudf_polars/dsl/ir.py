@@ -1118,6 +1118,107 @@ class GroupBy(IR):
         return DataFrame(broadcasted).slice(options.slice)
 
 
+class Sink(IR):
+    """Sink a dataframe to a file."""
+
+    __slots__ = ("kind", "path", "options")
+    _non_child = ("schema", "kind", "path", "options")
+
+    kind: str
+    path: str
+    options: dict[str, Any]
+
+    def __init__(self, schema, kind: str, path: str, options: dict[str, Any], df: IR):
+        self.schema = schema
+        self.kind = kind
+        self.path = path
+        self.options = options
+        self.children = (df,)
+        self._non_child_args = (schema, kind, path, options)
+
+        if kind == "Csv":
+            serialize = options["serialize_options"]
+            if options["include_bom"]:
+                raise NotImplementedError("include_bom is not supported.")
+            for key in (
+                "date_format",
+                "time_format",
+                "datetime_format",
+                "float_scientific",
+                "float_precision",
+            ):
+                if serialize[key] is not None:
+                    raise NotImplementedError(f"{key} is not supported.")
+            if serialize["quote_style"] != "Necessary":
+                raise NotImplementedError("Only quote_style='Necessary' is supported.")
+            if chr(serialize["quote_char"]) != '"':
+                raise NotImplementedError("Only quote_char='\"' is supported.")
+        elif kind == "Parquet":
+            compression = options["compression"]
+            if compression != "Uncompressed":
+                compression_type, compression_level = next(iter(compression.items()))
+                if compression_level is not None:
+                    raise NotImplementedError("compression_level is not supported.")
+                if not hasattr(plc.io.types.CompressionType, compression_type.upper()):
+                    raise NotImplementedError(
+                        f"{compression_type=} is not supported."
+                    )
+        elif kind == "Json":
+            pass
+        else:
+            raise NotImplementedError(f"Unhandled sink kind: {kind}")
+
+    @classmethod
+    def do_evaluate(cls, schema, kind, path, options, df: DataFrame) -> DataFrame:
+        target = plc.io.SinkInfo([path])
+
+        if kind == "Csv":
+            serialize = options["serialize_options"]
+            writer_opts = (
+                plc.io.csv.CsvWriterOptions.builder(target, df.table)
+                .include_header(options["include_header"])
+                .names(df.column_names if options["include_header"] else [])
+                .na_rep(serialize["null"])
+                .line_terminator(serialize["line_terminator"])
+                .inter_column_delimiter(chr(serialize["separator"]))
+                .build()
+            )
+            plc.io.csv.write_csv(writer_opts)
+
+        elif kind == "Parquet":
+            metadata = plc.io.types.TableInputMetadata(df.table)
+            for i, name in enumerate(df.column_names):
+                metadata.column_metadata[i].set_name(name)
+
+            builder = plc.io.parquet.ParquetWriterOptions.builder(target, df.table)
+            if (compression := options["compression"]) != "Uncompressed":
+                compression_type, _ = next(iter(compression.items()))
+                builder.compression(getattr(plc.io.types.CompressionType, compression_type.upper()))
+
+            if options["data_page_size"] is not None:
+                builder.set_max_page_size_bytes(options["data_page_size"])
+            if options["row_group_size"] is not None:
+                builder.row_group_size_rows(options["row_group_size"])
+
+            plc.io.parquet.write_parquet(builder.metadata(metadata).build())
+
+        elif kind == "Json":
+            metadata = plc.io.TableWithMetadata(df.table, [(col, []) for col in df.column_names])
+            writer_opts = (
+                plc.io.json.JsonWriterOptions.builder(target, df.table)
+                .lines(True)
+                .na_rep("null")
+                .include_nulls(True)
+                .metadata(metadata)
+                .build()
+            )
+            plc.io.json.write_json(writer_opts)
+
+        else:
+            raise AssertionError(f"Invalid sink kind: {kind}")
+
+        return df
+
 class ConditionalJoin(IR):
     """A conditional inner join of two dataframes on a predicate."""
 

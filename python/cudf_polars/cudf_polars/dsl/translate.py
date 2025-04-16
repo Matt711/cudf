@@ -494,6 +494,22 @@ def _(
 ) -> ir.IR:
     return ir.HConcat(schema, *(translator.translate_ir(n=n) for n in node.inputs))
 
+@_translate_ir.register
+def _(
+    node: pl_ir.Sink, translator: Translator, schema: dict[str, plc.DataType]
+) -> ir.IR:
+    payload = json.loads(node.payload)
+    file = payload["File"]
+    file_type = file["file_type"]
+    file_path = file["target"]
+    sink_kind, options = next(iter(file_type.items()))
+    return ir.Sink(
+        schema=schema,
+        kind=sink_kind,
+        path=file_path,
+        options=options,
+        df=translator.translate_ir(n=node.input),
+    )
 
 def translate_named_expr(
     translator: Translator, *, n: pl_expr.PyExprIR

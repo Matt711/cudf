@@ -12,12 +12,18 @@ from polars.testing.asserts import assert_frame_equal
 
 from cudf_polars.dsl.translate import Translator
 
+from pathlib import Path
+
+import polars as pl
+
 if TYPE_CHECKING:
     import polars as pl
 
     from cudf_polars.typing import OptimizationArgs
 
-__all__: list[str] = ["assert_gpu_result_equal", "assert_ir_translation_raises"]
+    from typing import Literal, Callable
+
+__all__: list[str] = ["assert_gpu_result_equal", "assert_ir_translation_raises", "assert_sink_result_equal"]
 
 
 # Will be overriden by `conftest.py` with the value from the `--executor`
@@ -244,3 +250,74 @@ def assert_collect_raises(
     else:
         if cudf_except != ():
             raise AssertionError(f"GPU execution DID NOT RAISE {cudf_except}")
+
+
+def _resolve_sink_format(path: Path) -> Literal["csv", "parquet", "ndjson"]:
+    suffix = path.suffix.lower()
+    supported_ext = {
+        ".csv": "csv",
+        ".pq": "parquet",
+        ".parquet": "parquet",
+        ".json": "ndjson",
+        ".ndjson": "ndjson",
+    }
+    if suffix not in supported_ext:
+        raise ValueError(f"Unsupported file format: {suffix}")
+    return supported_ext[suffix]
+
+
+def assert_sink_result_equal(
+    lazydf: pl.LazyFrame,
+    path: str | Path,
+    *,
+    engine: str | GPUEngine = "gpu",
+    read_kwargs: dict | None = None,
+    write_kwargs: dict | None = None,
+) -> None:
+    path = Path(path)
+    read_kwargs = read_kwargs or {}
+    write_kwargs = write_kwargs or {}
+
+    fmt = _resolve_sink_format(path)
+
+    cpu_path = path.with_name(f"{path.stem}_cpu{path.suffix}")
+    gpu_path = path.with_name(f"{path.stem}_gpu{path.suffix}")
+
+    sink_fn = getattr(lazydf, f"sink_{fmt}")
+    read_fn = getattr(pl, f"read_{fmt}")
+
+    sink_fn(cpu_path, **write_kwargs)
+    sink_fn(
+        gpu_path,
+        engine=GPUEngine(raise_on_fail=True) if engine == "gpu" else engine,
+        **write_kwargs,
+    )
+
+    expected = read_fn(str(cpu_path), **read_kwargs)
+    result = read_fn(str(gpu_path), **read_kwargs)
+
+    assert_frame_equal(expected, result)
+
+
+def assert_sink_ir_translation_raises(
+    lazydf: pl.LazyFrame,
+    path: str | Path,
+    write_kwargs: dict,
+    *exceptions: type[Exception],
+) -> None:
+    path = Path(path)
+    fmt = _resolve_sink_format(path)
+
+    try:
+        lazy_sink = getattr(lazydf, f"sink_{fmt}")(
+            path,
+            engine="gpu",
+            lazy=True,
+            **write_kwargs,
+        )
+    except Exception as e:
+        raise AssertionError(
+            f"Sink function raised an exception before translation: {e}"
+        ) from e
+
+    assert_ir_translation_raises(lazy_sink, *exceptions)
