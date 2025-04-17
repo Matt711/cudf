@@ -47,5 +47,7 @@ cdef class ParquetMetadata:
 
     cpdef list rowgroup_metadata(self)
 
+    cpdef list detailed_rowgroup_metadata(self)
+
 
 cpdef ParquetMetadata read_parquet_metadata(SourceInfo src_info)

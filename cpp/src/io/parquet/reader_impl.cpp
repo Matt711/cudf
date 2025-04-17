@@ -864,11 +864,56 @@ parquet_metadata read_parquet_metadata(host_span<std::unique_ptr<datasource> con
   // Open and parse the source dataset metadata
   auto metadata = aggregate_reader_metadata(sources, use_arrow_schema, has_column_projection);
 
-  return parquet_metadata{parquet_schema{walk_schema(&metadata, 0)},
-                          metadata.get_num_rows(),
-                          metadata.get_num_row_groups(),
-                          metadata.get_key_value_metadata()[0],
-                          metadata.get_rowgroup_metadata()};
+  std::vector<cudf::io::row_group_info> detailed_metadata;
+
+  for (size_type rg_idx = 0; rg_idx < metadata.get_num_row_groups(); ++rg_idx) {
+    cudf::io::row_group_info rg_info;
+  
+    auto rowgroup_meta = metadata.get_rowgroup_metadata();  // this is now a named object
+    auto const& rg_map = rowgroup_meta.at(rg_idx);          // safe reference
+    rg_info.num_rows = rg_map.at("num_rows");
+    rg_info.total_byte_size = rg_map.at("total_byte_size");
+  
+    // Iterate over schema elements from file 0 and filter for leaf nodes
+    auto const& schema_vec = metadata.get_schema(0, /*pfm_idx=*/0).parent_idx == -1
+                               ? metadata.get_schema(0).children_idx
+                               : std::vector<int>{};
+    int schema_count = static_cast<int>(metadata.get_schema(0).children_idx.size());
+  
+    for (int schema_idx = 0; schema_idx < schema_count; ++schema_idx) {
+      auto const& schema = metadata.get_schema(schema_idx);
+      if (!schema.children_idx.empty()) {
+        continue;  // skip nested
+      }
+  
+      auto const& column = metadata.get_column_metadata(rg_idx, 0, schema_idx);
+  
+      column_metadata col_info;
+      col_info.name = std::accumulate(
+        std::next(column.path_in_schema.begin()),
+        column.path_in_schema.end(),
+        column.path_in_schema.front(),
+        [](std::string a, std::string const& b) { return a + "." + b; });
+      col_info.total_uncompressed_size = column.total_uncompressed_size;
+  
+      rg_info.columns.push_back(std::move(col_info));
+    }
+  
+    detailed_metadata.push_back(std::move(rg_info));
+  }
+
+  // return parquet_metadata{parquet_schema{walk_schema(&metadata, 0)},
+  //                         metadata.get_num_rows(),
+  //                         metadata.get_num_row_groups(),
+  //                         metadata.get_key_value_metadata()[0],
+  //                         metadata.get_rowgroup_metadata()};
+  return parquet_metadata{
+    parquet_schema{walk_schema(&metadata, 0)},
+    metadata.get_num_rows(),
+    metadata.get_num_row_groups(),
+    metadata.get_key_value_metadata()[0],
+    metadata.get_rowgroup_metadata(),
+    std::move(detailed_metadata)};
 }
 
 }  // namespace cudf::io::parquet::detail

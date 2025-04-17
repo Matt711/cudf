@@ -190,6 +190,36 @@ cdef class ParquetMetadata:
             for metadata in self.meta.rowgroup_metadata()
         ]
 
+    cpdef list detailed_rowgroup_metadata(self):
+        """
+        Returns the detailed row group metadata including per-column statistics.
+
+        Returns
+        -------
+        list[dict]
+            Each element is a dictionary with keys: "num_rows", "total_byte_size", "columns"
+            where "columns" is itself a list of dicts with "name" and "total_uncompressed_size"
+        """
+        cdef cpp_parquet_metadata.row_group_info rg
+        cdef cpp_parquet_metadata.column_metadata col
+
+        result = []
+        for rg in self.meta.detailed_rowgroup_metadata():
+            rg_dict = {
+                "num_rows": rg.num_rows,
+                "total_byte_size": rg.total_byte_size,
+                "columns": [
+                    {
+                        "name": col.name.decode(),
+                        "total_uncompressed_size": col.total_uncompressed_size,
+                    }
+                    for col in rg.columns
+                ],
+            }
+            result.append(rg_dict)
+
+        return result
+
 
 cpdef ParquetMetadata read_parquet_metadata(SourceInfo src_info):
     """

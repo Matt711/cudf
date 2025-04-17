@@ -20,12 +20,22 @@ cdef extern from "cudf/io/parquet_metadata.hpp" namespace "cudf::io" nogil:
         parquet_schema() except +libcudf_exception_handler
         parquet_column_schema root() except +libcudf_exception_handler
 
+    cdef cppclass column_metadata:
+        string name
+        int64_t total_uncompressed_size
+
+    cdef cppclass row_group_info:
+        int64_t total_byte_size
+        int64_t num_rows
+        vector[column_metadata] columns
+
     cdef cppclass parquet_metadata:
         parquet_metadata() except +libcudf_exception_handler
         parquet_schema schema() except +libcudf_exception_handler
         int64_t num_rows() except +libcudf_exception_handler
         size_type num_rowgroups() except +libcudf_exception_handler
         unordered_map[string, string] metadata() except +libcudf_exception_handler
+        vector[row_group_info] detailed_rowgroup_metadata() except +libcudf_exception_handler
         vector[unordered_map[string, int64_t]] rowgroup_metadata()\
             except +libcudf_exception_handler
 

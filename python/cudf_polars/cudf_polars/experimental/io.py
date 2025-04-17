@@ -250,28 +250,73 @@ class SplitScan(IR):
         )
 
 
-def _sample_pq_statistics(ir: Scan) -> dict[str, np.floating[T]]:
-    import numpy as np
-    import pyarrow.dataset as pa_ds
+# def _sample_pq_statistics(ir: Scan) -> dict[str, np.floating[T]]:
+#     import numpy as np
+#     import pyarrow.dataset as pa_ds
 
-    # Use average total_uncompressed_size of three files
-    # TODO: Use plc.io.parquet_metadata.read_parquet_metadata
-    n_sample = min(3, len(ir.paths))
-    column_sizes = {}
-    ds = pa_ds.dataset(random.sample(ir.paths, n_sample), format="parquet")
-    for i, frag in enumerate(ds.get_fragments()):
-        md = frag.metadata
-        for rg in range(md.num_row_groups):
-            row_group = md.row_group(rg)
-            for col in range(row_group.num_columns):
-                column = row_group.column(col)
-                name = column.path_in_schema
-                if name not in column_sizes:
-                    column_sizes[name] = np.zeros(n_sample, dtype="int64")
-                column_sizes[name][i] += column.total_uncompressed_size
+#     # Use average total_uncompressed_size of three files
+#     # TODO: Use plc.io.parquet_metadata.read_parquet_metadata
+#     n_sample = min(3, len(ir.paths))
+#     column_sizes = {}
+#     ds = pa_ds.dataset(random.sample(ir.paths, n_sample), format="parquet")
+#     for i, frag in enumerate(ds.get_fragments()):
+#         md = frag.metadata
+#         for rg in range(md.num_row_groups):
+#             row_group = md.row_group(rg)
+#             for col in range(row_group.num_columns):
+#                 column = row_group.column(col)
+#                 name = column.path_in_schema
+#                 if name not in column_sizes:
+#                     column_sizes[name] = np.zeros(n_sample, dtype="int64")
+#                 column_sizes[name][i] += column.total_uncompressed_size
 
-    return {name: np.mean(sizes) for name, sizes in column_sizes.items()}
+#     return {name: np.mean(sizes) for name, sizes in column_sizes.items()}
 
+# def _sample_pq_statistics(ir: Scan) -> dict[str, float]:
+#     import numpy as np
+#     import pylibcudf as plc
+
+#     n_sample = min(3, len(ir.paths))
+#     sampled_paths = random.sample(ir.paths, n_sample)
+
+#     # Accumulate sizes per column across sampled files
+#     sizes: dict[str, list[int]] = {}
+
+#     for path in sampled_paths:
+#         md = plc.io.parquet_metadata.read_parquet_metadata(plc.io.SourceInfo([path]))
+#         for rg in md.detailed_rowgroup_metadata():
+#             for col in rg["columns"]:
+#                 name = col["name"]
+#                 sizes.setdefault(name, []).append(col["total_uncompressed_size"])
+
+#     return {k: float(np.mean(v)) for k, v in sizes.items()}
+
+# def _sample_pq_statistics(ir: Scan) -> dict[str, np.floating[T]]:
+#     """
+#     Estimate average uncompressed size per column using total_byte_size
+#     from a sample of Parquet files. The result is a dict from column name
+#     to mean estimated size in bytes, or an empty dict if unavailable.
+#     """
+#     import numpy as np
+#     from pylibcudf.io import SourceInfo, parquet_metadata
+
+#     n_sample = min(3, len(ir.paths))
+#     sample_paths = random.sample(ir.paths, n_sample)
+
+#     src_info = SourceInfo(sample_paths)
+#     meta = parquet_metadata.read_parquet_metadata(src_info)
+
+#     # Total uncompressed size across row groups
+#     total_size = sum(rg["total_byte_size"] for rg in meta.rowgroup_metadata())
+
+#     # Total number of columns (excluding nested structure)
+#     schema = meta.schema().root()
+#     col_names = [schema.child(i).name() for i in range(schema.num_children())]
+
+#     # Heuristic: evenly divide total size among all top-level columns
+#     size_per_col = total_size / len(col_names) if col_names else 0
+
+#     return {name: np.float64(size_per_col) for name in col_names}
 
 @lower_ir_node.register(Scan)
 def _(
