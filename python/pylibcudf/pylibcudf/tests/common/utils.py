@@ -43,6 +43,21 @@ def metadata_from_arrow_type(
     return metadata
 
 
+def assert_nested_array_almost_equal(lhs, rhs):
+    assert len(lhs) == len(rhs), f"Length mismatch: {len(lhs)} != {len(rhs)}"
+    for i, (left, right) in enumerate(zip(lhs, rhs)):
+        if isinstance(left, pa.Scalar) and pa.types.is_list(left.type):
+            left = np.array(left.as_py(), dtype=np.float64)
+            right = np.array(right.as_py(), dtype=np.float64)
+            np.testing.assert_array_almost_equal(
+                left, right, err_msg=f"Mismatch at index {i}"
+            )
+        else:
+            np.testing.assert_almost_equal(
+                left, right, err_msg=f"Mismatch at index {i}"
+            )
+
+
 def assert_column_eq(
     lhs: pa.Array | plc.Column,
     rhs: pa.Array | plc.Column,
@@ -157,19 +172,29 @@ def assert_column_eq(
             rhs = [rhs]
 
         for lh_arr, rh_arr in zip(lhs, rhs):
-            # Check NaNs positions match
-            # and then filter out nans
-            lhs_nans = pc.is_nan(lh_arr)
-            rhs_nans = pc.is_nan(rh_arr)
-            assert lhs_nans.equals(rhs_nans)
+            try:
+                # Check NaNs positions match
+                # and then filter out nans
+                lhs_nans = pc.is_nan(lh_arr)
+                rhs_nans = pc.is_nan(rh_arr)
+                assert lhs_nans.equals(rhs_nans)
 
-            if pc.any(lhs_nans) or pc.any(rhs_nans):
-                # masks must be equal at this point
-                mask = pc.fill_null(pc.invert(lhs_nans), True)
-                lh_arr = lh_arr.filter(mask)
-                rh_arr = rh_arr.filter(mask)
+                if pc.any(lhs_nans) or pc.any(rhs_nans):
+                    # masks must be equal at this point
+                    mask = pc.fill_null(pc.invert(lhs_nans), True)
+                    lh_arr = lh_arr.filter(mask)
+                    rh_arr = rh_arr.filter(mask)
 
+            except pa.ArrowNotImplementedError:
+                # If the nested type doesn't support
+                # (e.g., list<float>), skip NaN mask
+                # comparison and just check values
+                assert_nested_array_almost_equal(lh_arr, rh_arr)
+                continue
+
+            # Now do approximate comparison of values regardless
             np.testing.assert_array_almost_equal(lh_arr, rh_arr)
+
     else:
         assert lhs.equals(rhs)
 

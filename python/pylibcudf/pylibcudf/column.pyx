@@ -146,23 +146,54 @@ class _Ravelled:
         self.__cuda_array_interface__ = cai
 
 
-def _parse_array_interface(
-    iface: dict
-) -> tuple[tuple[int, bool] | None | object, tuple, tuple | None, DataType, int]:
+# def _parse_array_interface(
+#     iface: dict
+# ) -> tuple[tuple[int, bool] | None | object, tuple, tuple | None, DataType, int]:
+#     """
+#     Parse and validate a CUDA or NumPy array interface dict.
+#     """
+#     typestr = iface["typestr"]
+#     if typestr[0] == ">":
+#         raise ValueError("Big-endian data is not supported")
+
+#     data = iface.get("data")
+#     dtype = _datatype_from_dtype_desc(typestr[1:])
+#     shape = iface["shape"]
+#     strides = iface.get("strides")
+#     itemsize = size_of(dtype)
+
+#     return data, shape, strides, dtype, itemsize
+
+def _parse_array_interface(iface: dict) -> tuple:
     """
-    Parse and validate a CUDA or NumPy array interface dict.
+    Parse a CUDA or NumPy array interface dict.
     """
     typestr = iface["typestr"]
-    if typestr[0] == ">":
-        raise ValueError("Big-endian data is not supported")
-
     data = iface.get("data")
-    dtype = _datatype_from_dtype_desc(typestr[1:])
     shape = iface["shape"]
     strides = iface.get("strides")
-    itemsize = size_of(dtype)
+    return typestr, data, shape, strides
 
-    return data, shape, strides, dtype, itemsize
+
+def _validate_array_metadata(typestr, data, shape, strides, itemsize):
+    """
+    Validate the CUDA or NumPy array interface metadata.
+    """
+    if typestr[0] == ">":
+        raise ValueError("Big-endian data is not supported")
+    if not isinstance(data, tuple) or not isinstance(data[0], int):
+        raise ValueError(
+            "Expected a data field with an integer pointer in the array interface. "
+            "Objects with data set to None or a buffer object are not supported."
+        )
+    if not is_c_contiguous(shape, strides, itemsize):
+        raise ValueError("Data must be C-contiguous")
+    if len(shape) > 1:
+        total_rows = functools.reduce(operator.mul, shape[:-1])
+    else:
+        total_rows = shape[0]
+    if total_rows >= numeric_limits[size_type].max():
+        raise ValueError("Number of rows exceeds size_type limit for offsets column.")
 
 
 cdef class Column:
@@ -547,75 +578,49 @@ cdef class Column:
         return Column.from_libcudf(move(c_result))
 
     @staticmethod
-    cdef Column from_gpumemoryview(
+    cdef Column _from_gpumemoryview(
         gpumemoryview data,
         tuple shape,
         tuple strides,
         DataType dtype,
     ):
-        """
-        Construct a Column from a gpumemoryview and array metadata.
+        """Construct a Column from a gpumemoryview."""
+        ndim = len(shape)
+        flat_size = functools.reduce(operator.mul, shape)
+        data_col = Column(
+            data_type=dtype,
+            size=flat_size,
+            data=data,
+            mask=None,
+            null_count=0,
+            offset=0,
+            children=[],
+        )
 
-        Parameters
-        ----------
-        data : gpumemoryview
-            The data buffer.
-        shape : tuple
-            The shape of the array.
-        strides : tuple or None
-            The strides of the array, or None if C-contiguous.
-        dtype : DataType
-            The element type of the array.
+        if ndim == 1:
+            return data_col
 
-        Returns
-        -------
-        Column
-        """
-        if not is_c_contiguous(shape, strides, size_of(dtype)):
-            raise ValueError("Data must be C-contiguous")
-
-        if len(shape) == 1:
-            size = shape[0]
-            return Column(dtype, size, data, None, 0, 0, [])
-
-        elif len(shape) == 2:
-            num_rows, num_cols = shape
-
-            if num_rows >= numeric_limits[size_type].max():
-                raise ValueError(
-                    "Number of rows exceeds size_type limit for offsets column."
-                )
+        current_data_col = data_col
+        for level, dim in enumerate(reversed(shape[:-1]), 1):
+            total_rows = functools.reduce(operator.mul, shape[: -level])
 
             offsets_col = sequence(
-                num_rows + 1,
+                total_rows + 1,
                 Scalar.from_py(0, DataType(type_id.INT32)),
-                Scalar.from_py(num_cols, DataType(type_id.INT32)),
+                Scalar.from_py(shape[-level], DataType(type_id.INT32)),
             )
 
-            flat_size = num_rows * num_cols
-
-            data_col = Column(
-                data_type=dtype,
-                size=flat_size,
-                data=data,
-                mask=None,
-                null_count=0,
-                offset=0,
-                children=[],
-            )
-
-            return Column(
+            current_data_col = Column(
                 data_type=DataType(type_id.LIST),
-                size=num_rows,
+                size=total_rows,
                 data=None,
                 mask=None,
                 null_count=0,
                 offset=0,
-                children=[offsets_col, data_col],
+                children=[offsets_col, current_data_col],
             )
 
-        else:
-            raise ValueError("Only 1D or 2D arrays are supported")
+        return current_data_col
 
     @classmethod
     def from_array_interface(cls, obj):
@@ -641,7 +646,7 @@ cdef class Column:
         TypeError
             If the object does not implement ``__array_interface__``.
         ValueError
-            If the array is not 1D or 2D, or is not C-contiguous.
+            If the object is not C-contiguous.
             If the number of rows exceeds size_type limit.
             If the 'data' field is invalid.
         NotImplementedError
@@ -652,26 +657,23 @@ cdef class Column:
         except AttributeError:
             raise TypeError("Object does not implement __array_interface__")
 
-        data, shape, strides, dtype, itemsize = _parse_array_interface(iface)
+        typestr, data, shape, strides = _parse_array_interface(iface)
+        dtype = _datatype_from_dtype_desc(typestr[1:])
+        itemsize = size_of(dtype)
+        _validate_array_metadata(typestr, data, shape, strides, itemsize)
 
-        if isinstance(data, tuple) and isinstance(data[0], int):
-            data_ptr = <uintptr_t>data[0]
-            nbytes = functools.reduce(operator.mul, shape, 1) * itemsize
+        data_ptr = <uintptr_t>data[0]
+        nbytes = functools.reduce(operator.mul, shape, 1) * itemsize
 
-            dbuf = DeviceBuffer.to_device(
-                # Converts the uintptr_t integer to a memoryview.
-                # We need the two casts: first to a pointer type,
-                # then to a typed memoryview. This allows us to reinterpret
-                # the raw memory as a 1D array of bytes.
-                <const unsigned char[:nbytes:1]><const unsigned char*>data_ptr
-            )
-        else:
-            raise ValueError(
-                "Expected a data field with an integer pointer in the array interface. "
-                "Objects with data set to None or a buffer object are not supported."
-            )
+        dbuf = DeviceBuffer.to_device(
+            # Converts the uintptr_t integer to a memoryview.
+            # We need the two casts: first to a pointer type,
+            # then to a typed memoryview. This allows us to reinterpret
+            # the raw memory as a 1D array of bytes.
+            <const unsigned char[:nbytes:1]><const unsigned char*>data_ptr
+        )
 
-        return Column.from_gpumemoryview(gpumemoryview(dbuf), shape, strides, dtype)
+        return Column._from_gpumemoryview(gpumemoryview(dbuf), shape, strides, dtype)
 
     @classmethod
     def from_cuda_array_interface(cls, obj):
@@ -693,7 +695,7 @@ cdef class Column:
         TypeError
             If the object does not support ``__cuda_array_interface__``.
         ValueError
-            If the object is not 1D or 2D, or is not C-contiguous.
+            If the object is not C-contiguous.
             If the number of rows exceeds size_type limit.
         NotImplementedError
             If the object has a mask.
@@ -703,12 +705,15 @@ cdef class Column:
         except AttributeError:
             raise TypeError("Object does not implement __cuda_array_interface__")
 
-        _, shape, strides, dtype, _ = _parse_array_interface(iface)
+        typestr, data, shape, strides = _parse_array_interface(iface)
+        dtype = _datatype_from_dtype_desc(typestr[1:])
+        itemsize = size_of(dtype)
+        _validate_array_metadata(typestr, data, shape, strides, itemsize)
 
         if len(shape) == 2:
             obj = _Ravelled(obj)
 
-        return Column.from_gpumemoryview(gpumemoryview(obj), shape, strides, dtype)
+        return Column._from_gpumemoryview(gpumemoryview(obj), shape, strides, dtype)
 
     @classmethod
     def from_array(cls, obj):
@@ -732,7 +737,7 @@ cdef class Column:
 
         Notes
         -----
-        - 1D and 2D C-contiguous host and device arrays are supported.
+        - Only C-contiguous host and device ndarrays are supported.
           For device arrays, the data is not copied.
 
         Examples

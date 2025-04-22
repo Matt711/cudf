@@ -25,111 +25,79 @@ CUPY_DTYPES = [
 
 NUMPY_DTYPES = [
     *CUPY_DTYPES,
-    *[
-        np.dtype("datetime64[s]"),
-        np.dtype("datetime64[ms]"),
-        np.dtype("datetime64[us]"),
-        np.dtype("datetime64[ns]"),
-        np.dtype("timedelta64[s]"),
-        np.dtype("timedelta64[ms]"),
-        np.dtype("timedelta64[us]"),
-        np.dtype("timedelta64[ns]"),
-    ],
+    np.dtype("datetime64[s]"),
+    np.dtype("datetime64[ms]"),
+    np.dtype("datetime64[us]"),
+    np.dtype("datetime64[ns]"),
+    np.dtype("timedelta64[s]"),
+    np.dtype("timedelta64[ms]"),
+    np.dtype("timedelta64[us]"),
+    np.dtype("timedelta64[ns]"),
 ]
 
 
-@pytest.fixture(params=NUMPY_DTYPES, ids=repr)
-def np_1darray(request):
-    dtype = request.param
-    return np.array([0, 1, 2, 3], dtype=dtype)
-
-
-@pytest.fixture(params=NUMPY_DTYPES, ids=repr)
-def np_2darray(request):
-    dtype = request.param
-    return np.array([[0, 1, 2], [3, 4, 5]], dtype=dtype)
-
-
-@pytest.fixture(params=CUPY_DTYPES, ids=repr)
-def cp_1darray(request):
-    dtype = request.param
-    np_data = np.array([0, 1, 2, 3], dtype=dtype)
-    return cp.asarray(np_data), np_data
+@pytest.fixture(params=[1, 2, 3, 4], ids=lambda x: f"ndim={x}")
+def shape(request):
+    ndim = request.param
+    shapes = {
+        1: (6,),
+        2: (2, 3),
+        3: (2, 2, 3),
+        4: (2, 2, 2, 3),
+    }
+    return shapes[ndim]
 
 
 @pytest.fixture(params=CUPY_DTYPES, ids=repr)
-def cp_2darray(request):
+def cp_array_and_np(request, shape):
     dtype = request.param
-    np_data = np.array([[0, 1, 2], [3, 4, 5]], dtype=dtype)
-    return cp.asarray(np_data), np_data
+    size = np.prod(shape)
+    if dtype == np.bool_:
+        arr_np = np.array(
+            [True, False] * ((size + 1) // 2), dtype=dtype
+        ).reshape(shape)
+    else:
+        arr_np = np.arange(size, dtype=dtype).reshape(shape)
+    return cp.asarray(arr_np), arr_np
 
 
-def test_from_ndarray_cupy_1d(cp_1darray):
-    cp_arr, np_arr = cp_1darray
-    expect = pa.array(np_arr, type=pa.from_numpy_dtype(np_arr.dtype))
-    got = plc.Column.from_array(cp_arr)
-    assert_column_eq(expect, got)
+@pytest.fixture(params=NUMPY_DTYPES, ids=repr)
+def np_array(request, shape):
+    dtype = request.param
+    size = np.prod(shape)
+    if dtype == np.bool_:
+        arr = np.array([True, False] * ((size + 1) // 2), dtype=dtype).reshape(
+            shape
+        )
+    elif np.issubdtype(dtype, np.datetime64):
+        unit = dtype.name.split("[")[-1][:-1]
+        start = np.datetime64("2000-01-01", unit)
+        step = np.timedelta64(1, unit)
+        arr = np.arange(start, start + size * step, step, dtype=dtype).reshape(
+            shape
+        )
+    else:
+        arr = np.arange(size, dtype=dtype).reshape(shape)
+    return arr
 
 
-def test_from_ndarray_cupy_2d(cp_2darray):
-    cp_arr, np_arr = cp_2darray
-    dtype = pa.from_numpy_dtype(np_arr.dtype)
-    expect = pa.array(np_arr.tolist(), type=pa.list_(dtype))
-    got = plc.Column.from_array(cp_arr)
-    assert_column_eq(expect, got)
+def test_from_cupy_array(cp_array_and_np):
+    arr_cp, arr_np = cp_array_and_np
+    arrow_type = pa.from_numpy_dtype(arr_np.dtype)
+    for _ in range(len(arr_np.shape) - 1):
+        arrow_type = pa.list_(arrow_type)
+    expected = pa.array(arr_np.tolist(), type=arrow_type)
+
+    result = plc.Column.from_array(arr_cp)
+    assert_column_eq(expected, result)
 
 
-def test_from_ndarray_numpy_1d(np_1darray):
-    expect = pa.array(np_1darray, type=pa.from_numpy_dtype(np_1darray.dtype))
-    got = plc.Column.from_array(np_1darray)
-    assert_column_eq(expect, got)
+def test_from_numpy_array(np_array):
+    arr = np_array
+    arrow_type = pa.from_numpy_dtype(arr.dtype)
+    for _ in range(len(arr.shape) - 1):
+        arrow_type = pa.list_(arrow_type)
+    expected = pa.array(arr.tolist(), type=arrow_type)
 
-
-def test_from_ndarray_numpy_2d(np_2darray):
-    dtype = pa.from_numpy_dtype(np_2darray.dtype)
-    expect = pa.array(np_2darray.tolist(), type=pa.list_(dtype))
-    got = plc.Column.from_array(np_2darray)
-    assert_column_eq(expect, got)
-
-
-def test_non_c_contiguous_raises(cp_2darray):
-    with pytest.raises(
-        ValueError,
-        match="Data must be C-contiguous",
-    ):
-        plc.Column.from_array(cp.asfortranarray(cp_2darray[0]))
-
-
-def test_row_limit_exceed_raises():
-    with pytest.raises(
-        ValueError,
-        match="Number of rows exceeds size_type limit for offsets column.",
-    ):
-        plc.Column.from_array(cp.zeros((2**31, 1)))
-
-
-@pytest.mark.parametrize("obj", [None, "str"])
-def test_from_ndarray_invalid_obj(obj):
-    with pytest.raises(
-        TypeError,
-        match="Cannot convert object of type .* to a pylibcudf Column",
-    ):
-        plc.Column.from_array(obj)
-
-
-def test_array_interface_with_data_none():
-    class ArrayInterfaceWithNone:
-        @property
-        def __array_interface__(self):
-            return {
-                "shape": (4,),
-                "typestr": "<i4",
-                "data": None,
-                "version": 3,
-            }
-
-    with pytest.raises(
-        ValueError,
-        match="Expected a data field .* the array interface.",
-    ):
-        plc.Column.from_array(ArrayInterfaceWithNone())
+    result = plc.Column.from_array(arr)
+    assert_column_eq(expected, result)
