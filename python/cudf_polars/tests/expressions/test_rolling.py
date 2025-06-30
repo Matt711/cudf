@@ -124,11 +124,43 @@ def test_invalid_duration_spec_raises_in_translation():
     assert_ir_translation_raises(q, pl.exceptions.InvalidOperationError)
 
 
-def test_grouped_rolling():
-    df = pl.LazyFrame({"a": [1, 2, 3, 4, 5, 6], "b": [1, 2, 1, 3, 1, 2]})
+def test_over_simple():
+    df = pl.LazyFrame({"x": [1, 2, 3, 4], "g": ["a", "a", "b", "b"]})
+    q = df.select(pl.col("x").max().over("g"))
+    assert_gpu_result_equal(q)
 
-    q = df.select(pl.col("a").min().over("b"))
 
+def test_over_expression_partition():
+    df = pl.LazyFrame({"x": [1, 2, 3, 4], "g": [1, 2, 3, 4]})
+    q = df.select(pl.col("x").max().over(pl.col("g") % 2))
+    assert_gpu_result_equal(q, check_row_order=False)
+
+
+def test_over_multiple_keys():
+    df = pl.LazyFrame({"x": [1, 2, 3, 4], "g1": [1, 1, 2, 2], "g2": [0, 1, 0, 1]})
+    q = df.select(pl.col("x").sum().over("g1", "g2"))
+    assert_gpu_result_equal(q, check_row_order=False)
+
+
+def test_over_order_by():
+    df = pl.LazyFrame(
+        {"store": ["a", "a", "b", "b"], "date": [1, 2, 1, 2], "sales": [10, 20, 15, 25]}
+    )
+    q = df.select(pl.col("sales").cum_sum().over("store", order_by="date"))
+    assert_ir_translation_raises(q, NotImplementedError)
+
+
+def test_over_order_by_desc():
+    df = pl.LazyFrame(
+        {
+            "g": [1, 2, 1, 2],
+            "t": [3, 1, 2, 4],
+            "x": [10, 20, 30, 40],
+        }
+    )
+    q = df.select(
+        pl.col("x").rank().over(pl.col("g"), order_by=pl.col("t"), descending=True)
+    )
     assert_ir_translation_raises(q, NotImplementedError)
 
 

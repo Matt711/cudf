@@ -160,4 +160,50 @@ class GroupedRollingWindow(Expr):
         self.options = options
         self.children = (agg, *by)
         self.is_pointwise = False
-        raise NotImplementedError("Grouped rolling window not implemented")
+        # TODO: should it be group_to_windows or groups_to_windows?
+        if options.kind != "groups_to_rows":
+            raise NotImplementedError(f"mapping_strategy={options.kind}")
+
+    def do_evaluate(  # noqa: D102
+        self, df: DataFrame, *, context: ExecutionContext = ExecutionContext.FRAME
+    ) -> Column:
+        agg, *by = self.children
+        by_cols = [col.evaluate(df) for col in by]
+        key_table = plc.Table([col.obj for col in by_cols])
+
+        sorted = (
+            plc.types.Sorted.YES
+            if all(col.is_sorted for col in by_cols)
+            else plc.types.Sorted.NO
+        )
+
+        grouper = plc.groupby.GroupBy(
+            key_table,
+            null_handling=plc.types.NullPolicy.INCLUDE,
+            keys_are_sorted=sorted,
+            column_order=[col.order for col in by_cols],
+            null_precedence=[col.null_order for col in by_cols],
+        )
+        offsets, _, _ = grouper.get_groups()
+
+        if isinstance(agg, expr.Len):
+            input_col = by_cols[0].obj  # dummy input
+        elif isinstance(agg, expr.Agg):
+            child = agg.children[0]
+            input_col = child.evaluate(df, context=ExecutionContext.GROUPBY).obj
+        else:
+            input_col = agg.evaluate(df, context=ExecutionContext.GROUPBY).obj
+
+        request = plc.groupby.GroupByRequest(input_col, [agg.agg_request])
+        _, [result_table] = grouper.aggregate([request])
+        (col_out,) = result_table.columns()
+
+        group_sizes = [offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1)]
+        repeat_counts = plc.Column.from_iterable_of_py(
+            group_sizes, dtype=plc.DataType(plc.TypeId.INT32)
+        )
+
+        return Column(
+            plc.filling.repeat(plc.Table([col_out]), repeat_counts).columns()[0],
+            dtype=self.dtype,
+        )
