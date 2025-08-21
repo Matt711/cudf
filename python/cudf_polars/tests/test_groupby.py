@@ -390,3 +390,9 @@ def test_groupby_rank_raises(df: pl.LazyFrame) -> None:
     q = df.group_by("key1").agg(pl.col("int").rank())
 
     assert_ir_translation_raises(q, NotImplementedError)
+
+
+def test_groupby_nested_rank_raises(df: pl.LazyFrame) -> None:
+    q = df.group_by("key1").agg(pl.col("int").rank().first())
+
+    assert_ir_translation_raises(q, NotImplementedError)

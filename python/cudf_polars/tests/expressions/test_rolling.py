@@ -217,3 +217,45 @@ def test_over_with_mapping_strategy_unsupported(df, strategy):
 def test_over_boolean_function_unsupported(df):
     q = df.select(pl.col("x").not_().over("g"))
     assert_ir_translation_raises(q, NotImplementedError)
+
+
+@pytest.mark.parametrize("method", ["ordinal", "dense", "min", "max", "average"])
+@pytest.mark.parametrize("descending", [False, True])
+def test_over_rank_methods_basic(
+    df: pl.LazyFrame, method: str, *, descending: bool
+) -> None:
+    expr = pl.col("x").rank(method=method, descending=descending).over("g")
+    q = df.select(expr)
+    assert_gpu_result_equal(q)
+
+
+@pytest.mark.parametrize("method", ["ordinal", "dense", "min", "max", "average"])
+@pytest.mark.parametrize("descending", [False, True])
+def test_over_rank_methods_with_ties(
+    df: pl.LazyFrame, method: str, *, descending: bool
+) -> None:
+    v = pl.when(pl.col("g") == 2).then(pl.lit(4)).otherwise(pl.col("x"))
+    expr = v.rank(method=method, descending=descending).over("g")
+    q = df.select(expr)
+    assert_gpu_result_equal(q)
+
+
+@pytest.mark.parametrize("method", ["ordinal", "dense", "min", "max", "average"])
+@pytest.mark.parametrize("descending", [False, True])
+def test_over_rank_methods_with_null_values(
+    df: pl.LazyFrame, method: str, *, descending: bool
+) -> None:
+    x_null = pl.when((pl.col("x") % 2) == 0).then(None).otherwise(pl.col("x"))
+    expr = x_null.rank(method=method, descending=descending).over("g")
+    q = df.select(expr)
+    assert_gpu_result_equal(q)
+
+
+@pytest.mark.parametrize("method", ["ordinal", "dense", "min", "max", "average"])
+@pytest.mark.parametrize("descending", [False, True])
+def test_over_rank_methods_with_null_partition_keys(
+    df: pl.LazyFrame, method: str, *, descending: bool
+) -> None:
+    expr = pl.col("x").rank(method=method, descending=descending).over("g_null")
+    q = df.select(expr)
+    assert_gpu_result_equal(q)
