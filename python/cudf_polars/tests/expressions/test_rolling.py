@@ -203,9 +203,31 @@ def test_window_over_group_sum_all_null_group_is_zero(df):
     assert_gpu_result_equal(q)
 
 
-def test_over_with_order_by_unsupported(df):
-    q = df.select(pl.col("x").sum().over("g", order_by="x"))
-    assert_ir_translation_raises(q, NotImplementedError)
+# replace the existing test_over_with_order_by_unsupported with this version
+@pytest.mark.parametrize(
+    "order_by",
+    [
+        "x",
+        pl.col("x"),
+        pl.col("x") * 2,
+        (pl.col("x") + 1),
+        pl.when((pl.col("x") % 2) == 0).then(pl.col("x")).otherwise(-pl.col("x")),
+        ["x", "x2"],
+        ["x2", "x"],
+        ["g_null", "g2", "x2"],
+        [pl.col("x") + 1, pl.col("x2") % 10],
+        [pl.col("g") + 7, (pl.col("x") * 3) - 2],
+    ],
+)
+@pytest.mark.parametrize("ob_desc", [False, True])
+@pytest.mark.parametrize("ob_nulls_last", [False, True])
+def test_over_with_order_by(df, order_by, ob_desc, ob_nulls_last):
+    q = df.select(
+        pl.col("x")
+        .sum()
+        .over("g", order_by=order_by, descending=ob_desc, nulls_last=ob_nulls_last)
+    )
+    assert_gpu_result_equal(q)
 
 
 @pytest.mark.parametrize("strategy", ["explode", "join"], ids=["explode", "join"])

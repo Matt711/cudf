@@ -768,24 +768,32 @@ def _(
         descending = bool(getattr(node, "order_by_descending", False))
         nulls_last = bool(getattr(node, "order_by_nulls_last", False))
 
-        if has_order_by or descending or nulls_last:
-            raise NotImplementedError(
-                f"over(order_by) not supported yet: "
-                f"{node.order_by=}, {descending=}, {nulls_last=}"
-            )
-
         if mapping != "groups_to_rows":
             raise NotImplementedError(
-                f"over(mapping_strategy) not supported yet: {mapping=}; "
-                f"expected 'groups_to_rows'"
+                f"over(mapping_strategy) not supported yet: {mapping=}; expected 'groups_to_rows'"
             )
+
+        part_exprs = [
+            translator.translate_expr(n=n, schema=schema) for n in node.partition_by
+        ]
+
+        order_nodes = []
+        if has_order_by:
+            if isinstance(node.order_by, (list, tuple)):
+                order_nodes = list(node.order_by)
+            else:
+                order_nodes = [node.order_by]
+        order_exprs = [
+            translator.translate_expr(n=o, schema=schema) for o in order_nodes
+        ]
+        order_count = len(order_exprs)
 
         return expr.GroupedRollingWindow(
             dtype,
-            (mapping, has_order_by, descending, nulls_last),
+            (mapping, has_order_by, descending, nulls_last, order_count),
             [agg for agg, _ in aggs],
             post,
-            *(translator.translate_expr(n=n, schema=schema) for n in node.partition_by),
+            *(part_exprs + order_exprs),
         )
     assert_never(node.options)
 
