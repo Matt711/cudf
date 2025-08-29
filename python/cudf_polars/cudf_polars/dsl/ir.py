@@ -21,6 +21,7 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from cuda.bindings.runtime import cudaDeviceSynchronize
 from typing_extensions import assert_never
 
 import polars as pl
@@ -168,6 +169,7 @@ class IR(Node["IR"]):
         if timer is not None:
             start = time.monotonic_ns()
             result = self.do_evaluate(*self._non_child_args, *children)
+            cudaDeviceSynchronize()
             end = time.monotonic_ns()
             # TODO: Set better names on each class object.
             timer.store(start, end, type(self).__name__)

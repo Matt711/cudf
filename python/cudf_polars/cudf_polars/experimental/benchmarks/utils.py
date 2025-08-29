@@ -333,6 +333,8 @@ def get_executor_options(
     run_config: RunConfig, benchmark: Any = None
 ) -> dict[str, Any]:
     """Generate executor_options for GPUEngine."""
+    if run_config.executor != "streaming":
+        return {}
     executor_options: dict[str, Any] = {}
 
     if run_config.blocksize:
@@ -453,7 +455,12 @@ def execute_query(
         color="green",
     ):
         if run_config.executor == "cpu":
-            return q.collect(engine="streaming")
+            if args.profile:
+                df, timings = q.profile(engine="streaming")
+                _print_profile_timings(q_id, i, timings)
+                return df
+            else:
+                return q.collect(engine="streaming")
 
         elif CUDF_POLARS_AVAILABLE:
             assert isinstance(engine, pl.GPUEngine)
@@ -466,7 +473,12 @@ def execute_query(
                     return evaluate_streaming(ir, translator.config_options).to_polars()
                 assert_never(run_config.executor)
             else:
-                return q.collect(engine=engine)
+                if args.profile:
+                    df, timings = q.profile(engine=engine)
+                    _print_profile_timings(q_id, i, timings)
+                    return df
+                else:
+                    return q.collect(engine=engine)
 
         else:
             raise RuntimeError("The requested engine is not supported.")
@@ -704,6 +716,12 @@ def parse_args(
         default="duckdb",
         help="Which engine to use as the baseline for validation.",
     )
+    parser.add_argument(
+        "--profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Profile the query with the Polars profiler and print per-operation timings.",
+    )
     return parser.parse_args(args)
 
 
@@ -807,3 +825,83 @@ def run_polars(
 
     if query_failures or validation_failures:
         sys.exit(1)
+
+
+# def _print_profile_timings(q_id: int, i: int, timings: list[tuple[int, int, str]]) -> None:
+#     """Pretty-print Polars profiler timings."""
+#     # timings: [(start_ns, end_ns, label), ...]
+#     print(f"\nProfile for Query {q_id} - Iteration {i}")
+#     print("=======================================")
+#     # Convert to durations and align
+#     rows = [
+#         (label, (end - start) / 1e6)  # ms
+#         for (start, end, label) in timings
+#     ]
+#     # Keep order from Polars (already meaningful)
+#     label_width = max((len(lbl) for lbl, _ in rows), default=10)
+#     for lbl, ms in rows:
+#         print(f"{lbl:<{label_width}}  {ms:9.2f} ms")
+#     total_ms = sum(ms for _, ms in rows)
+#     print("-" * (label_width + 14))
+#     print(f"{'total (sum)':<{label_width}}  {total_ms:9.2f} ms\n")
+
+
+def _print_profile_timings(q_id: int, i: int, timings: Any) -> None:
+    """Pretty-print Polars profiler timings, accepting multiple shapes."""
+    print(f"\nProfile for Query {q_id} - Iteration {i}")
+    print("=======================================")
+
+    def _iter_triplets(obj):  # type: ignore
+        # Case 1: Polars DataFrame with columns like: node|start|end
+        try:
+            if isinstance(obj, pl.DataFrame):
+                cols = {c.lower(): c for c in obj.columns}
+                # prefer 'label' over 'node' if present
+                label_col = cols.get("label") or cols.get("op") or cols.get("node")
+                start_col = cols.get("start") or cols.get("start_ns")
+                end_col = cols.get("end") or cols.get("end_ns")
+                if label_col and start_col and end_col:
+                    for r in obj.iter_rows(named=True):
+                        yield int(r[start_col]), int(r[end_col]), str(r[label_col])
+                    return
+        except Exception:
+            pass
+
+        # Case 2: list/iterable of dicts
+        if isinstance(obj, (list, tuple)) and obj and isinstance(obj[0], dict):
+            for r in obj:
+                start = r.get("start") or r.get("start_ns")
+                end = r.get("end") or r.get("end_ns")
+                label = r.get("label") or r.get("op") or r.get("node")
+                if start is not None and end is not None and label is not None:
+                    yield int(start), int(end), str(label)
+            return
+
+        # Case 3: list/iterable of tuples/lists (length >= 3)
+        if isinstance(obj, (list, tuple)):
+            for itm in obj:
+                if isinstance(itm, (list, tuple)) and len(itm) >= 3:
+                    start, end, label = itm[0], itm[1], itm[2]
+                    yield int(start), int(end), str(label)
+            return
+
+        # Fallback: nothing printable
+        return
+
+    rows = [
+        (label, (end - start) / 1e6) for (start, end, label) in _iter_triplets(timings)
+    ]
+
+    if not rows:
+        # last resort—just print the raw object for debugging
+        print("(unrecognized timings shape)")
+        print(repr(timings))
+        print()
+        return
+
+    label_width = max((len(lbl) for lbl, _ in rows), default=10)
+    for lbl, ms in rows:
+        print(f"{lbl:<{label_width}}  {ms:9.5f} ms")
+    total_ms = sum(ms for _, ms in rows)
+    print("-" * (label_width + 14))
+    print(f"{'total (sum)':<{label_width}}  {total_ms:9.2f} ms\n")

@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import contextlib
 import os
-import textwrap
 import time
 import warnings
+from dataclasses import replace
 from functools import cache, partial
 from typing import TYPE_CHECKING, Literal, overload
 
@@ -24,6 +24,9 @@ from rmm._cuda import gpu
 
 from cudf_polars.dsl.tracing import CUDF_POLARS_NVTX_DOMAIN
 from cudf_polars.dsl.translate import Translator
+from cudf_polars.dsl.traversal import traversal as _trav
+from cudf_polars.experimental.base import get_key_name
+from cudf_polars.experimental.profiling import flush_task_events
 from cudf_polars.utils.config import _env_get_int, get_total_device_memory
 from cudf_polars.utils.timer import Timer
 
@@ -235,17 +238,54 @@ def _callback(
         elif config_options.executor.name == "streaming":
             from cudf_polars.experimental.parallel import evaluate_streaming
 
+            # If Polars requested timing, enable task wrapping in the executor.
+            _cfg = config_options
             if timer is not None:
-                msg = textwrap.dedent("""\
-                    LazyFrame.profile() is not supported with the streaming executor.
-                    To profile execution with the streaming executor, use:
+                _cfg = replace(
+                    config_options,
+                    executor=replace(config_options.executor, profile=True),
+                )
 
-                    - NVIDIA NSight Systems with the 'streaming' scheduler.
-                    - Dask's built-in profiling tools with the 'distributed' scheduler.
-                    """)
-                raise NotImplementedError(msg)
+            df = evaluate_streaming(ir, _cfg).to_polars()
 
-            return evaluate_streaming(ir, config_options).to_polars()
+            if timer is None:
+                return df
+
+            # --- Aggregate per IR node ---
+            events = flush_task_events()  # TaskEvent(start, end, node_key, op_label)
+            # Sum per node
+            per_node_ns: dict[str, int] = {}
+            node_label: dict[str, str] = {}
+            for ev in events:
+                per_node_ns[ev.node_key] = per_node_ns.get(ev.node_key, 0) + (
+                    ev.end_ns - ev.start_ns
+                )
+                node_label[ev.node_key] = ev.op_label
+
+            # Emit one timing per IR node in traversal order so Polars UI looks familiar
+            node_order = [get_key_name(n) for n in _trav([ir])]
+            ordered_nodes = [k for k in node_order if k in per_node_ns]
+            # Any internal nodes (e.g., final concat) that don't correspond to an IR node:
+            extras = [k for k in per_node_ns if k not in node_order]
+
+            # Build sequential, non-overlapping intervals
+            base = (
+                timer.timings[-1][1]
+                if timer.timings
+                else (events[0].start_ns if events else time.monotonic_ns())
+            )
+            cursor = base
+            op_timings: list[tuple[int, int, str]] = []
+            for node_key in ordered_nodes + extras:
+                dur = per_node_ns[node_key]
+                label = node_label.get(node_key, node_key)
+                start = cursor
+                end = start + dur
+                op_timings.append((start, end, label))
+                cursor = end
+
+            return df, (timer.timings + op_timings)
+
         assert_never(f"Unknown executor '{config_options.executor}'")
 
 

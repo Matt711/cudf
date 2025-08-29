@@ -431,6 +431,9 @@ class StreamingExecutor:
             f"{_env_prefix}__SINK_TO_DIRECTORY", _bool_converter, default=None
         )
     )
+    # Internal: enable per-task wrapping & timing in streaming executor.
+    # Not user-facing; toggled by .profile() code path.
+    profile: bool = dataclasses.field(default=False, compare=False)
 
     def __post_init__(self) -> None:  # noqa: D105
         # Handle shuffle_method defaults for streaming executor

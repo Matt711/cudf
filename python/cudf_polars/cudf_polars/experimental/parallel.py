@@ -34,6 +34,7 @@ from cudf_polars.experimental.dispatch import (
     lower_ir_node,
 )
 from cudf_polars.experimental.io import _clear_source_info_cache
+from cudf_polars.experimental.profiling import profiled_task
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.utils import _concat, _contains_over, _lower_ir_fallback
 
@@ -142,6 +143,11 @@ def task_graph(
     else:
         key = (key_name, 0)
 
+    graph["__cudf_polars_profile_labels__"] = {
+        get_key_name(n): getattr(n, "op_name", type(n).__name__)
+        for n in traversal([ir])
+    }
+
     graph = post_process_task_graph(graph, key, config_options)
     return graph, key
 
@@ -201,6 +207,52 @@ def post_process_task_graph(
     assert config_options.executor.name == "streaming", (
         "'in-memory' executor not supported in 'post_process_task_graph'"
     )
+
+    # Pull out the op-label metadata (not part of the executable graph)
+    label_map = graph.pop("__cudf_polars_profile_labels__", None)
+
+    # If Polars asked us to profile, wrap each executable task.
+    if getattr(config_options.executor, "profile", False) and label_map:
+
+        def _parse_key(key: Any) -> tuple[str, str]:
+            # String keys: simplest path (e.g., final _concat)
+            if isinstance(key, str):
+                return key, key
+
+            # Tuple keys: (name, idx) OR (name, shard, idx) OR arbitrary…
+            if isinstance(key, tuple) and len(key) > 0:
+                base = key[0] if isinstance(key[0], str) else str(key[0])
+                # Prefer the first INT after the base as the "partition index" for display
+                part_idx = None
+                for comp in key[1:]:
+                    if isinstance(comp, int):
+                        part_idx = comp
+                        break
+                if part_idx is not None:
+                    return base, f"{base}[{part_idx}]"
+                else:
+                    # No obvious partition index; just stringify compactly
+                    return base, f"{base}"
+
+            # Fallback: opaque key type — stringify for the NVTX label,
+            # and use that string to attempt a label_map lookup.
+            s = str(key)
+            return s, s
+
+        wrapped: dict[Any, Any] = {}
+        for k, v in graph.items():
+            # Dask tasks are tuples: (callable, *args). Leave literals alone.
+            if isinstance(v, tuple) and v and callable(v[0]):
+                func, *rest = v
+                node_key, nvtx_label = _parse_key(k)
+                op_label = label_map.get(node_key, node_key)
+                wrapped[k] = (
+                    profiled_task(func, nvtx_label, node_key, op_label),
+                    *rest,
+                )
+            else:
+                wrapped[k] = v
+        graph = wrapped
 
     if config_options.executor.rapidsmpf_spill:  # pragma: no cover
         from cudf_polars.experimental.spilling import wrap_dataframe_in_spillable
