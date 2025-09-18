@@ -2,27 +2,11 @@
 
 from cython.operator cimport dereference
 
-from cpython.float cimport PyFloat_FromDouble
-from cpython.list cimport PyList_New, PyList_SetItem
-from cpython.long cimport (
-    PyLong_FromLong,
-    PyLong_FromLongLong,
-    PyLong_FromUnsignedLong,
-    PyLong_FromUnsignedLongLong,
-)
 from cpython.pycapsule cimport PyCapsule_GetPointer, PyCapsule_New
-from cpython.ref cimport Py_INCREF
-from cpython.unicode cimport PyUnicode_DecodeUTF8
+from cpython.ref cimport PyObject
 
 from libc.stddef cimport size_t
 from libc.stdint cimport (
-    int8_t,
-    int16_t,
-    int32_t,
-    int64_t,
-    uint8_t,
-    uint16_t,
-    uint32_t,
     uint64_t,
     uintptr_t,
 )
@@ -77,6 +61,146 @@ from itertools import accumulate
 from typing import Iterable
 
 __all__ = ["Column", "ListColumnView", "is_c_contiguous"]
+
+
+cdef extern from *:
+    """
+    #include <Python.h>
+    #include <cstdint>
+    #include <type_traits>
+    #include <cstdio>
+    #include <nanoarrow/nanoarrow.h>
+    #include <cudf/types.hpp>
+
+    static inline bool _is_valid(const uint8_t* bm, size_t idx) {
+      if (!bm) return true;
+      return ((bm[idx >> 3] >> (idx & 7)) & 1) != 0;
+    }
+
+    template <typename T, typename Enable = void>
+    struct into_py;
+
+    template <typename T>
+    struct into_py<T, std::enable_if_t<std::is_integral_v<T> && std::is_signed_v<T>>> {
+      static inline PyObject* convert(T v) {
+      return PyLong_FromLongLong((long long)v); }
+    };
+
+    template <typename T>
+    struct into_py<T,
+      std::enable_if_t<std::is_integral_v<T> && std::is_unsigned_v<T>>> {
+      static inline PyObject* convert(T v) {
+        return PyLong_FromUnsignedLongLong((unsigned long long)v); }
+    };
+
+    template <typename T>
+    struct into_py<T, std::enable_if_t<std::is_floating_point_v<T>>> {
+      static inline PyObject* convert(T v) { return PyFloat_FromDouble((double)v); }
+    };
+
+    template <typename EmitFn>
+    static inline PyObject* _make_py_obj(int64_t n,
+                                                   long long offset,
+                                                   bool check_valid,
+                                                   const uint8_t* null_bm,
+                                                   EmitFn&& emit) {
+      PyObject* out = PyList_New(n);
+      if (!out) return nullptr;
+      for (int64_t i = 0; i < n; ++i) {
+        size_t bi = (size_t)(offset + i);
+        if (check_valid && !_is_valid(null_bm, bi)) {
+          Py_INCREF(Py_None);
+          PyList_SET_ITEM(out, i, Py_None);
+          continue;
+        }
+        PyObject* obj = emit(i, bi);
+        if (!obj) { Py_DECREF(out); return nullptr; }
+        PyList_SET_ITEM(out, i, obj);
+      }
+      return out;
+    }
+
+    static inline PyObject* cpp_arrow_to_pylist(int dtype_id, ArrowArray* arr) {
+      int64_t n     = (int64_t)arr->length;
+      long long offset = arr->offset;
+      if (n == 0) return PyList_New(0);
+
+      const void* const* buffers = arr->buffers;
+      bool check_valid           = (arr->null_count != 0);
+      const uint8_t* null_bm     = check_valid ? (const uint8_t*)buffers[0] : nullptr;
+
+      // BOOL8
+      if (dtype_id == (int)cudf::type_id::BOOL8) {
+        const uint8_t* bool_base = (const uint8_t*)buffers[1];
+        auto emit = [&](int64_t, size_t bi)->PyObject*{
+          bool b = ((bool_base[bi >> 3] >> (bi & 7)) & 1) != 0;
+          PyObject* o = b ? Py_True : Py_False; Py_INCREF(o); return o;
+        };
+        return _make_py_obj(n, offset, check_valid, null_bm, emit);
+      }
+
+      // STRING (UTF-8)
+      if (dtype_id == (int)cudf::type_id::STRING) {
+        const int32_t* offs = (const int32_t*)buffers[1] + (size_t)offset;
+        const char* data    = (const char*)buffers[2];
+        auto emit = [&](int64_t i, size_t)->PyObject*{
+          int32_t b = offs[i], e = offs[i + 1], len = e - b;
+          PyObject* s = PyUnicode_DecodeUTF8(data + b, len, nullptr);
+          if (!s) {
+            PyErr_SetString(
+              PyExc_MemoryError,
+              "Unable to convert string dtype to python");
+            return (PyObject*)nullptr;
+          }
+          return s;
+        };
+        return _make_py_obj(n, offset, check_valid, null_bm, emit);
+      }
+
+      // Fixed-width numerics via template
+      auto numerics = [&](auto tag)->PyObject*{
+        using T = decltype(tag);
+        const T* base = (const T*)buffers[1] + (size_t)offset;
+        auto emit = [&](int64_t i, size_t)->PyObject*{
+          PyObject* o = into_py<T>::convert(base[i]);
+          if (!o) {
+            PyErr_SetString(
+              PyExc_MemoryError,
+              "Unable to convert numeric dtype to python");
+            return (PyObject*)nullptr;
+          }
+          return o;
+        };
+        return _make_py_obj(n, offset, check_valid, null_bm, emit);
+      };
+
+      switch ((cudf::type_id)dtype_id) {
+        case cudf::type_id::INT8:    return numerics((int8_t)0);
+        case cudf::type_id::INT16:   return numerics((int16_t)0);
+        case cudf::type_id::INT32:   return numerics((int32_t)0);
+        case cudf::type_id::INT64:   return numerics((int64_t)0);
+
+        case cudf::type_id::UINT8:   return numerics((uint8_t)0);
+        case cudf::type_id::UINT16:  return numerics((uint16_t)0);
+        case cudf::type_id::UINT32:  return numerics((uint32_t)0);
+        case cudf::type_id::UINT64:  return numerics((uint64_t)0);
+
+        case cudf::type_id::FLOAT32: return numerics((float) 0);
+        case cudf::type_id::FLOAT64: return numerics((double)0);
+
+        default: {
+          char buf[96];
+          std::snprintf(
+            buf,
+            sizeof(buf),
+            "Column with dtype=%d not supported", dtype_id);
+          PyErr_SetString(PyExc_NotImplementedError, buf);
+          return nullptr;
+        }
+      }
+    }
+    """
+    PyObject* cpp_arrow_to_pylist(int dtype_id, ArrowArray* arr) except NULL
 
 
 cdef is_iterable(obj):
@@ -1398,135 +1522,6 @@ def is_c_contiguous(
     return True
 
 
-cdef inline bint _is_valid(const uint8_t* null_bitmap, size_t bit_index):
-    # See https://arrow.apache.org/docs/format/Columnar.html#validity-bitmaps
-    # for more details on how the validity bitmap works.
-    if null_bitmap == NULL:
-        return 1
-    return ((null_bitmap[bit_index >> 3] >> (bit_index & 7)) & 1) != 0
-
-
-cdef inline void _set_item(list out, int64_t i, object obj) except *:
-    # PyList_SetItem steals a reference, so this helper function
-    # ensures that we incref the object before calling it
-    # https://docs.python.org/3/c-api/list.html#c.PyList_SetItem
-    Py_INCREF(obj)
-    PyList_SetItem(out, i, obj)
-
-
-cdef inline object _make_py_obj(
-    type_id dtype,
-    int64_t i,
-    const char* numeric_base,
-    const int32_t* str_offsets,
-    const char* str_base
-):
-    cdef object obj
-    if dtype == type_id.STRING:
-        obj = PyUnicode_DecodeUTF8(
-            str_base + str_offsets[i],
-            str_offsets[i + 1] - str_offsets[i],
-            NULL,
-        )
-        if obj is None:
-            raise MemoryError("Unable to convert string dtype to python")
-        return obj
-
-    if dtype == type_id.INT8:
-        return PyLong_FromLong(<long>(<const int8_t*>numeric_base)[i])
-    elif dtype == type_id.INT16:
-        return PyLong_FromLong(<long>(<const int16_t*>numeric_base)[i])
-    elif dtype == type_id.INT32:
-        return PyLong_FromLong(<long>(<const int32_t*>numeric_base)[i])
-    elif dtype == type_id.INT64:
-        return PyLong_FromLongLong(<long long>(<const int64_t*>numeric_base)[i])
-    elif dtype == type_id.UINT8:
-        return PyLong_FromUnsignedLong(
-            <unsigned long>(<const uint8_t*>numeric_base)[i]
-        )
-    elif dtype == type_id.UINT16:
-        return PyLong_FromUnsignedLong(
-            <unsigned long>(<const uint16_t*>numeric_base)[i]
-        )
-    elif dtype == type_id.UINT32:
-        return PyLong_FromUnsignedLong(
-            <unsigned long>(<const uint32_t*>numeric_base)[i]
-        )
-    elif dtype == type_id.UINT64:
-        return PyLong_FromUnsignedLongLong(
-            <unsigned long long>(<const uint64_t*>numeric_base)[i]
-        )
-    elif dtype == type_id.FLOAT32:
-        return PyFloat_FromDouble(<double>(<const float*>numeric_base)[i])
-    else:
-        return PyFloat_FromDouble((<const double*>numeric_base)[i])
-
-
 cdef list _arrow_to_pylist_impl(type_id dtype, ArrowArray* arr):
-    cdef size_t n = <size_t>arr.length
-    cdef list out = <list>PyList_New(n)
-    if out is None:
-        raise MemoryError("Unable to create new python list")
-
-    if n == 0:
-        return out
-
-    cdef const void** buffers = arr.buffers
-    cdef int64_t offset = arr.offset
-    cdef size_t bit_index
-    cdef int64_t i, N = n
-    cdef const char* numeric_base = NULL
-    cdef size_t item_size = 0
-    cdef const uint8_t* bool_base = NULL
-    cdef const int32_t* str_offsets = NULL
-    cdef const char* str_base = NULL
-    cdef bint is_bool = dtype == type_id.BOOL8
-    cdef bint is_string = dtype == type_id.STRING
-    cdef bint check_valid = arr.null_count != 0
-    cdef const uint8_t* null_bm = (
-        <const uint8_t*>buffers[0] if check_valid
-        else NULL
-    )
-
-    if dtype not in {
-        type_id.INT8, type_id.INT16, type_id.INT32, type_id.INT64,
-        type_id.UINT8, type_id.UINT16, type_id.UINT32, type_id.UINT64,
-        type_id.FLOAT32, type_id.FLOAT64, type_id.BOOL8, type_id.STRING
-    }:
-        raise NotImplementedError(f"Column with dtype={dtype} not supported")
-
-    if is_bool:
-        bool_base = <const uint8_t*>buffers[1]
-    elif is_string:
-        str_base = <const char*>buffers[2]
-        str_offsets = <const int32_t*>buffers[1] + offset
-    else:
-        if dtype == type_id.INT8 or dtype == type_id.UINT8:
-            item_size = sizeof(uint8_t)
-        elif dtype == type_id.INT16 or dtype == type_id.UINT16:
-            item_size = sizeof(uint16_t)
-        elif dtype == type_id.INT32 or dtype == type_id.UINT32:
-            item_size = sizeof(uint32_t)
-        elif dtype == type_id.INT64 or dtype == type_id.UINT64:
-            item_size = sizeof(uint64_t)
-        elif dtype == type_id.FLOAT32:
-            item_size = sizeof(float)
-        else:
-            item_size = sizeof(double)
-        numeric_base = <const char*>buffers[1] + item_size * <size_t>offset
-
-    if not check_valid and not is_bool:
-        for i in range(N):
-            obj = _make_py_obj(dtype, i, numeric_base, str_offsets, str_base)
-            _set_item(out, i, obj)
-    else:
-        for i in range(N):
-            bit_index = offset + i
-            if check_valid and not _is_valid(null_bm, bit_index):
-                obj = None
-            elif is_bool:
-                obj = ((bool_base[bit_index >> 3] >> (bit_index & 7)) & 1) != 0
-            else:
-                obj = _make_py_obj(dtype, i, numeric_base, str_offsets, str_base)
-            _set_item(out, i, obj)
-    return out
+    cdef PyObject* py = cpp_arrow_to_pylist(<int>dtype, arr)
+    return <list>py
