@@ -7,7 +7,7 @@ import pickle
 
 import pytest
 
-from polars.polars import _expr_nodes as pl_expr
+from polars import polars
 
 from cudf_polars.dsl.expressions.boolean import BooleanFunction
 from cudf_polars.dsl.expressions.datetime import TemporalFunction
@@ -20,6 +20,9 @@ from cudf_polars.utils.versions import (
 
 if not POLARS_VERSION_LT_131:
     from cudf_polars.dsl.expressions.struct import StructFunction
+
+pl_expr = polars._expr_nodes
+pl_ir = polars._ir_nodes
 
 
 @pytest.fixture(
