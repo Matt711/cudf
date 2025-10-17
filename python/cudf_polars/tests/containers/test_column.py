@@ -186,44 +186,69 @@ def test_serialize_cache_miss():
 # datetimes return instances of DataType, rather than DataTypeClass
 
 
+def _as_instance(dt: pl.DataType) -> pl.DataType:
+    # Materialize classes to instances (including nested list/struct inners)
+    if isinstance(dt, type):
+        return dt()  # e.g., pl.Int8 -> pl.Int8()
+    if isinstance(dt, pl.List):
+        inner = _as_instance(dt.inner)
+        return pl.List(inner)
+    if isinstance(dt, pl.Struct):
+        return pl.Struct([pl.Field(f.name, _as_instance(f.dtype)) for f in dt.fields])
+    return dt
+
+
 @pytest.mark.parametrize(
     "dtype",
     [
-        pl.Binary,
-        pl.Binary(),
         pl.Boolean,
         pl.Boolean(),
-        pl.Categorical(),
         pl.Date,
         pl.Date(),
         pl.Datetime,
         pl.Datetime(),
+        pl.Duration,
+        pl.Duration(),
         pl.Float32,
         pl.Float32(),
         pl.Int8,
         pl.Int8(),
         pl.List(pl.Int8()),
         pl.List(pl.Int8),
-        pl.Object,
-        pl.Object(),
+        pl.List(pl.Decimal(10)),
         pl.String,
         pl.String(),
         pl.Time,
         pl.Time(),
         pl.UInt8,
         pl.UInt8(),
-        # These fail.
+        pl.Struct([pl.Field("a", pl.Int8), pl.Field("b", pl.Int8)]),
+        # Not supported by our (de)serializer:
+        pytest.param(
+            pl.Binary,
+            marks=pytest.mark.xfail(reason="Binary is not supported", strict=True),
+        ),
+        pytest.param(
+            pl.Binary(),
+            marks=pytest.mark.xfail(reason="Binary is not supported", strict=True),
+        ),
+        pytest.param(
+            pl.Categorical(),
+            marks=pytest.mark.xfail(reason="Categorical is not supported", strict=True),
+        ),
+        pytest.param(
+            pl.Object,
+            marks=pytest.mark.xfail(reason="Object is not supported", strict=True),
+        ),
+        pytest.param(
+            pl.Object(),
+            marks=pytest.mark.xfail(reason="Object is not supported", strict=True),
+        ),
+        # These already failed/errored before:
         pytest.param(
             pl.Enum(["a", "b"]),
             marks=pytest.mark.xfail(reason="Enum is not supported", strict=True),
         ),
-        pytest.param(
-            pl.List(pl.Decimal(10)),
-            marks=pytest.mark.xfail(
-                reason="List[Decimal] is not supported", strict=True
-            ),
-        ),
-        # These Error
         pytest.param(
             pl.Array(pl.Int8, shape=(1,)),
             marks=pytest.mark.xfail(reason="Array[Int8] is not supported", strict=True),
@@ -232,18 +257,10 @@ def test_serialize_cache_miss():
             pl.Array(pl.Int8(), shape=(1,)),
             marks=pytest.mark.xfail(reason="Array[Int8] is not supported", strict=True),
         ),
-        pytest.param(
-            pl.Struct([pl.Field("a", pl.Int8), pl.Field("b", pl.Int8)]),
-            marks=pytest.mark.xfail(reason="Struct is not supported", strict=True),
-        ),
-        pytest.param(
-            pl.Struct([pl.Field("a", pl.Int8()), pl.Field("b", pl.Int8())]),
-            marks=pytest.mark.xfail(reason="Struct is not supported", strict=True),
-        ),
     ],
 )
-def test_dtype_short_repr_to_dtype_roundtrip(dtype: pl.DataType):
-    result = cudf_polars.containers.column._dtype_short_repr_to_dtype(
-        pl.polars.dtype_str_repr(dtype)
-    )
-    assert result == dtype
+def test_dtype_header_roundtrip(dtype: pl.DataType):
+    dt = _as_instance(dtype)
+    header = cudf_polars.containers.datatype._dtype_to_header(dt)
+    result = cudf_polars.containers.datatype._dtype_from_header(header)
+    assert result == dt

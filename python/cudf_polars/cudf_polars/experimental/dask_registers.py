@@ -34,6 +34,28 @@ if TYPE_CHECKING:
 __all__ = ["DaskRegisterManager", "register"]
 
 
+@dask_serialize.register(plc.Scalar)
+def serialize_plc_scalar(
+    x: plc.Scalar,
+) -> tuple[dict[str, Any], list]:  # pragma: no cover
+    return {
+        "type_id": int(x.type().id()),
+        "scale": x.type().scale(),
+        "value": x.to_py(),
+    }, []
+
+
+@dask_deserialize.register(plc.Scalar)
+def deserialize_plc_scalar(header: dict, frames: Any) -> plc.Scalar:  # pragma: no cover
+    dtype = plc.DataType(plc.TypeId(header["type_id"]), header["scale"])
+    return plc.Scalar.from_py(header["value"], dtype=dtype)
+
+
+@normalize_token.register(plc.Scalar)
+def tokenize_plc_scalar(x: plc.Scalar) -> tuple[str, int, int, Any]:  # pragma: no cover
+    return ("plc.Scalar", int(x.type().id()), x.type().scale(), x.to_py())
+
+
 class DaskRegisterManager:  # pragma: no cover; Only used with Distributed cluster
     """Manager to ensure ensure serializer is only registered once."""
 

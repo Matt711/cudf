@@ -28,6 +28,7 @@ cdef extern from "cudf/scalar/scalar.hpp" namespace "cudf" nogil:
 
     cdef cppclass duration_scalar[T](scalar):
         void set_value(T value) except +libcudf_exception_handler
+        int64_t count(cuda_stream_view stream) except +libcudf_exception_handler
 
     cdef cppclass string_scalar(scalar):
         string to_string() except +libcudf_exception_handler

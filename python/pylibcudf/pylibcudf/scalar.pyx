@@ -310,6 +310,7 @@ cdef class Scalar:
 
         cdef type_id tid = self.type().id()
         cdef const scalar* slr = self.c_obj.get()
+        cdef Stream _s = Stream()
         if tid == type_id.BOOL8:
             return (<numeric_scalar[cbool]*>slr).value()
         elif tid == type_id.STRING:
@@ -334,6 +335,16 @@ cdef class Scalar:
             return (<numeric_scalar[uint32_t]*>slr).value()
         elif tid == type_id.UINT64:
             return (<numeric_scalar[uint64_t]*>slr).value()
+        elif tid == type_id.DURATION_NANOSECONDS:
+            return (<duration_scalar[duration_ns]*>slr).count(_s.view())
+        elif tid == type_id.DURATION_MICROSECONDS:
+            return (<duration_scalar[duration_us]*>slr).count(_s.view())
+        elif tid == type_id.DURATION_MILLISECONDS:
+            return (<duration_scalar[duration_ms]*>slr).count(_s.view())
+        elif tid == type_id.DURATION_SECONDS:
+            return (<duration_scalar[duration_s]*>slr).count(_s.view())
+        elif tid == type_id.DURATION_DAYS:
+            return (<duration_scalar[duration_D]*>slr).count(_s.view())
         elif tid == type_id.DECIMAL128:
             return decimal.Decimal(
                 (<fixed_point_scalar[decimal128]*>slr).value().value()
