@@ -294,17 +294,14 @@ class _SeriesLocIndexer(_FrameIndexer):
         if isinstance(self._frame.index, cudf.MultiIndex) and not isinstance(
             arg, cudf.MultiIndex
         ):
-            if is_scalar(arg):
-                row_arg = (arg,)
-            else:
-                row_arg = arg
+            row_arg = (arg,) if is_scalar(arg) else arg
             result = self._frame.index._get_row_major(self._frame, row_arg)
-            if (
-                isinstance(arg, tuple)
-                and len(arg) == self._frame.index.nlevels
-                and not any(isinstance(x, slice) for x in arg)
+            if is_scalar(arg) or (
+                isinstance(row_arg, tuple)
+                and len(row_arg) == self._frame.index.nlevels
+                and not any(isinstance(x, slice) for x in row_arg)
             ):
-                result = result.iloc[0]
+                return result.iloc[0]
             return result
         try:
             arg = self._loc_to_iloc(arg)
@@ -1911,12 +1908,17 @@ class Series(SingleColumnFrame, IndexedFrame):
         bool_only: bool | None = None,
         skipna: bool = True,
         **kwargs,
-    ) -> bool:
+    ) -> bool | np.bool_:
         if bool_only not in (None, True):
             raise NotImplementedError(
                 "The bool_only parameter is not supported for Series."
             )
-        return super().all(axis, skipna, **kwargs)
+        res = super().all(axis, skipna, **kwargs)
+        if cudf.get_option("mode.pandas_compatible") and isinstance(
+            res, (bool, np.bool_)
+        ):
+            return np.bool_(res)
+        return res
 
     @_performance_tracking
     def any(
@@ -1925,12 +1927,17 @@ class Series(SingleColumnFrame, IndexedFrame):
         bool_only: bool | None = None,
         skipna: bool = True,
         **kwargs,
-    ) -> bool:
+    ) -> bool | np.bool_:
         if bool_only not in (None, True):
             raise NotImplementedError(
                 "The bool_only parameter is not supported for Series."
             )
-        return super().any(axis, skipna, **kwargs)
+        res = super().any(axis, skipna, **kwargs)
+        if cudf.get_option("mode.pandas_compatible") and isinstance(
+            res, (bool, np.bool_)
+        ):
+            return np.bool_(res)
+        return res
 
     @_performance_tracking
     def to_pandas(
