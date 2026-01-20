@@ -188,15 +188,30 @@ class DatetimeColumn(TemporalBaseColumn):
 
     @functools.cached_property
     def year(self) -> ColumnBase:
-        return self._get_dt_field(plc.datetime.DatetimeComponent.YEAR)
+        result = self._get_dt_field(plc.datetime.DatetimeComponent.YEAR)
+        if cudf.get_option(
+            "mode.pandas_compatible"
+        ) and result.dtype == np.dtype("int16"):
+            result = result.astype(np.dtype("int32"))
+        return result
 
     @functools.cached_property
     def month(self) -> ColumnBase:
-        return self._get_dt_field(plc.datetime.DatetimeComponent.MONTH)
+        result = self._get_dt_field(plc.datetime.DatetimeComponent.MONTH)
+        if cudf.get_option(
+            "mode.pandas_compatible"
+        ) and result.dtype == np.dtype("int16"):
+            result = result.astype(np.dtype("int32"))
+        return result
 
     @functools.cached_property
     def day(self) -> ColumnBase:
-        return self._get_dt_field(plc.datetime.DatetimeComponent.DAY)
+        result = self._get_dt_field(plc.datetime.DatetimeComponent.DAY)
+        if cudf.get_option(
+            "mode.pandas_compatible"
+        ) and result.dtype == np.dtype("int16"):
+            result = result.astype(np.dtype("int32"))
+        return result
 
     @functools.cached_property
     def hour(self) -> ColumnBase:

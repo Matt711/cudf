@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
 # SPDX-License-Identifier: Apache-2.0
 import datetime
 import zoneinfo
@@ -733,3 +733,32 @@ def test_convert_edge_cases(data, original_timezone, target_timezone):
     expect = ps.dt.tz_convert(target_timezone)
     got = gs.dt.tz_convert(target_timezone)
     assert_eq(expect, got)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pd.date_range("2020-01-01", periods=10, freq="D"),
+        pd.date_range("1990-01-01", periods=100, freq="ME"),
+        pd.to_datetime(["2023-12-25", "2024-01-01", "2024-06-15", None]),
+    ],
+)
+def test_dt_year_month_day_dtype(data):
+    ps = pd.Series(data)
+    gs = cudf.Series(data)
+
+    with cudf.option_context("mode.pandas_compatible", True):
+        # Test year
+        expect = ps.dt.year
+        got = gs.dt.year
+        assert_eq(expect, got, check_dtype=True)
+
+        # Test month
+        expect = ps.dt.month
+        got = gs.dt.month
+        assert_eq(expect, got, check_dtype=True)
+
+        # Test day
+        expect = ps.dt.day
+        got = gs.dt.day
+        assert_eq(expect, got, check_dtype=True)
