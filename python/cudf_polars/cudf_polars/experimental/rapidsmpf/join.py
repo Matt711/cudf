@@ -692,10 +692,18 @@ async def _choose_strategy_from_samples(
 
     # Determine which sides may be broadcasted
     broadcast_threshold = executor.target_partition_size * executor.broadcast_join_limit
-    left_size_ok = left_total < broadcast_threshold and (
+    # Guard against an unreliable zero estimate: if the sample returned 0 rows but
+    # there are multiple chunks, the first chunk may have been empty (e.g. the first
+    # parquet partition had no matching rows after a filter).  Trusting a zero estimate
+    # would cause _collect_small_side_for_broadcast to pull all large chunks into GPU
+    # memory, causing OOM.  Treat a zero-row estimate as "unknown" when there is more
+    # than one expected chunk.
+    left_estimate_reliable = left_total_rows > 0 or left_sample.total_chunks <= 1
+    right_estimate_reliable = right_total_rows > 0 or right_sample.total_chunks <= 1
+    left_size_ok = left_estimate_reliable and left_total < broadcast_threshold and (
         left_total_rows < MAX_BROADCAST_ROWS or left_metadata.duplicated
     )
-    right_size_ok = right_total < broadcast_threshold and (
+    right_size_ok = right_estimate_reliable and right_total < broadcast_threshold and (
         right_total_rows < MAX_BROADCAST_ROWS or right_metadata.duplicated
     )
     can_broadcast_left = left_size_ok and ir.options[0] in ("Inner", "Right")

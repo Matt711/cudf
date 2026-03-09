@@ -183,6 +183,15 @@ def test_select_mean_with_decimals(df, engine):
     assert_gpu_result_equal(q, engine=engine, check_dtypes=not POLARS_VERSION_LT_134)
 
 
+def test_select_n_unique_mixed_with_sum(df, engine):
+    q = df.select(
+        foo=pl.col("a").n_unique(),
+        bar=pl.col("b").sum(),
+        baz=pl.col("c").sum(),
+    )
+    assert_gpu_result_equal(q, engine=engine)
+
+
 def test_select_with_len(engine):
     # https://github.com/pola-rs/polars/issues/25592
     df1 = pl.LazyFrame({"c0": [1] * 4})

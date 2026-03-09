@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.streaming.core.message import Message
@@ -58,10 +59,18 @@ async def union_node(
         # Merge and forward metadata.
         # Union loses partitioning/ordering info since sources may differ.
         # TODO: Warn users that Union does NOT preserve order?
+        #
+        # Read metadata from all input channels concurrently. Sequential reads
+        # cause a deadlock when branches share a fanout node: groupby_actor
+        # only sends its output metadata after draining all input data, and
+        # send_metadata blocks (via drain_metadata) until the receiver reads.
+        # With sequential reads, Union blocks on channel 0 while channels 1..N
+        # cannot make progress, stalling the fanout that feeds channel 0.
         total_local_count = 0
         duplicated = True
-        for ch_in in chs_in:
-            metadata = await recv_metadata(ch_in, context)
+        for metadata in await asyncio.gather(
+            *(recv_metadata(ch, context) for ch in chs_in)
+        ):
             total_local_count += metadata.local_count
             duplicated = duplicated and metadata.duplicated
         await send_metadata(
