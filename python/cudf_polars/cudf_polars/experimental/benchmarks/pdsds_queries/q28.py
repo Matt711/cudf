@@ -82,43 +82,6 @@ def duckdb_impl(run_config: RunConfig) -> str:
     """
 
 
-def make_block(
-    store_sales: pl.LazyFrame,
-    lp_min: int,
-    lp_max: int,
-    ca_min: int,
-    ca_max: int,
-    wc_min: int,
-    wc_max: int,
-    q_lo: int,
-    q_hi: int,
-    prefix: str,
-) -> pl.LazyFrame:
-    """Make store sales filter block."""
-    return store_sales.filter(
-        pl.col("ss_quantity").is_between(q_lo, q_hi)
-        & (
-            pl.col("ss_list_price").is_between(lp_min, lp_max)
-            | pl.col("ss_coupon_amt").is_between(ca_min, ca_max)
-            | pl.col("ss_wholesale_cost").is_between(wc_min, wc_max)
-        )
-    ).select(
-        [
-            pl.col("ss_list_price").mean().alias(f"{prefix}_LP"),
-            pl.col("ss_list_price")
-            .drop_nulls()
-            .count()
-            .cast(pl.Int64)
-            .alias(f"{prefix}_CNT"),
-            pl.col("ss_list_price")
-            .drop_nulls()
-            .n_unique()
-            .cast(pl.Int64)
-            .alias(f"{prefix}_CNTD"),
-        ]
-    )
-
-
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 28."""
     params = load_parameters(
@@ -133,88 +96,34 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
 
     store_sales = get_data(run_config.dataset_path, "store_sales", run_config.suffix)
 
-    b1 = make_block(
-        store_sales,
-        lp[0],
-        lp[0] + 10,
-        ca[0],
-        ca[0] + 1000,
-        wc[0],
-        wc[0] + 20,
-        0,
-        5,
-        "B1",
-    )
-    b2 = make_block(
-        store_sales,
-        lp[1],
-        lp[1] + 10,
-        ca[1],
-        ca[1] + 1000,
-        wc[1],
-        wc[1] + 20,
-        6,
-        10,
-        "B2",
-    )
-    b3 = make_block(
-        store_sales,
-        lp[2],
-        lp[2] + 10,
-        ca[2],
-        ca[2] + 1000,
-        wc[2],
-        wc[2] + 20,
-        11,
-        15,
-        "B3",
-    )
-    b4 = make_block(
-        store_sales,
-        lp[3],
-        lp[3] + 10,
-        ca[3],
-        ca[3] + 1000,
-        wc[3],
-        wc[3] + 20,
-        16,
-        20,
-        "B4",
-    )
-    b5 = make_block(
-        store_sales,
-        lp[4],
-        lp[4] + 10,
-        ca[4],
-        ca[4] + 1000,
-        wc[4],
-        wc[4] + 20,
-        21,
-        25,
-        "B5",
-    )
-    b6 = make_block(
-        store_sales,
-        lp[5],
-        lp[5] + 10,
-        ca[5],
-        ca[5] + 1000,
-        wc[5],
-        wc[5] + 20,
-        26,
-        30,
-        "B6",
-    )
+    buckets = [
+        (0, 5, 0, "B1"),
+        (6, 10, 1, "B2"),
+        (11, 15, 2, "B3"),
+        (16, 20, 3, "B4"),
+        (21, 25, 4, "B5"),
+        (26, 30, 5, "B6"),
+    ]
+
+    exprs = []
+    for q_lo, q_hi, i, prefix in buckets:
+        c = pl.col("ss_quantity").is_between(q_lo, q_hi) & (
+            pl.col("ss_list_price").is_between(lp[i], lp[i] + 10)
+            | pl.col("ss_coupon_amt").is_between(ca[i], ca[i] + 1000)
+            | pl.col("ss_wholesale_cost").is_between(wc[i], wc[i] + 20)
+        )
+        lp_masked = pl.col("ss_list_price").filter(c)
+        exprs.extend(
+            [
+                lp_masked.mean().alias(f"{prefix}_LP"),
+                lp_masked.count().alias(f"{prefix}_CNT"),
+                lp_masked.drop_nulls().n_unique().alias(f"{prefix}_CNTD"),
+            ]
+        )
+
     limit = 100
     return QueryResult(
-        frame=(
-            b1.join(b2, how="cross")
-            .join(b3, how="cross")
-            .join(b4, how="cross")
-            .join(b5, how="cross")
-            .join(b6, how="cross")
-            .limit(limit)
-        ),
+        frame=store_sales.select(exprs).limit(limit),
         sort_by=[],
         limit=limit,
     )

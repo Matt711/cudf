@@ -16,6 +16,7 @@ import cudf_polars.experimental.join
 import cudf_polars.experimental.select
 import cudf_polars.experimental.shuffle
 import cudf_polars.experimental.sort  # noqa: F401
+from cudf_polars.dsl.expr import Filter as ExprFilter, Literal, NamedExpr, Ternary
 from cudf_polars.dsl.ir import (
     IR,
     Cache,
@@ -456,12 +457,38 @@ def _(
     )
 
 
+def _rewrite_filter_to_ternary(e: ExprFilter) -> Ternary:
+    # Rewrite Filter(values, mask) → Ternary(mask, values, null).
+    # Semantically equivalent for null-ignoring aggregations (mean, count,
+    # sum, n_unique with drop_nulls) while producing same-length output
+    # that is safe to store in a multi-partition DataFrame.
+    values, mask = e.children
+    return Ternary(e.dtype, mask, values, Literal(e.dtype, None))
+
+
 @lower_ir_node.register(HStack)
 def _(
     ir: HStack, rec: LowerIRTransformer
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    columns = ir.columns
+
+    # Polars CSE may place Filter expressions inside a should_broadcast=False
+    # HStack. Filter produces variable-length output which is incompatible with
+    # multi-partition DataFrames. Rewrite Filter(values, mask) →
+    # Ternary(mask, values, null) so the column is same-length and pointwise.
+    if not ir.should_broadcast and any(
+        isinstance(e, ExprFilter) for e in traversal([ne.value for ne in columns])
+    ):
+        columns = tuple(
+            NamedExpr(ne.name, _rewrite_filter_to_ternary(ne.value))
+            if isinstance(ne.value, ExprFilter)
+            else ne
+            for ne in columns
+        )
+        ir = HStack(ir.schema, columns, ir.should_broadcast, ir.children[0])
+
     if not all(
-        expr.is_pointwise for expr in traversal([e.value for e in ir.columns])
+        expr.is_pointwise for expr in traversal([e.value for e in columns])
     ):  # pragma: no cover
         # TODO: Avoid fallback if/when possible
         return _lower_ir_fallback(

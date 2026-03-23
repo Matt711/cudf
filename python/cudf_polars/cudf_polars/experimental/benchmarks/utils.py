@@ -1275,13 +1275,14 @@ def build_parser(num_queries: int = 22) -> argparse.ArgumentParser:
     parser.add_argument(
         "--fallback-mode",
         type=str,
-        choices=["warn", "raise", "silent"],
+        choices=["warn", "raise", "silent", "debug"],
         default=None,
         help=textwrap.dedent("""\
             How to handle operations that don't support multiple partitions in streaming executor.
             - warn   : Emit a warning and fall back to single partition (default)
             - raise  : Raise an exception
-            - silent : Silently fall back to single partition"""),
+            - silent : Silently fall back to single partition
+            - debug  : Emit a detailed warning showing which expressions caused the fallback"""),
     )
 
     return parser

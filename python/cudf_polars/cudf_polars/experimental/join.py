@@ -15,6 +15,7 @@ from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.shuffle import Shuffle, _hash_partition_dataframe
 from cudf_polars.experimental.utils import (
     _concat,
+    _debug_ir_str,
     _dynamic_planning_on,
     _fallback_inform,
     _lower_ir_fallback,
@@ -209,11 +210,28 @@ def _(
     left, pi_left = rec(left)
     right, pi_right = rec(right)
 
-    # Fallback to single partition on the smaller table
     left_count = pi_left[left].count
     right_count = pi_right[right].count
     output_count = max(left_count, right_count)
+
+    # When one side has a single partition it can be broadcast to all partitions
+    # of the other side. The ConditionalJoin executes partition-wise: each task
+    # calls do_evaluate(L_i, R_0) (or L_0 broadcast to R_i), and the default
+    # generate_ir_tasks handler already handles the broadcast via bcast_child.
+    if min(left_count, right_count) == 1:
+        new_node = ir.reconstruct([left, right])
+        partition_info = reduce(operator.or_, (pi_left, pi_right))
+        partition_info[new_node] = PartitionInfo(count=output_count)
+        return new_node, partition_info
+
+    # Both sides have multiple partitions - fall back to single partition.
     fallback_msg = "ConditionalJoin not supported for multiple partitions."
+    if config_options.executor.fallback_mode == "debug":
+        parts = [fallback_msg, _debug_ir_str(ir)]
+        parts.append(
+            f"  child_partitions: left(count={left_count}) -> right(count={right_count})"
+        )
+        fallback_msg = "\n".join(parts)
     if left_count < right_count:
         if left_count > 1 or dynamic_planning:
             left = Repartition(left.schema, left)
@@ -224,7 +242,6 @@ def _(
         pi_right[right] = PartitionInfo(count=1)
         _fallback_inform(fallback_msg, config_options)
 
-    # Reconstruct and return
     new_node = ir.reconstruct([left, right])
     partition_info = reduce(operator.or_, (pi_left, pi_right))
     partition_info[new_node] = PartitionInfo(count=output_count)

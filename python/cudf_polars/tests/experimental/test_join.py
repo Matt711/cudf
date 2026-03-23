@@ -178,6 +178,29 @@ def test_join_conditional(reverse, max_rows_per_partition):
         assert_gpu_result_equal(q, engine=engine, check_row_order=False)
 
 
+def test_join_conditional_broadcast():
+    # When one side of a ConditionalJoin has a single partition (e.g. a scalar
+    # aggregate used as a threshold), it should be broadcast partition-wise
+    # without triggering a fallback warning.
+    engine = pl.GPUEngine(
+        raise_on_fail=True,
+        executor="streaming",
+        executor_options={
+            "max_rows_per_partition": 3,
+            "cluster": DEFAULT_CLUSTER,
+            "runtime": DEFAULT_RUNTIME,
+            "fallback_mode": "warn",
+            "dynamic_planning": None,  # Requires static planning
+        },
+    )
+    # left has 15 rows → multiple partitions; right has 1 row → 1 partition
+    left = pl.LazyFrame({"x": range(15), "y": [float(i) for i in range(15)]})
+    right = pl.LazyFrame({"threshold": [5.0]})
+    q = left.join_where(right, pl.col("y") > pl.col("threshold"))
+    # Should not warn: right side is already a single partition
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
 @pytest.mark.parametrize("zlice", [(0, 2), (2, 2), (-2, None)])
 def test_join_and_slice(zlice):
     engine = pl.GPUEngine(

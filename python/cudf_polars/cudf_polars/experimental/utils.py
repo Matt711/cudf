@@ -10,7 +10,29 @@ from functools import reduce
 from itertools import chain
 from typing import TYPE_CHECKING
 
-from cudf_polars.dsl.expr import Col, Expr, GroupedRollingWindow, UnaryFunction
+from cudf_polars.dsl.expr import (
+    Agg,
+    BinOp,
+    BooleanFunction,
+    Cast,
+    Col,
+    Expr,
+    Filter,
+    Gather,
+    GroupedRollingWindow,
+    Len,
+    Literal,
+    LiteralColumn,
+    RollingWindow,
+    Slice,
+    Sort,
+    SortBy,
+    StringFunction,
+    StructFunction,
+    TemporalFunction,
+    Ternary,
+    UnaryFunction,
+)
 from cudf_polars.dsl.ir import Union
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.experimental.base import ColumnStat, PartitionInfo
@@ -19,7 +41,6 @@ if TYPE_CHECKING:
     from collections.abc import MutableMapping, Sequence
 
     from cudf_polars.containers import DataFrame
-    from cudf_polars.dsl.expr import Expr
     from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.experimental.base import ColumnStats
     from cudf_polars.experimental.dispatch import LowerIRTransformer
@@ -31,12 +52,94 @@ def _concat(*dfs: DataFrame, context: IRExecutionContext) -> DataFrame:
     return dfs[0] if len(dfs) == 1 else Union.do_evaluate(None, *dfs, context=context)
 
 
+def _debug_expr_str(e: Expr, depth: int = 0, max_depth: int = 6) -> str:
+    """Get a concise, human-readable representation of an expression tree."""
+    if depth > max_depth:
+        return "..."
+
+    def _children() -> str:
+        return ", ".join(_debug_expr_str(c, depth + 1, max_depth) for c in e.children)
+
+    if isinstance(e, Col):
+        return f"Col({e.name!r}, dtype={e.dtype})"
+    elif isinstance(e, Literal):
+        return f"Literal({e.value!r}, dtype={e.dtype})"
+    elif isinstance(e, LiteralColumn):
+        return f"LiteralColumn(dtype={e.dtype})"
+    elif isinstance(e, Len):
+        return f"Len(dtype={e.dtype})"
+    elif isinstance(e, Agg):
+        return f"Agg({e.name!r}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, UnaryFunction):
+        return f"UnaryFunction({e.name!r}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, Cast):
+        return f"Cast(strict={e.strict}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, BinOp):
+        return f"BinOp({e.op.name}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, BooleanFunction):
+        return f"BooleanFunction({e.name.name}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, TemporalFunction):
+        return f"TemporalFunction({e.name.name}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, StringFunction):
+        return f"StringFunction({e.name.name}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, StructFunction):
+        return f"StructFunction({e.name.name}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, Ternary):
+        return f"Ternary({_children()}, dtype={e.dtype})"
+    elif isinstance(e, Filter):
+        return f"Filter({_children()}, dtype={e.dtype})"
+    elif isinstance(e, Gather):
+        return f"Gather({_children()}, dtype={e.dtype})"
+    elif isinstance(e, Slice):
+        return f"Slice(offset={e.offset}, length={e.length}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, Sort):
+        return f"Sort(options={e.options}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, SortBy):
+        return f"SortBy(options={e.options}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, RollingWindow):
+        return f"RollingWindow(orderby={e.orderby!r}, {_children()}, dtype={e.dtype})"
+    elif isinstance(e, GroupedRollingWindow):
+        return f"GroupedRollingWindow({_children()}, dtype={e.dtype})"
+    elif e.children:
+        return f"{type(e).__name__}({_children()}, dtype={e.dtype})"
+    else:
+        return f"{type(e).__name__}(dtype={e.dtype})"
+
+
+def _debug_ir_str(ir: IR) -> str:
+    """Get a concise debug summary of an IR node for fallback messages."""
+    type_name = type(ir).__name__
+    schema_items = list(ir.schema.items())
+    schema_str = (
+        "{"
+        + ", ".join(f"{k}: {v}" for k, v in schema_items[:5])
+        + (f", ... ({len(schema_items)} cols total)" if len(schema_items) > 5 else "")
+        + "}"
+    )
+    children_str = " -> ".join(type(c).__name__ for c in ir.children)
+    lines = [f"  IR: {type_name}", f"  schema: {schema_str}"]
+    if children_str:
+        lines.append(f"  children: {children_str}")
+    # Join-specific: show join type and key columns
+    if hasattr(ir, "left_on") and hasattr(ir, "right_on") and hasattr(ir, "options"):
+        lines.append(f"  join_type: {ir.options[0]}")
+        left_keys = [ne.name for ne in ir.left_on]
+        right_keys = [ne.name for ne in ir.right_on]
+        if left_keys or right_keys:
+            lines.append(f"  left_on:  {left_keys}")
+            lines.append(f"  right_on: {right_keys}")
+    # ConditionalJoin-specific: show predicate
+    elif hasattr(ir, "predicate"):
+        lines.append(f"  predicate: {_debug_expr_str(ir.predicate)}")
+    return "\n".join(lines)
+
+
 def _fallback_inform(
     msg: str, config_options: ConfigOptions[StreamingExecutor]
 ) -> None:
     """Inform the user of single-partition fallback."""
     match fallback_mode := config_options.executor.fallback_mode:
-        case "warn":
+        case "warn" | "debug":
             warnings.warn(msg, stacklevel=2)
         case "raise":
             raise NotImplementedError(msg)
@@ -45,7 +148,7 @@ def _fallback_inform(
         case _:  # pragma: no cover; Should never get here.
             raise ValueError(
                 f"{fallback_mode} is not a supported 'fallback_mode' "
-                "option. Please use 'warn', 'raise', or 'silent'."
+                "option. Please use 'warn', 'raise', 'silent', or 'debug'."
             )
 
 
@@ -62,6 +165,7 @@ def _lower_ir_fallback(
     rec: LowerIRTransformer,
     *,
     msg: str | None = None,
+    debug_info: str | None = None,
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
     # Catch-all single-partition lowering logic.
     # If any children contain multiple partitions,
@@ -91,7 +195,18 @@ def _lower_ir_fallback(
     if inform and msg:
         # Warn/raise the user if any children were collapsed
         # and the "fallback_mode" configuration is not "silent"
-        _fallback_inform(msg, rec.state["config_options"])
+        if config_options.executor.fallback_mode == "debug":
+            parts = [msg]
+            if debug_info:
+                parts.append(debug_info)
+            parts.append(_debug_ir_str(ir))
+            child_counts = " -> ".join(
+                f"{type(c).__name__}(count={partition_info[c].count})"
+                for c in lowered_children
+            )
+            parts.append(f"  child_partitions: {child_counts}")
+            msg = "\n".join(parts)
+        _fallback_inform(msg, config_options)
 
     # Reconstruct and return
     new_node = ir.reconstruct(children)
@@ -160,6 +275,7 @@ def _get_unique_fractions(
         }
     )
     return unique_fractions
+
 
 
 def _contains_over(exprs: Sequence[Expr]) -> bool:

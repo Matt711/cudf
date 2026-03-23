@@ -262,3 +262,22 @@ def test_groupby_literal_with_stats_planning(df):
     )
 
     assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("op", ["std", "var"])
+@pytest.mark.parametrize("ddof", [0, 1])
+def test_groupby_std_var(engine, op, ddof):
+    df = pl.LazyFrame(
+        {
+            "key": [1, 1, 1, 2, 2, 2, 3, 3, 3] * 5,
+            "fval": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0] * 5,
+            "ival": [1, 2, 3, 4, 5, 6, 7, 8, 9] * 5,
+        }
+    )
+    q = df.group_by("key").agg(
+        [
+            getattr(pl.col("fval"), op)(ddof=ddof).alias(f"fval_{op}"),
+            getattr(pl.col("ival"), op)(ddof=ddof).alias(f"ival_{op}"),
+        ]
+    )
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)

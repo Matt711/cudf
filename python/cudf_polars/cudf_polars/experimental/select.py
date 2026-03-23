@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.dsl import expr
-from cudf_polars.dsl.expr import Col, Len
+from cudf_polars.dsl.expr import Col, Len, NamedExpr
 from cudf_polars.dsl.ir import Empty, HConcat, Scan, Select, Union
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.dsl.utils.naming import unique_names
@@ -20,6 +20,7 @@ from cudf_polars.experimental.expressions import decompose_expr_graph
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.utils import (
     _contains_unsupported_fill_strategy,
+    _debug_expr_str,
     _dynamic_planning_on,
     _lower_ir_fallback,
 )
@@ -173,16 +174,11 @@ def _fuse_simple_reductions(
     if len(decomposed_select_irs) == 1:
         return list(decomposed_select_irs), pi
 
-    fused_select_c_exprs = []
     fused_select_c_schema: Schema = {}
 
     # Find reduction groups
     reduction_groups: defaultdict[IR, list[Select]] = defaultdict(list)
     for select_c in decomposed_select_irs:
-        # Final expressions and schema must be included in
-        # the fused select_c node even if this specific
-        # selection is not a simple reduction.
-        fused_select_c_exprs.extend(list(select_c.exprs))
         fused_select_c_schema |= select_c.schema
 
         if (
@@ -201,6 +197,27 @@ def _fuse_simple_reductions(
             # Not a simple reduction.
             # This selection becomes it own "group".
             reduction_groups[select_c].append(select_c)
+
+    # Determine which select_c nodes will be in fused groups (size > 1)
+    fused_select_cs: set[Select] = {
+        select_c
+        for group in reduction_groups.values()
+        if len(group) > 1
+        for select_c in group
+    }
+
+    # Build fused_select_c_exprs in original order.
+    # For non-fused nodes the HConcat will expose their output schema directly,
+    # so use a passthrough Col reference instead of internal temp-name expressions.
+    fused_select_c_exprs = []
+    for select_c in decomposed_select_irs:
+        if select_c in fused_select_cs:
+            fused_select_c_exprs.extend(list(select_c.exprs))
+        else:
+            for ne in select_c.exprs:
+                fused_select_c_exprs.append(
+                    NamedExpr(ne.name, Col(ne.value.dtype, ne.name))
+                )
 
     new_decomposed_select_irs: list[IR] = []
     for root_ir, group in reduction_groups.items():
@@ -353,8 +370,46 @@ def _(
                 rec.state["stats"],
             )
         except NotImplementedError:
+            debug_info = None
+            if config_options.executor.fallback_mode == "debug":
+                lines = []
+                for ne in ir.exprs:
+                    if not all(
+                        e.is_pointwise for e in traversal([ne.value])
+                    ):
+                        try:
+                            decompose_expr_graph(
+                                ne,
+                                child,
+                                dict(partition_info),
+                                config_options,
+                                rec.state["stats"].row_count.get(
+                                    ir.children[0], ColumnStat[int](None)
+                                ),
+                                rec.state["stats"].column_stats.get(
+                                    ir.children[0], {}
+                                ),
+                                unique_names(
+                                    (
+                                        *(e.name for e in ir.exprs),
+                                        *child.schema.keys(),
+                                    )
+                                ),
+                            )
+                        except NotImplementedError as inner:
+                            lines.append(
+                                f"  - named expr {ne.name!r}"
+                                f" (dtype={ne.value.dtype}):\n"
+                                f"    expr: {_debug_expr_str(ne.value)}\n"
+                                f"    reason: {inner}"
+                            )
+                if lines:
+                    debug_info = "\n".join(lines)
             return _lower_ir_fallback(
-                ir, rec, msg="This selection is not supported for multiple partitions."
+                ir,
+                rec,
+                msg="This selection is not supported for multiple partitions.",
+                debug_info=debug_info,
             )
 
     new_node = ir.reconstruct([child])

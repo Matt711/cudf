@@ -94,27 +94,14 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
     store_sales = get_data(run_config.dataset_path, "store_sales", run_config.suffix)
     item = get_data(run_config.dataset_path, "item", run_config.suffix)
 
-    # Step 1: Calculate benchmark (average profit for store with null demographics)
+    # Step 1: Calculate benchmark (average profit for store with null demographics).
+    # Use a global aggregate (not group_by) so this produces a single partition,
+    # enabling the ConditionalJoin below to execute partition-wise via broadcast.
     benchmark = (
         store_sales.filter(
             (pl.col("ss_store_sk") == store_sk) & (pl.col("ss_cdemo_sk").is_null())
         )
-        .group_by("ss_store_sk")
-        .agg(
-            [
-                pl.col("ss_net_profit").mean().alias("profit_mean"),
-                pl.col("ss_net_profit").count().alias("profit_count"),
-            ]
-        )
-        .with_columns(
-            [
-                pl.when(pl.col("profit_count") > 0)
-                .then(pl.col("profit_mean"))
-                .otherwise(None)
-                .alias("benchmark_profit")
-            ]
-        )
-        .select("benchmark_profit")
+        .select(pl.col("ss_net_profit").mean().alias("benchmark_profit"))
     )
 
     # Step 2: Calculate item-level average profits for store
@@ -143,7 +130,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
     # Step 3: Create ascending ranking (worst to best)
     ascending_rank = (
         item_profits.with_columns(
-            [pl.col("avg(ss_net_profit)").rank(method="ordinal").alias("rnk")]
+            [pl.col("avg(ss_net_profit)").rank(method="min").alias("rnk")]
         )
         .filter(pl.col("rnk") < 11)
         .select(["ss_item_sk", "rnk"])
@@ -154,7 +141,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         item_profits.with_columns(
             [
                 pl.col("avg(ss_net_profit)")
-                .rank(method="ordinal", descending=True)
+                .rank(method="min", descending=True)
                 .alias("rnk")
             ]
         )

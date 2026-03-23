@@ -141,11 +141,14 @@ class StreamingFallbackMode(enum.StrEnum):
     * ``StreamingFallbackMode.WARN`` : Emit a warning and fall back to a single partition.
     * ``StreamingFallbackMode.SILENT``: Silently fall back to a single partition.
     * ``StreamingFallbackMode.RAISE`` : Raise an exception.
+    * ``StreamingFallbackMode.DEBUG`` : Emit a detailed warning showing which expressions
+      caused the fallback, including expression types, dtypes, and tree structure.
     """
 
     WARN = "warn"
     RAISE = "raise"
     SILENT = "silent"
+    DEBUG = "debug"
 
 
 class Runtime(enum.StrEnum):
