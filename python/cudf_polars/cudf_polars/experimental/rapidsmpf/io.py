@@ -435,6 +435,7 @@ async def scan_node(
         Estimated size of each chunk in bytes. Used for memory reservation
         with block spilling to avoid thrashing.
     """
+    print(f"[DBG scan_node START] ir_id={id(ir)} n_paths={len(ir.paths)}", flush=True)
     async with shutdown_on_error(
         context, ch_out, trace_ir=ir, ir_context=ir_context
     ) as tracer:

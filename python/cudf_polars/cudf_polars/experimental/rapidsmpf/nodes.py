@@ -72,6 +72,7 @@ async def default_node_single(
     -----
     Chunks are processed in the order they are received.
     """
+    print(f"[DBG default_node_single START] ir_id={id(ir)} ir_type={type(ir).__name__}", flush=True)
     async with shutdown_on_error(
         context, ch_in, ch_out, trace_ir=ir, ir_context=ir_context
     ) as tracer:
@@ -125,6 +126,7 @@ async def default_node_multi(
         Index of the input channel to preserve partitioning information for.
         If None, no partitioning information is preserved.
     """
+    print(f"[DBG default_node_multi START] ir_id={id(ir)} ir_type={type(ir).__name__} n_inputs={len(chs_in)}", flush=True)
     async with shutdown_on_error(
         context, *chs_in, ch_out, trace_ir=ir, ir_context=ir_context
     ) as tracer:
@@ -269,6 +271,7 @@ async def fanout_node_bounded(
     # TODO: Use rapidsmpf fanout node once available.
     # See: https://github.com/rapidsai/rapidsmpf/issues/560
     # TODO: Use ir_context
+    print(f"[DBG fanout_bounded START] ir_id={id(trace_ir)} n_outputs={len(chs_out)}", flush=True)
     async with shutdown_on_error(
         context, ch_in, *chs_out, trace_ir=trace_ir, ir_context=ir_context
     ):
@@ -306,7 +309,7 @@ async def fanout_node_unbounded(
     *chs_out: Channel[TableChunk],
     trace_ir: IR,
     ir_context: IRExecutionContext,
-) -> None:
+) -> None:  # pragma: no cover - added only for debug
     """
     Unbounded fanout node for rapidsmpf with spilling support.
 
@@ -337,6 +340,7 @@ async def fanout_node_unbounded(
     # TODO: Use rapidsmpf fanout node once available.
     # See: https://github.com/rapidsai/rapidsmpf/issues/560
     # TODO: Use ir_context
+    print(f"[DBG fanout_unbounded START] ir_id={id(trace_ir)} n_outputs={len(chs_out)}", flush=True)
     async with shutdown_on_error(
         context, ch_in, *chs_out, trace_ir=trace_ir, ir_context=ir_context
     ):
@@ -675,6 +679,7 @@ async def metadata_feeder_node(
         The execution context for the IR node.
     """
     # TODO: Use ir_context
+    print(f"[DBG metadata_feeder_node START] ir_id={id(ir)}", flush=True)
     async with shutdown_on_error(
         context, ch_in, ch_out, trace_ir=ir, ir_context=ir_context
     ):
@@ -716,6 +721,7 @@ async def metadata_drain_node(
         This list will be mutated when the network is executed.
         If None, metadata will not be collected.
     """
+    print(f"[DBG metadata_drain_node START] ir_id={id(ir)}", flush=True)
     async with shutdown_on_error(
         context, ch_in, ch_out, ir_context=ir_context, trace_ir=ir
     ):

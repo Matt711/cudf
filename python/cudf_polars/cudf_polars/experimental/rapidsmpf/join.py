@@ -417,16 +417,22 @@ async def _join_chunks(
     tracer: ActorTracer | None,
 ) -> None:
     # Consume metadata from both shuffle outputs before reading data
+    print(f"[DBG _join_chunks RECV_META]", flush=True)
     await asyncio.gather(
         recv_metadata(ch_left, context),
         recv_metadata(ch_right, context),
     )
+    print(f"[DBG _join_chunks GOT_META]", flush=True)
 
     left, right = ir.children
+    n_chunks = 0
     while True:
+        print(f"[DBG _join_chunks RECV_CHUNK] chunk={n_chunks}", flush=True)
         left_msg, right_msg = await asyncio.gather(
             ch_left.recv(context), ch_right.recv(context)
         )
+        print(f"[DBG _join_chunks GOT_CHUNK] chunk={n_chunks} left_none={left_msg is None} right_none={right_msg is None}", flush=True)
+        n_chunks += 1
         if left_msg is None or right_msg is None:
             assert left_msg is None, (
                 "Mismatched chunk counts in shuffle join: left has unmatched chunk. "
@@ -547,6 +553,7 @@ async def _shuffle_join(
     # Construct a shuffle-shuffle-join pipeline.
     # The shuffle operations will pass chunks through unchanged
     # if the data is already partitioned correctly.
+    print(f"[DBG _shuffle_join START] shuffle_modulus={strategy.shuffle_modulus}", flush=True)
     ch_left_shuffle = context.create_channel()
     ch_right_shuffle = context.create_channel()
     # note: this is an actor inside of an actor. How should we log that in our traces?
@@ -584,7 +591,9 @@ async def _shuffle_join(
                 tracer=tracer,
             ),
         ]
+        print(f"[DBG _shuffle_join GATHER_START] shuffle_modulus={strategy.shuffle_modulus}", flush=True)
         await asyncio.gather(*actor_tasks)
+        print(f"[DBG _shuffle_join GATHER_DONE] shuffle_modulus={strategy.shuffle_modulus}", flush=True)
 
 
 def _make_shuffle_strategy(
@@ -968,6 +977,8 @@ async def join_actor(
     collective_ids
         List of collective IDs for shuffle/broadcast; consumed as needed.
     """
+    ir_id = id(ir)
+    print(f"[DBG join_actor START] ir_id={ir_id}", flush=True)
     async with shutdown_on_error(
         context,
         ch_out,
@@ -976,11 +987,14 @@ async def join_actor(
         trace_ir=ir,
         ir_context=ir_context,
     ) as tracer:
+        print(f"[DBG join_actor RECV_META] ir_id={ir_id}", flush=True)
         left_metadata, right_metadata = await asyncio.gather(
             recv_metadata(ch_left, context),
             recv_metadata(ch_right, context),
         )
+        print(f"[DBG join_actor GOT_META] ir_id={ir_id} left_local_count={left_metadata.local_count} right_local_count={right_metadata.local_count}", flush=True)
 
+        print(f"[DBG join_actor CHOOSE_STRATEGY] ir_id={ir_id}", flush=True)
         left_sample, right_sample, strategy = await _choose_strategy(
             context,
             comm,
@@ -993,6 +1007,7 @@ async def join_actor(
             collective_ids,
             tracer=tracer,
         )
+        print(f"[DBG join_actor STRATEGY_CHOSEN] ir_id={ir_id} broadcast_side={strategy.broadcast_side} left_chunks={len(left_sample.chunks)} right_chunks={len(right_sample.chunks)}", flush=True)
 
         ch_left_replay = context.create_channel()
         ch_right_replay = context.create_channel()
@@ -1018,6 +1033,7 @@ async def join_actor(
         ch_right = ch_right_replay
 
         if strategy.broadcast_side is not None:
+            print(f"[DBG join_actor BROADCAST_JOIN] ir_id={ir_id} broadcast_side={strategy.broadcast_side}", flush=True)
             actor_tasks.append(
                 _broadcast_join(
                     context,
@@ -1034,6 +1050,7 @@ async def join_actor(
                 )
             )
         else:
+            print(f"[DBG join_actor SHUFFLE_JOIN] ir_id={ir_id}", flush=True)
             actor_tasks.append(
                 _shuffle_join(
                     context,
@@ -1048,7 +1065,10 @@ async def join_actor(
                     tracer=tracer,
                 )
             )
+        print(f"[DBG join_actor GATHER_START] ir_id={ir_id} n_tasks={len(actor_tasks)}", flush=True)
         await asyncio.gather(*actor_tasks)
+        print(f"[DBG join_actor GATHER_DONE] ir_id={ir_id}", flush=True)
+    print(f"[DBG join_actor END] ir_id={ir_id}", flush=True)
 
 
 @generate_ir_sub_network.register(Join)

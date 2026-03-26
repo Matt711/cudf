@@ -82,11 +82,15 @@ async def concatenate_node(
     collective_id
         Pre-allocated collective ID for this operation.
     """
+    ir_id = id(ir)
+    print(f"[DBG concatenate_node START] ir_id={ir_id} output_count={output_count} collective_id={collective_id}", flush=True)
     async with shutdown_on_error(
         context, ch_in, ch_out, trace_ir=ir, ir_context=ir_context
     ) as tracer:
         # Receive metadata.
+        print(f"[DBG concatenate_node RECV_META] ir_id={ir_id}", flush=True)
         input_metadata = await recv_metadata(ch_in, context)
+        print(f"[DBG concatenate_node GOT_META] ir_id={ir_id} local_count={input_metadata.local_count} duplicated={input_metadata.duplicated}", flush=True)
         nranks = comm.nranks
 
         # Interpret output_count as the GLOBAL target chunk count.
@@ -232,7 +236,9 @@ async def concatenate_node(
                 if done_receiving:
                     break
 
+        print(f"[DBG concatenate_node DRAIN] ir_id={ir_id}", flush=True)
         await ch_out.drain(context)
+        print(f"[DBG concatenate_node END] ir_id={ir_id}", flush=True)
 
 
 @generate_ir_sub_network.register(Repartition)

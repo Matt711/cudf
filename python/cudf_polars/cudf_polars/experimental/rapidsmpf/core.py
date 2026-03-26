@@ -303,11 +303,32 @@ def evaluate_pipeline(
         )
 
         # Run the network
+        from rapidsmpf.streaming.core.actor import CppActor, PyActor
+        n_py = sum(1 for n in nodes if isinstance(n, PyActor))
+        n_cpp = sum(1 for n in nodes if isinstance(n, CppActor))
+        n_other = len(nodes) - n_py - n_cpp
+        print(f"[DBG run_actor_network START] n_actors={len(nodes)} n_py={n_py} n_cpp={n_cpp} n_other={n_other}", flush=True)
+        # Patch each PyActor to print its position when it starts/ends
+        import asyncio as _asyncio
+        for i, n in enumerate(nodes):
+            if isinstance(n, PyActor):
+                orig_coro = n._coro
+                async def _position_wrapper(orig=orig_coro, pos=i):
+                    print(f"[DBG py_actor[{pos}] STARTED]", flush=True)
+                    try:
+                        return await orig
+                    except BaseException as e:
+                        print(f"[DBG py_actor[{pos}] ERROR] {type(e).__name__}: {e}", flush=True)
+                        raise
+                    finally:
+                        print(f"[DBG py_actor[{pos}] DONE]", flush=True)
+                n._coro = _position_wrapper()
         with ThreadPoolExecutor(
             max_workers=config_options.executor.rapidsmpf_py_executor_max_workers,
             thread_name_prefix="cpse",
         ) as executor:
-            run_actor_network(actors=nodes, py_executor=executor)
+            run_actor_network(actors=nodes, py_executor=executor, context=rmpf_context)
+        print(f"[DBG run_actor_network DONE]", flush=True)
 
         # Extract/return the concatenated result.
         # Keep chunks alive until after concatenation to prevent

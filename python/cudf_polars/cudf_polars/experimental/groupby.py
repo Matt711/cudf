@@ -13,7 +13,7 @@ import polars as pl
 import pylibcudf as plc
 
 from cudf_polars.containers import DataType
-from cudf_polars.dsl.expr import Agg, BinOp, Col, Len, NamedExpr
+from cudf_polars.dsl.expr import Agg, BinOp, Cast, Col, Len, Literal, NamedExpr, UnaryFunction
 from cudf_polars.dsl.expressions.base import ExecutionContext
 from cudf_polars.dsl.ir import GroupBy, Select, Slice
 from cudf_polars.dsl.traversal import traversal
@@ -148,6 +148,66 @@ def decompose(
                 name,
                 BinOp(dtype, plc.binaryop.BinaryOperator.DIV, sum.value, count.value),
             )
+            return selection, aggregations, reductions, need_preshuffle
+        elif expr.name in ("std", "var"):
+            ddof = expr.options  # degrees of freedom (e.g., 1 for sample std)
+            (child,) = expr.children
+            # Cast child to the output float dtype to avoid integer overflow in x^2.
+            # Skip the cast if child is already the right type.
+            float_child = (
+                child if child.dtype == dtype else Cast(dtype, False, child)  # noqa: FBT003
+            )
+            x_sq = BinOp(
+                dtype, plc.binaryop.BinaryOperator.MUL, float_child, float_child
+            )
+            (sum_val, sum2_val, count_val), aggregations, reductions, need_preshuffle = (
+                combine(
+                    decompose(
+                        f"{next(names)}__std_sum",
+                        Agg(dtype, "sum", None, ExecutionContext.GROUPBY, float_child),
+                        names=names,
+                    ),
+                    decompose(
+                        f"{next(names)}__std_sum2",
+                        Agg(dtype, "sum", None, ExecutionContext.GROUPBY, x_sq),
+                        names=names,
+                    ),
+                    decompose(
+                        f"{next(names)}__std_count",
+                        Agg(
+                            DataType(pl.Int64()),
+                            "count",
+                            False,  # noqa: FBT003
+                            ExecutionContext.GROUPBY,
+                            child,
+                        ),
+                        names=names,
+                    ),
+                )
+            )
+            # std = sqrt((sum_x2 - sum_x^2 / n) / (n - ddof))
+            n = Cast(dtype, False, count_val.value)  # noqa: FBT003  Int64 -> float
+            ddof_lit = Literal(dtype, float(ddof))
+            sum_sq_div_n = BinOp(
+                dtype,
+                plc.binaryop.BinaryOperator.DIV,
+                BinOp(dtype, plc.binaryop.BinaryOperator.MUL, sum_val.value, sum_val.value),
+                n,
+            )
+            ssd = BinOp(
+                dtype, plc.binaryop.BinaryOperator.SUB, sum2_val.value, sum_sq_div_n
+            )
+            denom = BinOp(dtype, plc.binaryop.BinaryOperator.SUB, n, ddof_lit)
+            variance = BinOp(dtype, plc.binaryop.BinaryOperator.DIV, ssd, denom)
+            # mask_nans converts NaN -> null, matching Polars behavior when n == ddof
+            # (e.g. single-element groups with ddof=1 give 0/0 = NaN, should be null)
+            unmasked: Expr = (
+                UnaryFunction(dtype, "sqrt", (), variance)
+                if expr.name == "std"
+                else variance
+            )
+            result: Expr = UnaryFunction(dtype, "mask_nans", (), unmasked)
+            selection = NamedExpr(name, result)
             return selection, aggregations, reductions, need_preshuffle
         else:
             raise NotImplementedError(

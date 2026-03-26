@@ -54,6 +54,9 @@ async def union_node(
     chs_in
         The input Channel[TableChunk]s.
     """
+    ir_id = id(ir)
+    n_inputs = len(chs_in)
+    print(f"[DBG union_node START] ir_id={ir_id} n_inputs={n_inputs}", flush=True)
     async with shutdown_on_error(
         context, *chs_in, ch_out, trace_ir=ir, ir_context=ir_context
     ):
@@ -62,10 +65,13 @@ async def union_node(
         # TODO: Warn users that Union does NOT preserve order?
         total_local_count = 0
         duplicated = True
-        for ch_in in chs_in:
+        for i, ch_in in enumerate(chs_in):
+            print(f"[DBG union_node RECV_META] ir_id={ir_id} ch={i}", flush=True)
             metadata = await recv_metadata(ch_in, context)
+            print(f"[DBG union_node GOT_META] ir_id={ir_id} ch={i} local_count={metadata.local_count}", flush=True)
             total_local_count += metadata.local_count
             duplicated = duplicated and metadata.duplicated
+        print(f"[DBG union_node SEND_META] ir_id={ir_id} total_local_count={total_local_count}", flush=True)
         await send_metadata(
             ch_out,
             context,
@@ -74,10 +80,12 @@ async def union_node(
                 duplicated=duplicated,
             ),
         )
+        print(f"[DBG union_node SEND_META_DONE] ir_id={ir_id}", flush=True)
 
         seq_num_offset = 0
-        for ch_in in chs_in:
+        for i, ch_in in enumerate(chs_in):
             num_ch_chunks = 0
+            print(f"[DBG union_node DATA_FWD_START] ir_id={ir_id} ch={i}", flush=True)
             while (msg := await ch_in.recv(context)) is not None:
                 num_ch_chunks += 1
                 await ch_out.send(
@@ -90,8 +98,11 @@ async def union_node(
                     ),
                 )
             seq_num_offset += num_ch_chunks
+            print(f"[DBG union_node DATA_FWD_DONE] ir_id={ir_id} ch={i} chunks={num_ch_chunks}", flush=True)
 
+        print(f"[DBG union_node DRAIN] ir_id={ir_id}", flush=True)
         await ch_out.drain(context)
+        print(f"[DBG union_node END] ir_id={ir_id}", flush=True)
 
 
 @generate_ir_sub_network.register(Union)

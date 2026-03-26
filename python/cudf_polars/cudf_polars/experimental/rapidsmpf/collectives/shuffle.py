@@ -192,17 +192,21 @@ async def _global_shuffle(
     collective_id
         The collective ID.
     """
+    print(f"[DBG _global_shuffle START] num_partitions={num_partitions} collective_id={collective_id}", flush=True)
     metadata_in = await recv_metadata(ch_in, context)
+    print(f"[DBG _global_shuffle GOT_META] num_partitions={num_partitions} local_count={metadata_in.local_count} duplicated={metadata_in.duplicated}", flush=True)
 
     # Check if we can skip the shuffle (already partitioned correctly)
     if _is_already_partitioned(
         metadata_in, columns_to_hash, num_partitions, comm.nranks
     ):
+        print(f"[DBG _global_shuffle SKIP (already partitioned)] num_partitions={num_partitions}", flush=True)
         # Forward metadata and data unchanged
         await send_metadata(ch_out, context, metadata_in)
         while (msg := await ch_in.recv(context)) is not None:
             await ch_out.send(context, msg)
         await ch_out.drain(context)
+        print(f"[DBG _global_shuffle SKIP_DONE] num_partitions={num_partitions}", flush=True)
         return
 
     # Normal shuffle path
@@ -223,6 +227,7 @@ async def _global_shuffle(
     # Other ranks still participate in the shuffle protocol.
     skip_insert = metadata_in.duplicated and comm.rank != 0
 
+    n_chunks = 0
     while (msg := await ch_in.recv(context)) is not None:
         if not skip_insert:
             shuffle.insert_chunk(
@@ -230,10 +235,15 @@ async def _global_shuffle(
                     context.br(), allow_overbooking=True
                 )
             )
+            n_chunks += 1
 
+    print(f"[DBG _global_shuffle INSERT_FINISHED] num_partitions={num_partitions} collective_id={collective_id} n_chunks={n_chunks}", flush=True)
     await shuffle.insert_finished()
+    print(f"[DBG _global_shuffle INSERT_FINISHED_DONE] num_partitions={num_partitions}", flush=True)
 
-    for partition_id in shuffle.shuffler.local_partitions():
+    local_parts = shuffle.shuffler.local_partitions()
+    print(f"[DBG _global_shuffle EXTRACT] num_partitions={num_partitions} local_parts={local_parts}", flush=True)
+    for partition_id in local_parts:
         stream = ir_context.get_cuda_stream()
         await ch_out.send(
             context,
@@ -247,7 +257,9 @@ async def _global_shuffle(
             ),
         )
 
+    print(f"[DBG _global_shuffle DRAIN] num_partitions={num_partitions}", flush=True)
     await ch_out.drain(context)
+    print(f"[DBG _global_shuffle END] num_partitions={num_partitions}", flush=True)
 
 
 @define_actor()

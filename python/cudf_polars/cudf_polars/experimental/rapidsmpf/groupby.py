@@ -454,7 +454,9 @@ async def _shuffle_reduce(
         )
         del aggregated
 
+    print(f"[DBG _shuffle_reduce INSERT_FINISHED] modulus={modulus} collective_id={collective_id}", flush=True)
     await shuffle.insert_finished()
+    print(f"[DBG _shuffle_reduce INSERT_FINISHED_DONE] modulus={modulus}", flush=True)
     extract_irs = [decomposed.reduction_ir] + (
         [decomposed.select_ir] if decomposed.select_ir else []
     )
@@ -656,10 +658,15 @@ async def groupby_actor(
     collective_ids
         The collective IDs.
     """
+    ir_id = id(ir)
+    ir_keys = [ne.name for ne in ir.keys] if isinstance(ir, GroupBy) else []
+    print(f"[DBG groupby_actor START] ir_id={ir_id} keys={ir_keys}", flush=True)
     async with shutdown_on_error(
         context, ch_in, ch_out, trace_ir=ir, ir_context=ir_context
     ) as tracer:
+        print(f"[DBG groupby_actor RECV_META] ir_id={ir_id}", flush=True)
         metadata_in = await recv_metadata(ch_in, context)
+        print(f"[DBG groupby_actor GOT_META] ir_id={ir_id} local_count={metadata_in.local_count} duplicated={metadata_in.duplicated}", flush=True)
 
         nranks = comm.nranks
         partitioning = NormalizedPartitioning.from_indices(
@@ -681,9 +688,11 @@ async def groupby_actor(
             and isinstance(ir.children[0], Repartition)
         )
 
+        print(f"[DBG groupby_actor STRATEGY_CHECK] ir_id={ir_id} fully_partitioned={fully_partitioned} fallback_case={fallback_case}", flush=True)
         if fully_partitioned or fallback_case:
             if tracer is not None:
                 tracer.decision = "chunkwise"
+            print(f"[DBG groupby_actor CHUNKWISE] ir_id={ir_id}", flush=True)
             await chunkwise_evaluate(
                 context,
                 ir,
@@ -693,11 +702,13 @@ async def groupby_actor(
                 metadata_in,
                 tracer=tracer,
             )
+            print(f"[DBG groupby_actor CHUNKWISE_DONE] ir_id={ir_id}", flush=True)
             return
 
         decomposed = DecomposedGroupBy.from_ir(ir)
         assert not decomposed.need_preshuffle, "Should already be shuffled."
 
+        print(f"[DBG groupby_actor LOCAL_AGG_START] ir_id={ir_id}", flush=True)
         aggregated, input_drained, chunks_received = await _local_aggregation(
             context,
             decomposed,
@@ -706,8 +717,10 @@ async def groupby_actor(
             target_partition_size,
             allow_early_exit=not require_tree,
         )
+        print(f"[DBG groupby_actor LOCAL_AGG_DONE] ir_id={ir_id} input_drained={input_drained} chunks_received={chunks_received}", flush=True)
 
         skip_global_comm = metadata_in.duplicated or partitioned_inter_rank
+        print(f"[DBG groupby_actor CHOOSE_STRATEGY] ir_id={ir_id} skip_global_comm={skip_global_comm}", flush=True)
         output_count = await _choose_strategy(
             context,
             comm,
@@ -720,8 +733,10 @@ async def groupby_actor(
             skip_global_comm,
             tracer,
         )
+        print(f"[DBG groupby_actor CHOSEN] ir_id={ir_id} output_count={output_count}", flush=True)
 
         if output_count == 1:
+            print(f"[DBG groupby_actor TREE_REDUCE] ir_id={ir_id}", flush=True)
             await _tree_reduce(
                 context,
                 comm,
@@ -734,7 +749,9 @@ async def groupby_actor(
                 aggregated=aggregated,
                 tracer=tracer,
             )
+            print(f"[DBG groupby_actor TREE_REDUCE_DONE] ir_id={ir_id}", flush=True)
         else:
+            print(f"[DBG groupby_actor SHUFFLE_REDUCE] ir_id={ir_id} output_count={output_count}", flush=True)
             await _shuffle_reduce(
                 context,
                 comm,
@@ -751,6 +768,8 @@ async def groupby_actor(
                 input_drained=input_drained,
                 tracer=tracer,
             )
+            print(f"[DBG groupby_actor SHUFFLE_REDUCE_DONE] ir_id={ir_id}", flush=True)
+    print(f"[DBG groupby_actor END] ir_id={ir_id}", flush=True)
 
 
 @generate_ir_sub_network.register(GroupBy)

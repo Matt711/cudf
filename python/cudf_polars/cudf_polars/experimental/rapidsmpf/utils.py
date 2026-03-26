@@ -127,6 +127,7 @@ async def shutdown_on_error(
             yield tracer
         except BaseException:
             await asyncio.gather(*(ch.shutdown(context) for ch in channels))
+            context.cancel_network()
             raise
         finally:
             stop = time.monotonic_ns()
