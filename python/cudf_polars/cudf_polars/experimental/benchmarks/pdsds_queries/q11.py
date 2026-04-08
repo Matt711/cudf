@@ -128,10 +128,8 @@ def create_year_total(
 ) -> pl.LazyFrame:
     """Computes per-customer yearly totals for a sales table and year."""
     return (
-        customer_table.join(
-            sales_table, left_on="c_customer_sk", right_on=customer_sk_col, how="inner"
-        )
-        .join(year_filter, left_on=date_sk_col, right_on="d_date_sk", how="inner")
+        sales_table.join(year_filter, left_on=date_sk_col, right_on="d_date_sk", how="inner")
+        .join(customer_table, left_on=customer_sk_col, right_on="c_customer_sk", how="inner")
         .group_by(
             [
                 "c_customer_id",
@@ -191,7 +189,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         "ss_ext_list_price",
         "ss_ext_discount_amt",
         date_first,
-    ).select(
+    ).filter(pl.col("year_total") > 0).select(
         [
             pl.col("customer_id").alias("s_first_customer_id"),
             pl.col("year_total").alias("s_first_year_total"),
@@ -226,7 +224,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         "ws_ext_list_price",
         "ws_ext_discount_amt",
         date_first,
-    ).select(
+    ).filter(pl.col("year_total") > 0).select(
         [
             pl.col("customer_id").alias("w_first_customer_id"),
             pl.col("year_total").alias("w_first_year_total"),
@@ -271,16 +269,8 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
                 how="inner",
             )
             .filter(
-                (pl.col("s_first_year_total") > 0)
-                & (pl.col("w_first_year_total") > 0)
-                & (
-                    pl.when(pl.col("w_first_year_total") > 0)
-                    .then(pl.col("w_sec_year_total") / pl.col("w_first_year_total"))
-                    .otherwise(0.0)
-                    > pl.when(pl.col("s_first_year_total") > 0)
-                    .then(pl.col("s_sec_year_total") / pl.col("s_first_year_total"))
-                    .otherwise(0.0)
-                )
+                pl.col("w_sec_year_total") / pl.col("w_first_year_total")
+                > pl.col("s_sec_year_total") / pl.col("s_first_year_total")
             )
             .select(
                 [

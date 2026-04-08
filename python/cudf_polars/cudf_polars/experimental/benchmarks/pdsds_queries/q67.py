@@ -71,136 +71,29 @@ def duckdb_impl(run_config: RunConfig) -> str:
     """
 
 
-def _build_rollup_levels(
-    base_data: pl.LazyFrame,
-    full_cols: list[str],
-    rollup_specs: list[tuple[list[str], dict[str, pl.DataType]]],
-) -> pl.LazyFrame:
-    levels: list[pl.LazyFrame] = []
-
-    for grp_cols, null_cols in rollup_specs:
-        lf = (
-            base_data.group_by(grp_cols).agg(
-                pl.col("sales_amount").sum().alias("sumsales")
-            )
-            if grp_cols
-            else base_data.select(pl.col("sales_amount").sum().alias("sumsales"))
-        )
-
-        if null_cols:
-            lf = lf.with_columns(
-                [pl.lit(None, dtype=dt).alias(col) for col, dt in null_cols.items()]
-            )
-
-        lf = lf.select(
-            [*(c for c in full_cols if c in grp_cols or c in null_cols), "sumsales"]
-        )
-
-        missing = [c for c in full_cols if c not in grp_cols and c not in null_cols]
-        if missing:
-            lf = lf.with_columns([pl.lit(None).alias(c) for c in missing]).select(
-                [*full_cols, "sumsales"]
-            )
-
-        levels.append(lf)
-
-    return pl.concat(levels)
-
-
-rollup_specs: list[tuple[list[str], dict[str, pl.DataType]]] = [
-    (
-        [
-            "i_category",
-            "i_class",
-            "i_brand",
-            "i_product_name",
-            "d_year",
-            "d_qoy",
-            "d_moy",
-            "s_store_id",
-        ],
-        {},
-    ),
-    (
-        [
-            "i_category",
-            "i_class",
-            "i_brand",
-            "i_product_name",
-            "d_year",
-            "d_qoy",
-            "d_moy",
-        ],
-        {"s_store_id": pl.String()},
-    ),
-    (
-        ["i_category", "i_class", "i_brand", "i_product_name", "d_year", "d_qoy"],
-        {"d_moy": pl.Int64(), "s_store_id": pl.String()},
-    ),
-    (
-        ["i_category", "i_class", "i_brand", "i_product_name", "d_year"],
-        {"d_qoy": pl.Int64(), "d_moy": pl.Int64(), "s_store_id": pl.String()},
-    ),
-    (
-        ["i_category", "i_class", "i_brand", "i_product_name"],
-        {
-            "d_year": pl.Int64(),
-            "d_qoy": pl.Int64(),
-            "d_moy": pl.Int64(),
-            "s_store_id": pl.String(),
-        },
-    ),
-    (
-        ["i_category", "i_class", "i_brand"],
-        {
-            "i_product_name": pl.String(),
-            "d_year": pl.Int64(),
-            "d_qoy": pl.Int64(),
-            "d_moy": pl.Int64(),
-            "s_store_id": pl.String(),
-        },
-    ),
-    (
-        ["i_category", "i_class"],
-        {
-            "i_brand": pl.String(),
-            "i_product_name": pl.String(),
-            "d_year": pl.Int64(),
-            "d_qoy": pl.Int64(),
-            "d_moy": pl.Int64(),
-            "s_store_id": pl.String(),
-        },
-    ),
-    (
-        ["i_category"],
-        {
-            "i_class": pl.String(),
-            "i_brand": pl.String(),
-            "i_product_name": pl.String(),
-            "d_year": pl.Int64(),
-            "d_qoy": pl.Int64(),
-            "d_moy": pl.Int64(),
-            "s_store_id": pl.String(),
-        },
-    ),
-    (
-        [],
-        {
-            "i_category": pl.String(),
-            "i_class": pl.String(),
-            "i_brand": pl.String(),
-            "i_product_name": pl.String(),
-            "d_year": pl.Int64(),
-            "d_qoy": pl.Int64(),
-            "d_moy": pl.Int64(),
-            "s_store_id": pl.String(),
-        },
-    ),
-]
-
-
 def polars_impl(run_config: RunConfig) -> QueryResult:
-    """Query 67."""
+    """Query 67.
+
+    SQL structure
+    -------------
+    SELECT *, rank() OVER (PARTITION BY i_category ORDER BY sumsales DESC) rk
+    FROM (
+        SELECT i_category, i_class, i_brand, i_product_name,
+               d_year, d_qoy, d_moy, s_store_id,
+               SUM(COALESCE(ss_sales_price * ss_quantity, 0)) sumsales
+        FROM store_sales, date_dim, store, item
+        WHERE ss_sold_date_sk = d_date_sk
+          AND ss_item_sk = i_item_sk
+          AND ss_store_sk = s_store_sk
+          AND d_month_seq BETWEEN {dms} AND {dms}+11
+        GROUP BY ROLLUP(i_category, i_class, i_brand, i_product_name,
+                        d_year, d_qoy, d_moy, s_store_id)
+    )
+    WHERE rk <= 100
+    ORDER BY i_category, i_class, i_brand, i_product_name,
+             d_year, d_qoy, d_moy, s_store_id, sumsales, rk
+    LIMIT 100
+    """
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=67,
@@ -209,24 +102,41 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
 
     dms = params["dms"]
 
-    store_sales = get_data(run_config.dataset_path, "store_sales", run_config.suffix)
-    date_dim = get_data(run_config.dataset_path, "date_dim", run_config.suffix)
-    store = get_data(run_config.dataset_path, "store", run_config.suffix)
-    item = get_data(run_config.dataset_path, "item", run_config.suffix)
-
-    base_data = (
-        store_sales.join(date_dim, left_on="ss_sold_date_sk", right_on="d_date_sk")
-        .join(store, left_on="ss_store_sk", right_on="s_store_sk")
-        .join(item, left_on="ss_item_sk", right_on="i_item_sk")
+    # Pre-filter / project dimension tables once.
+    # These are small (~365, ~1K, ~360K rows at SF1000) so their 9-consumer
+    # fanout buffers in the streaming executor are negligible.
+    date_filtered = (
+        get_data(run_config.dataset_path, "date_dim", run_config.suffix)
         .filter(pl.col("d_month_seq").is_between(dms, dms + 11))
-        .with_columns(
-            (pl.col("ss_sales_price") * pl.col("ss_quantity"))
-            .fill_null(0)
-            .alias("sales_amount")
-        )
+        .select(["d_date_sk", "d_year", "d_qoy", "d_moy"])
+    )
+    item_sel = get_data(run_config.dataset_path, "item", run_config.suffix).select(
+        ["i_item_sk", "i_category", "i_class", "i_brand", "i_product_name"]
+    )
+    store_sel = get_data(run_config.dataset_path, "store", run_config.suffix).select(
+        ["s_store_sk", "s_store_id"]
     )
 
-    full_cols = [
+    # Each make_base() call issues a fresh scan_parquet() so the 9 rollup
+    # pipelines are independent in the streaming actor graph — no fanout and
+    # no back-pressure on the large store_sales table.
+    def make_base() -> pl.LazyFrame:
+        return (
+            get_data(run_config.dataset_path, "store_sales", run_config.suffix)
+            .join(date_filtered, left_on="ss_sold_date_sk", right_on="d_date_sk")
+            .join(item_sel, left_on="ss_item_sk", right_on="i_item_sk")
+            .join(store_sel, left_on="ss_store_sk", right_on="s_store_sk")
+        )
+
+    sales_expr = (
+        (pl.col("ss_sales_price") * pl.col("ss_quantity"))
+        .fill_null(0)
+        .sum()
+        .alias("sumsales")
+    )
+
+    # Output column order matches the SQL SELECT list.
+    out_cols = [
         "i_category",
         "i_class",
         "i_brand",
@@ -235,36 +145,140 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         "d_qoy",
         "d_moy",
         "s_store_id",
+        "sumsales",
     ]
 
-    rollup_data = _build_rollup_levels(base_data, full_cols, rollup_specs)
-
-    ranked = rollup_data.with_columns(
-        pl.col("sumsales")
-        .rank(method="dense", descending=True)
-        .over("i_category")
-        .alias("rk")
+    # ROLLUP(i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id)
+    # produces 9 levels: the full grouping plus each successive right-side drop.
+    level1 = (
+        make_base()
+        .group_by(["i_category", "i_class", "i_brand", "i_product_name",
+                   "d_year", "d_qoy", "d_moy", "s_store_id"])
+        .agg(sales_expr)
+        .select(out_cols)
+    )
+    level2 = (
+        make_base()
+        .group_by(["i_category", "i_class", "i_brand", "i_product_name",
+                   "d_year", "d_qoy", "d_moy"])
+        .agg(sales_expr)
+        .with_columns(pl.lit(None, dtype=pl.String).alias("s_store_id"))
+        .select(out_cols)
+    )
+    level3 = (
+        make_base()
+        .group_by(["i_category", "i_class", "i_brand", "i_product_name",
+                   "d_year", "d_qoy"])
+        .agg(sales_expr)
+        .with_columns(
+            pl.lit(None, dtype=pl.Int64).alias("d_moy"),
+            pl.lit(None, dtype=pl.String).alias("s_store_id"),
+        )
+        .select(out_cols)
+    )
+    level4 = (
+        make_base()
+        .group_by(["i_category", "i_class", "i_brand", "i_product_name", "d_year"])
+        .agg(sales_expr)
+        .with_columns(
+            pl.lit(None, dtype=pl.Int64).alias("d_qoy"),
+            pl.lit(None, dtype=pl.Int64).alias("d_moy"),
+            pl.lit(None, dtype=pl.String).alias("s_store_id"),
+        )
+        .select(out_cols)
+    )
+    level5 = (
+        make_base()
+        .group_by(["i_category", "i_class", "i_brand", "i_product_name"])
+        .agg(sales_expr)
+        .with_columns(
+            pl.lit(None, dtype=pl.Int64).alias("d_year"),
+            pl.lit(None, dtype=pl.Int64).alias("d_qoy"),
+            pl.lit(None, dtype=pl.Int64).alias("d_moy"),
+            pl.lit(None, dtype=pl.String).alias("s_store_id"),
+        )
+        .select(out_cols)
+    )
+    level6 = (
+        make_base()
+        .group_by(["i_category", "i_class", "i_brand"])
+        .agg(sales_expr)
+        .with_columns(
+            pl.lit(None, dtype=pl.String).alias("i_product_name"),
+            pl.lit(None, dtype=pl.Int64).alias("d_year"),
+            pl.lit(None, dtype=pl.Int64).alias("d_qoy"),
+            pl.lit(None, dtype=pl.Int64).alias("d_moy"),
+            pl.lit(None, dtype=pl.String).alias("s_store_id"),
+        )
+        .select(out_cols)
+    )
+    level7 = (
+        make_base()
+        .group_by(["i_category", "i_class"])
+        .agg(sales_expr)
+        .with_columns(
+            pl.lit(None, dtype=pl.String).alias("i_brand"),
+            pl.lit(None, dtype=pl.String).alias("i_product_name"),
+            pl.lit(None, dtype=pl.Int64).alias("d_year"),
+            pl.lit(None, dtype=pl.Int64).alias("d_qoy"),
+            pl.lit(None, dtype=pl.Int64).alias("d_moy"),
+            pl.lit(None, dtype=pl.String).alias("s_store_id"),
+        )
+        .select(out_cols)
+    )
+    level8 = (
+        make_base()
+        .group_by(["i_category"])
+        .agg(sales_expr)
+        .with_columns(
+            pl.lit(None, dtype=pl.String).alias("i_class"),
+            pl.lit(None, dtype=pl.String).alias("i_brand"),
+            pl.lit(None, dtype=pl.String).alias("i_product_name"),
+            pl.lit(None, dtype=pl.Int64).alias("d_year"),
+            pl.lit(None, dtype=pl.Int64).alias("d_qoy"),
+            pl.lit(None, dtype=pl.Int64).alias("d_moy"),
+            pl.lit(None, dtype=pl.String).alias("s_store_id"),
+        )
+        .select(out_cols)
+    )
+    # Grand total — no group-by keys; all dimension columns become NULL.
+    level9 = (
+        make_base()
+        .select(sales_expr)
+        .with_columns(
+            pl.lit(None, dtype=pl.String).alias("i_category"),
+            pl.lit(None, dtype=pl.String).alias("i_class"),
+            pl.lit(None, dtype=pl.String).alias("i_brand"),
+            pl.lit(None, dtype=pl.String).alias("i_product_name"),
+            pl.lit(None, dtype=pl.Int64).alias("d_year"),
+            pl.lit(None, dtype=pl.Int64).alias("d_qoy"),
+            pl.lit(None, dtype=pl.Int64).alias("d_moy"),
+            pl.lit(None, dtype=pl.String).alias("s_store_id"),
+        )
+        .select(out_cols)
     )
 
+    all_levels = pl.concat(
+        [level1, level2, level3, level4, level5, level6, level7, level8, level9]
+    )
+
+    # rank() OVER (PARTITION BY i_category ORDER BY sumsales DESC)
+    # The HStack handler shuffles by i_category so this runs partition-locally.
+    sort_cols = [
+        "i_category", "i_class", "i_brand", "i_product_name",
+        "d_year", "d_qoy", "d_moy", "s_store_id", "sumsales", "rk",
+    ]
     return QueryResult(
         frame=(
-            ranked.filter(pl.col("rk") <= 100)
-            .sort(
-                [
-                    "i_category",
-                    "i_class",
-                    "i_brand",
-                    "i_product_name",
-                    "d_year",
-                    "d_qoy",
-                    "d_moy",
-                    "s_store_id",
-                    "sumsales",
-                    "rk",
-                ],
-                nulls_last=True,
-                descending=[False] * 10,
+            all_levels
+            .with_columns(
+                pl.col("sumsales")
+                .rank(method="min", descending=True)
+                .over("i_category")
+                .alias("rk")
             )
+            .filter(pl.col("rk") <= 100)
+            .sort(sort_cols, nulls_last=True)
             .limit(100)
         ),
         sort_by=[

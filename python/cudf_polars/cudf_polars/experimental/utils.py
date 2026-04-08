@@ -141,6 +141,63 @@ def _contains_over(exprs: Sequence[Expr]) -> bool:
     return any(isinstance(e, GroupedRollingWindow) for e in traversal(exprs))
 
 
+def _extract_over_shuffle_keys(
+    col_exprs: Sequence[Expr],
+) -> tuple[str, ...] | None:
+    """
+    Extract common partition keys from all ``over()`` expressions.
+
+    Traverses *col_exprs* without descending into ``GroupedRollingWindow``
+    children (those contain internal aggregation nodes that are handled by
+    the window expression itself and are not "blocking" for the HStack).
+
+    Returns a tuple of column-name strings if every non-pointwise node in
+    the tree is a ``GroupedRollingWindow`` whose ``by`` keys are all simple
+    ``Col`` references **and** every such node uses the *same* set of keys.
+    Returns ``None`` if any non-pointwise node is not a
+    ``GroupedRollingWindow``, or if the ``over()`` keys differ across nodes,
+    or if any key is not a plain column reference.
+    """
+    common_keys: tuple[str, ...] | None = None
+    found_grw = False
+
+    seen: set[int] = set()
+    stack: list[Expr] = list(reversed(list(col_exprs)))
+
+    while stack:
+        e = stack.pop()
+        eid = id(e)
+        if eid in seen:
+            continue
+        seen.add(eid)
+
+        if isinstance(e, GroupedRollingWindow):
+            found_grw = True
+            by_exprs = e.children[: e.by_count]
+            # All partition-key expressions must be plain column references
+            if not all(isinstance(b, Col) for b in by_exprs):
+                return None
+            these_keys: tuple[str, ...] = tuple(b.name for b in by_exprs)  # type: ignore[union-attr]
+            if common_keys is None:
+                common_keys = these_keys
+            elif common_keys != these_keys:
+                return None
+            # Do NOT recurse into GroupedRollingWindow's children —
+            # they contain internal aggregation nodes that are non-pointwise
+            # but handled by the window expression itself.
+            continue
+
+        if not e.is_pointwise:
+            # Non-pointwise node that is not a GroupedRollingWindow — unsupported
+            return None
+
+        for child in reversed(e.children):
+            if id(child) not in seen:
+                stack.append(child)
+
+    return common_keys if found_grw else None
+
+
 def _contains_unsupported_fill_strategy(exprs: Sequence[Expr]) -> bool:
     for e in traversal(exprs):
         if (

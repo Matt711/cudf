@@ -167,6 +167,28 @@ def decompose_single_agg(
             child = agg.children[0]
         else:
             (child,) = agg.children
+        # Filtered aggregation: sum(x.filter(mask)), mean(x.filter(mask)), etc.
+        # Rewrite Filter(values, mask) -> Ternary(mask, values, null) so that masked-out
+        # values become null and are skipped by the aggregation.
+        # Only valid for aggregations that skip nulls. Excluded: first, last, collect_list,
+        # null_count (null_count would incorrectly count the substituted nulls).
+        _NULL_SKIPPING_AGGS = {
+            "sum", "mean", "min", "max", "std", "var", "median", "quantile",
+        }
+        if isinstance(child, expr.Filter) and agg.name in _NULL_SKIPPING_AGGS:
+            values_expr, mask_expr = child.children
+            child = expr.Ternary(
+                values_expr.dtype, mask_expr, values_expr, expr.Literal(values_expr.dtype, None)
+            )
+            new_children = (
+                [child, agg.children[1]] if agg.name == "quantile" else [child]
+            )
+            return decompose_single_agg(
+                named_expr.reconstruct(agg.reconstruct(new_children)),
+                name_generator,
+                is_top=is_top,
+                context=context,
+            )
         needs_masking = agg.name in {"min", "max"} and plc.traits.is_floating_point(
             child.dtype.plc_type
         )

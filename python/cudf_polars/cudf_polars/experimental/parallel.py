@@ -16,6 +16,7 @@ import cudf_polars.experimental.join
 import cudf_polars.experimental.select
 import cudf_polars.experimental.shuffle
 import cudf_polars.experimental.sort  # noqa: F401
+from cudf_polars.dsl import expr
 from cudf_polars.dsl.ir import (
     IR,
     Cache,
@@ -25,15 +26,18 @@ from cudf_polars.dsl.ir import (
     IRExecutionContext,
     MapFunction,
     Projection,
+    Select,
     Slice,
     Union,
 )
+from cudf_polars.dsl.utils.naming import unique_names
 from cudf_polars.dsl.traversal import CachingVisitor, traversal
 from cudf_polars.experimental.base import PartitionInfo, get_key_name
 from cudf_polars.experimental.dispatch import (
     generate_ir_tasks,
     lower_ir_node,
 )
+from cudf_polars.experimental.expressions import decompose_expr_graph
 from cudf_polars.experimental.io import _clear_source_info_cache
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.statistics import collect_statistics
@@ -41,6 +45,7 @@ from cudf_polars.experimental.utils import (
     _concat,
     _contains_over,
     _dynamic_planning_on,
+    _extract_over_shuffle_keys,
     _lower_ir_fallback,
 )
 
@@ -416,13 +421,40 @@ def _(
         )
 
     if partition_info[child].count > 1 and not all(
-        expr.is_pointwise for expr in traversal([ir.mask.value])
+        e.is_pointwise for e in traversal([ir.mask.value])
     ):
-        # TODO: Use expression decomposition to lower Filter
-        # See: https://github.com/rapidsai/cudf/issues/20076
-        return _lower_ir_fallback(
-            ir, rec, msg="This filter is not supported for multiple partitions."
+        config_options = rec.state["config_options"]
+        name_generator = unique_names(
+            (ir.mask.name, *child.schema.keys())
         )
+        try:
+            new_mask, new_child, _partition_info = decompose_expr_graph(
+                ir.mask,
+                child,
+                partition_info,
+                config_options,
+                name_generator,
+            )
+        except NotImplementedError:
+            return _lower_ir_fallback(
+                ir, rec, msg="This filter is not supported for multiple partitions."
+            )
+        partition_info.update(_partition_info)
+        pi_count = partition_info[new_child].count
+        # Apply the filter with the now-pointwise mask on the augmented child.
+        # new_child may have extra temporary columns added by decompose_expr_graph
+        # (the aggregation results), so use new_child.schema here.
+        new_filter = Filter(new_child.schema, new_mask, new_child)
+        partition_info[new_filter] = PartitionInfo(count=pi_count)
+        # Project back to the original schema, dropping any temporaries.
+        if new_child.schema != ir.schema:
+            proj_exprs = [
+                expr.NamedExpr(k, expr.Col(v, k)) for k, v in ir.schema.items()
+            ]
+            new_node = Select(ir.schema, proj_exprs, True, new_filter)  # noqa: FBT003
+            partition_info[new_node] = PartitionInfo(count=pi_count)
+            return new_node, partition_info
+        return new_filter, partition_info
 
     new_node = ir.reconstruct([child])
     partition_info[new_node] = partition_info[child]
@@ -460,15 +492,53 @@ def _(
 def _(
     ir: HStack, rec: LowerIRTransformer
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
-    if not all(
-        expr.is_pointwise for expr in traversal([e.value for e in ir.columns])
-    ):  # pragma: no cover
-        # TODO: Avoid fallback if/when possible
-        return _lower_ir_fallback(
-            ir, rec, msg="This HStack not supported for multiple partitions."
+    from cudf_polars.dsl.expr import Col, NamedExpr
+    from cudf_polars.experimental.shuffle import Shuffle
+
+    col_exprs = [e.value for e in ir.columns]
+
+    if all(e.is_pointwise for e in traversal(col_exprs)):
+        # All pointwise — distribute trivially partition-local
+        child, partition_info = rec(ir.children[0])
+        new_node = ir.reconstruct([child])
+        partition_info[new_node] = partition_info[child]
+        return new_node, partition_info
+
+    over_keys = _extract_over_shuffle_keys(col_exprs)
+    if over_keys is not None:
+        # All non-pointwise nodes are GroupedRollingWindow (over()) with
+        # consistent Col-based partition keys.  Shuffle on those keys so
+        # every partition holds all rows for a given key value, making the
+        # over() computation fully partition-local.
+        config_options = rec.state["config_options"]
+        child, partition_info = rec(ir.children[0])
+
+        shuffle_keys = tuple(
+            NamedExpr(k, Col(ir.children[0].schema[k], k)) for k in over_keys
+        )
+        already_shuffled = partition_info[child].partitioned_on == shuffle_keys
+        single_partition = (
+            partition_info[child].count <= 1
+            and not _dynamic_planning_on(config_options)
         )
 
-    child, partition_info = rec(ir.children[0])
-    new_node = ir.reconstruct([child])
-    partition_info[new_node] = partition_info[child]
-    return new_node, partition_info
+        if not already_shuffled and not single_partition:
+            shuffled = Shuffle(
+                child.schema,
+                shuffle_keys,
+                config_options.executor.shuffle_method,
+                child,
+            )
+            partition_info[shuffled] = PartitionInfo(
+                count=partition_info[child].count,
+                partitioned_on=shuffle_keys,
+            )
+            child = shuffled
+
+        new_node = ir.reconstruct([child])
+        partition_info[new_node] = partition_info[child]
+        return new_node, partition_info
+
+    return _lower_ir_fallback(
+        ir, rec, msg="This HStack not supported for multiple partitions."
+    )

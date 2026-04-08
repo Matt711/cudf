@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import contextlib
+import faulthandler
+import gc
+import sys
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -319,6 +322,18 @@ def evaluate_pipeline(
             metadata_collector=metadata_collector,
         )
 
+        # Enable faulthandler to dump Python tracebacks on SIGSEGV/SIGABRT.
+        # This helps identify which Python function holds the bad device_buffer.
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+
+        # Disable Python's cyclic GC for the duration of the pipeline.
+        # Asyncio tasks in fanout_node_unbounded create reference cycles that
+        # hold device_buffers allocated via `mr`. If the automatic GC fires
+        # during pipeline execution it may free those buffers at an
+        # unpredictable point. We re-enable GC and collect explicitly in the
+        # finally block, while `mr` is still valid.
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
         try:
             # Run the network
             with ThreadPoolExecutor(
@@ -379,6 +394,12 @@ def evaluate_pipeline(
             # Ensure these are dropped even if a node raises
             # an exception in run_actor_network
             del nodes, output
+            # Break any reference cycles created during pipeline execution
+            # (e.g. asyncio Task ↔ closure cycles in fanout_node_unbounded)
+            # before `mr` is freed. Re-enable GC first so collect() works normally.
+            if gc_was_enabled:
+                gc.enable()
+            gc.collect()
 
             # Restore the initial RMM memory resource
             if _original_mr is not None:

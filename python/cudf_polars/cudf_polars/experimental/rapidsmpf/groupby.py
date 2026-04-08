@@ -22,7 +22,8 @@ from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 import pylibcudf as plc
 
 from cudf_polars.containers import DataType
-from cudf_polars.dsl.expr import Col, NamedExpr
+from cudf_polars.dsl.expr import Agg, Col, NamedExpr
+from cudf_polars.dsl.expressions.base import ExecutionContext
 from cudf_polars.dsl.ir import IR, Distinct, GroupBy, Select
 from cudf_polars.dsl.utils.naming import unique_names
 from cudf_polars.experimental.groupby import combine, decompose
@@ -66,6 +67,11 @@ class DecomposedGroupBy:
     """The decomposed piecewise IR node."""
     reduction_ir: GroupBy | Distinct
     """The decomposed reduction IR node. Same as piecewise_ir for Distinct."""
+    re_reduction_ir: GroupBy | Distinct
+    """Re-reduction IR that takes already-reduced (reduction-schema) data.
+    Equal to reduction_ir when piecewise and reduction schemas are the same.
+    For std/var, this applies merge_m2 directly to the packed struct column
+    instead of using _StructCreate on the unpacked piecewise columns."""
     select_ir: Select | None
     """The decomposed select IR node. Always None for Distinct."""
     need_preshuffle: bool
@@ -86,7 +92,7 @@ class DecomposedGroupBy:
         shuffle_indices: tuple[int, ...]
 
         if isinstance(ir, Distinct):
-            piecewise_ir = reduction_ir = ir
+            piecewise_ir = reduction_ir = re_reduction_ir = ir
             select_ir = None
             need_preshuffle = (
                 ir.keep == plc.stream_compaction.DuplicateKeepOption.KEEP_NONE
@@ -120,7 +126,7 @@ class DecomposedGroupBy:
                 NamedExpr(k.name, Col(k.value.dtype, k.name)) for k in ir.keys
             )
 
-            # Reduction groupby schema and IR
+            # Reduction groupby schema and IR (takes piecewise-schema input)
             reduction_schema = {k.name: k.value.dtype for k in groupby_keys} | {
                 k.name: k.value.dtype for k in reduction_exprs
             }
@@ -133,6 +139,46 @@ class DecomposedGroupBy:
                 piecewise_ir,
             )
 
+            # Re-reduction IR: takes already-reduced (reduction-schema) data as
+            # input and produces the same reduction schema as output.
+            #
+            # When piecewise and reduction schemas are identical (all agg types
+            # except std/var), reduction_ir is already self-applicable so we
+            # reuse it directly.
+            #
+            # When they differ (std/var: piecewise has {count,mean,m2} columns
+            # but reduction collapses them into a single struct), we build a new
+            # GroupBy whose child has reduction_schema.  For each non-key column
+            # in reduction_schema (which must be a struct produced by merge_m2)
+            # we apply merge_m2 directly to Col(struct_name) — no _StructCreate
+            # needed since the struct is already packed.
+            if pwise_schema == reduction_schema:
+                re_reduction_ir: GroupBy | Distinct = reduction_ir
+            else:
+                key_names = {ne.name for ne in ir.keys}
+                re_agg_exprs = [
+                    NamedExpr(
+                        col_name,
+                        Agg(
+                            dtype,
+                            "merge_m2",
+                            None,
+                            ExecutionContext.GROUPBY,
+                            Col(dtype, col_name),
+                        ),
+                    )
+                    for col_name, dtype in reduction_schema.items()
+                    if col_name not in key_names
+                ]
+                re_reduction_ir = GroupBy(
+                    reduction_schema,
+                    groupby_keys,
+                    re_agg_exprs,
+                    ir.maintain_order,
+                    None,
+                    reduction_ir,  # child has reduction_schema
+                )
+
             select_ir = Select(
                 ir.schema,
                 [
@@ -143,7 +189,7 @@ class DecomposedGroupBy:
                     *selection_exprs,
                 ],
                 False,  # noqa: FBT003
-                reduction_ir,
+                re_reduction_ir,
             )
         else:  # pragma: no cover
             raise TypeError(f"Unsupported IR type: {type(ir)}")
@@ -159,6 +205,7 @@ class DecomposedGroupBy:
             ir=ir,
             piecewise_ir=piecewise_ir,
             reduction_ir=reduction_ir,
+            re_reduction_ir=re_reduction_ir,
             select_ir=select_ir,
             need_preshuffle=need_preshuffle,
             output_indices=output_indices,
@@ -206,7 +253,15 @@ async def _local_aggregation(
     total_size = 0
     chunks_received = 0
     input_drained = False
-    evaluated_chunks: list[TableChunk] = []
+    # pwise_chunks: piecewise-schema chunks waiting to be reduced.
+    # accumulated: already-reduced chunk in reduction_ir.schema (used when
+    # piecewise and reduction schemas differ, e.g. std/var).  When schemas
+    # match accumulated stays None and reduced chunks go back into pwise_chunks
+    # (original behaviour, preserved for performance).
+    schemas_match = decomposed.piecewise_ir.schema == decomposed.reduction_ir.schema
+    pwise_chunks: list[TableChunk] = []
+    accumulated: TableChunk | None = None
+
     while True:
         msg = await ch_in.recv(context)
         if msg is None:
@@ -222,36 +277,78 @@ async def _local_aggregation(
         )
         chunk = _enforce_schema(chunk, decomposed.piecewise_ir.schema)
         total_size += chunk.data_alloc_size()
-        evaluated_chunks.append(chunk)
-        if total_size > target_partition_size and len(evaluated_chunks) > 1:
-            evaluated_chunks = [
-                await evaluate_batch(
-                    evaluated_chunks,
-                    context,
-                    decomposed.reduction_ir,
-                    ir_context=ir_context,
-                )
-            ]
-            total_size = evaluated_chunks[0].data_alloc_size()
+        pwise_chunks.append(chunk)
+
+        if total_size > target_partition_size and len(pwise_chunks) > 1:
+            new_reduced = await evaluate_batch(
+                pwise_chunks,
+                context,
+                decomposed.reduction_ir,
+                ir_context=ir_context,
+            )
+            pwise_chunks = []
+            if schemas_match:
+                # Reduced chunk has same schema as piecewise; put it back so
+                # subsequent pwise chunks can be batched with it.
+                pwise_chunks = [new_reduced]
+            else:
+                # Different schemas: merge into accumulated via re_reduction_ir.
+                if accumulated is not None:
+                    accumulated = await evaluate_batch(
+                        [accumulated, new_reduced],
+                        context,
+                        decomposed.re_reduction_ir,
+                        ir_context=ir_context,
+                    )
+                else:
+                    accumulated = new_reduced
+            total_size = (pwise_chunks[0] if schemas_match else accumulated).data_alloc_size()
+
         if total_size > target_partition_size and allow_early_exit:
             break
 
     aggregated: TableChunk
-    if len(evaluated_chunks) > 1:
-        aggregated = await evaluate_batch(
-            evaluated_chunks,
-            context,
-            decomposed.reduction_ir,
-            ir_context=ir_context,
-        )
-    elif evaluated_chunks:
-        aggregated = evaluated_chunks[0]
+    if schemas_match:
+        if len(pwise_chunks) > 1:
+            aggregated = await evaluate_batch(
+                pwise_chunks,
+                context,
+                decomposed.reduction_ir,
+                ir_context=ir_context,
+            )
+        elif pwise_chunks:
+            aggregated = pwise_chunks[0]
+        else:
+            aggregated = empty_table_chunk(
+                decomposed.reduction_ir,
+                context,
+                ir_context.get_cuda_stream(),
+            )
     else:
-        aggregated = empty_table_chunk(
-            decomposed.reduction_ir,
-            context,
-            ir_context.get_cuda_stream(),
-        )
+        if pwise_chunks:
+            new_reduced = await evaluate_batch(
+                pwise_chunks,
+                context,
+                decomposed.reduction_ir,
+                ir_context=ir_context,
+            )
+            if accumulated is not None:
+                aggregated = await evaluate_batch(
+                    [accumulated, new_reduced],
+                    context,
+                    decomposed.re_reduction_ir,
+                    ir_context=ir_context,
+                )
+            else:
+                aggregated = new_reduced
+        elif accumulated is not None:
+            aggregated = accumulated
+        else:
+            aggregated = empty_table_chunk(
+                decomposed.reduction_ir,
+                context,
+                ir_context.get_cuda_stream(),
+            )
 
     return aggregated, input_drained, chunks_received
 
@@ -322,7 +419,7 @@ async def _tree_reduce(
                 stream,
                 exclusive_view=True,
             ),
-            decomposed.reduction_ir,
+            decomposed.re_reduction_ir,
             ir_context=ir_context,
         )
 
@@ -456,7 +553,10 @@ async def _shuffle_reduce(
         del aggregated
 
     await shuffle.insert_finished()
-    extract_irs = [decomposed.reduction_ir] + (
+    # Extracted partition chunks are already in reduction_ir.schema, so use
+    # re_reduction_ir (which takes reduction-schema input) rather than
+    # reduction_ir (which takes piecewise-schema input).
+    extract_irs = [decomposed.re_reduction_ir] + (
         [decomposed.select_ir] if decomposed.select_ir else []
     )
     for partition_id in shuffle.local_partitions():

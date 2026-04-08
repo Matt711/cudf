@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import TYPE_CHECKING, Any, cast
 
 from rapidsmpf.memory.buffer import MemoryType
@@ -279,6 +280,7 @@ async def fanout_node_bounded(
             *(send_metadata(ch, context, metadata) for ch in chs_out)
         )
 
+        seq_num_count = 0
         while (msg := await ch_in.recv(context)) is not None:
             table_chunk = TableChunk.from_message(msg).make_available_and_spill(
                 context.br(), allow_overbooking=True
@@ -298,6 +300,7 @@ async def fanout_node_bounded(
                     ),
                 )
             del table_chunk
+            seq_num_count += 1
 
         await gather_in_task_group(*(ch.drain(context) for ch in chs_out))
 
@@ -469,9 +472,20 @@ async def fanout_node_unbounded(
                             else:
                                 # Use host memory for buffering - much safer
                                 # Downstream consumers will make_available() when they need device memory
+                                # Only include PINNED_HOST if pinned memory is actually configured;
+                                # otherwise reserve_or_fail may return an invalid reservation and
+                                # cause a segfault when the buffer is later freed as a device buffer.
+                                pinned_available = context.br().memory_available(
+                                    MemoryType.PINNED_HOST
+                                )
+                                host_memory_types = (
+                                    [MemoryType.PINNED_HOST, MemoryType.HOST]
+                                    if pinned_available > 0
+                                    else [MemoryType.HOST]
+                                )
                                 memory_reservation = context.br().reserve_or_fail(
                                     total_copy_cost,
-                                    [MemoryType.PINNED_HOST, MemoryType.HOST],
+                                    host_memory_types,
                                 )
 
                             # Copy message for each output buffer
@@ -686,8 +700,10 @@ async def metadata_feeder_node(
         context, ch_in, ch_out, trace_ir=ir, ir_context=ir_context
     ):
         await send_metadata(ch_out, context, metadata)
+        seq_count = 0
         while (msg := await ch_in.recv(context)) is not None:
             await ch_out.send(context, msg)
+            seq_count += 1
         await ch_out.drain(context)
 
 
@@ -733,9 +749,11 @@ async def metadata_drain_node(
             metadata_collector.append(metadata)
 
         # Forward non-duplicated data messages
+        seq_count = 0
         while (msg := await ch_in.recv(context)) is not None:
             if not send_empty:
                 await ch_out.send(context, msg)
+            seq_count += 1
 
         # Send empty data if needed
         if send_empty:

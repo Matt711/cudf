@@ -72,6 +72,10 @@ class Agg(Expr):
         elif name == "var":
             # TODO: handle nans
             req = plc.aggregation.variance(ddof=options)
+        elif name == "m2":
+            req = plc.aggregation.m2()
+        elif name == "merge_m2":
+            req = plc.aggregation.merge_m2()
         elif name == "count":
             req = plc.aggregation.count(
                 null_handling=plc.types.NullPolicy.EXCLUDE
@@ -131,6 +135,8 @@ class Agg(Expr):
             "first",
             "last",
             "mean",
+            "m2",
+            "merge_m2",
             "sum",
             "count",
             "std",

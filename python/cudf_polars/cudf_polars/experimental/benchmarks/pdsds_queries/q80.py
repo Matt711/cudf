@@ -155,15 +155,17 @@ def q80_segment(
     ret_loss_col: str,
 ) -> pl.LazyFrame:
     """Builds one channel sub-aggregation (sales, returns, profit) grouped by an ID column."""
+    # Apply semi-joins on the sales table first to reduce cardinality before
+    # the expensive LEFT JOIN with returns.  dates/item/promotion are small
+    # after pre-filtering so these semi-joins are cheap.
     return (
-        sales.join(
+        sales.join(dates, left_on=sold_date_key, right_on="d_date_sk", how="semi")
+        .join(item, left_on=item_left_key, right_on="i_item_sk", how="semi")
+        .join(promotion, left_on=promo_left_key, right_on="p_promo_sk", how="semi")
+        .join(
             returns, left_on=returns_join_left, right_on=returns_join_right, how="left"
         )
-        .join(dates, left_on=sold_date_key, right_on="d_date_sk")
         .join(id_dim, left_on=id_left_key, right_on=id_right_key)
-        .join(item, left_on=item_left_key, right_on="i_item_sk")
-        .join(promotion, left_on=promo_left_key, right_on="p_promo_sk")
-        .filter((pl.col("i_current_price") > 50) & (pl.col("p_channel_tv") == "N"))
         .group_by(id_out_col)
         .agg(
             [
@@ -228,13 +230,19 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         (pl.col("d_date") >= start_date) & (pl.col("d_date") <= end_date)
     ).select("d_date_sk")
 
+    # Pre-filter and project to key-only frames shared across all three segments.
+    item_filtered = item.filter(pl.col("i_current_price") > 50).select(["i_item_sk"])
+    promo_filtered = (
+        promotion.filter(pl.col("p_channel_tv") == "N").select(["p_promo_sk"])
+    )
+
     ssr = q80_segment(
         store_sales,
         store_returns,
         dates,
         store,
-        item,
-        promotion,
+        item_filtered,
+        promo_filtered,
         returns_join_left=["ss_item_sk", "ss_ticket_number"],
         returns_join_right=["sr_item_sk", "sr_ticket_number"],
         sold_date_key="ss_sold_date_sk",
@@ -254,8 +262,8 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         catalog_returns,
         dates,
         catalog_page,
-        item,
-        promotion,
+        item_filtered,
+        promo_filtered,
         returns_join_left=["cs_item_sk", "cs_order_number"],
         returns_join_right=["cr_item_sk", "cr_order_number"],
         sold_date_key="cs_sold_date_sk",
@@ -282,8 +290,8 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         web_returns,
         dates,
         web_site,
-        item,
-        promotion,
+        item_filtered,
+        promo_filtered,
         returns_join_left=["ws_item_sk", "ws_order_number"],
         returns_join_right=["wr_item_sk", "wr_order_number"],
         sold_date_key="ws_sold_date_sk",

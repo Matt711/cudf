@@ -64,6 +64,16 @@ if TYPE_CHECKING:
     from cudf_polars.utils.config import StreamingExecutor
 
 
+def _join_evaluate_sync(
+    ir: Join,
+    ir_context: IRExecutionContext,
+    dfs: list[DataFrame],
+    join_type: str,
+) -> DataFrame:
+    """Synchronous wrapper for ir.do_evaluate used in asyncio.to_thread."""
+    return ir.do_evaluate(*ir._non_child_args, *dfs, context=ir_context)
+
+
 # cuDF column/concatenate row limit (int32)
 CUDF_ROW_LIMIT = 2**31 - 1
 MAX_BROADCAST_ROWS = CUDF_ROW_LIMIT // 2
@@ -258,10 +268,11 @@ async def _broadcast_join_large_chunk(
     ):
         for sdf in dfs_to_join:
             result = await asyncio.to_thread(
-                ir.do_evaluate,
-                *ir._non_child_args,
-                *([large_df, sdf] if broadcast_side == "right" else [sdf, large_df]),
-                context=ir_context,
+                _join_evaluate_sync,
+                ir,
+                ir_context,
+                [large_df, sdf] if broadcast_side == "right" else [sdf, large_df],
+                "broadcast",
             )
             join_results.append(result)
 
@@ -459,11 +470,11 @@ async def _join_chunks(
             await reserve_memory(context, size=input_bytes, net_memory_delta=0)
         ):
             df = await asyncio.to_thread(
-                ir.do_evaluate,
-                *ir._non_child_args,
-                chunk_to_frame(left_chunk, left),
-                chunk_to_frame(right_chunk, right),
-                context=ir_context,
+                _join_evaluate_sync,
+                ir,
+                ir_context,
+                [chunk_to_frame(left_chunk, left), chunk_to_frame(right_chunk, right)],
+                "shuffle",
             )
             del left_chunk, right_chunk
         if tracer is not None:
