@@ -228,16 +228,17 @@ async def _global_shuffle(
     # Other ranks still participate in the shuffle protocol.
     skip_insert = metadata_in.duplicated and comm.rank != 0
 
-    while (msg := await ch_in.recv(context)) is not None:
-        if not skip_insert:
-            shuffle.insert_hash(
-                TableChunk.from_message(msg).make_available_and_spill(
-                    context.br(), allow_overbooking=True
-                ),
-                columns_to_hash,
-            )
-
-    await shuffle.insert_finished()
+    try:
+        while (msg := await ch_in.recv(context)) is not None:
+            if not skip_insert:
+                shuffle.insert_hash(
+                    TableChunk.from_message(msg).make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    ),
+                    columns_to_hash,
+                )
+    finally:
+        await shuffle.insert_finished()
 
     for partition_id in shuffle.shuffler.local_partitions():
         stream = ir_context.get_cuda_stream()

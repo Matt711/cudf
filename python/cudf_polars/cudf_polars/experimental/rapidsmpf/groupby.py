@@ -432,30 +432,31 @@ async def _shuffle_reduce(
         collective_id,
     )
 
-    shuffle.insert_hash(
-        _enforce_schema(
-            aggregated,
-            decomposed.reduction_ir.schema,
-        ),
-        decomposed.shuffle_indices,
-    )
-    del aggregated
-
-    while not input_drained:
-        aggregated, input_drained, _ = await _local_aggregation(
-            context,
-            decomposed,
-            ir_context,
-            ch_in,
-            target_partition_size,
-        )
+    try:
         shuffle.insert_hash(
-            _enforce_schema(aggregated, decomposed.reduction_ir.schema),
+            _enforce_schema(
+                aggregated,
+                decomposed.reduction_ir.schema,
+            ),
             decomposed.shuffle_indices,
         )
         del aggregated
 
-    await shuffle.insert_finished()
+        while not input_drained:
+            aggregated, input_drained, _ = await _local_aggregation(
+                context,
+                decomposed,
+                ir_context,
+                ch_in,
+                target_partition_size,
+            )
+            shuffle.insert_hash(
+                _enforce_schema(aggregated, decomposed.reduction_ir.schema),
+                decomposed.shuffle_indices,
+            )
+            del aggregated
+    finally:
+        await shuffle.insert_finished()
     extract_irs = [decomposed.reduction_ir] + (
         [decomposed.select_ir] if decomposed.select_ir else []
     )

@@ -176,7 +176,14 @@ def _from_polars(dtype: pl.DataType) -> plc.DataType:
     elif isinstance(dtype, pl.String):
         return plc.DataType(plc.TypeId.STRING)
     elif isinstance(dtype, pl.Decimal):
-        return plc.DataType(plc.TypeId.DECIMAL128, scale=-dtype.scale)
+        precision = dtype.precision
+        if precision is None or precision > 18:
+            type_id = plc.TypeId.DECIMAL128
+        elif precision > 9:
+            type_id = plc.TypeId.DECIMAL64
+        else:
+            type_id = plc.TypeId.DECIMAL32
+        return plc.DataType(type_id, scale=-dtype.scale)
     elif isinstance(dtype, pl.Null):
         # TODO: Hopefully
         return plc.DataType(plc.TypeId.EMPTY)

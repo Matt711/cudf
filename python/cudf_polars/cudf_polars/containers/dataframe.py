@@ -134,8 +134,21 @@ class DataFrame:
             _create_polars_column_metadata(name, dtype.polars_type)
             for name, dtype in zip(name_map, self.dtypes, strict=True)
         ]
+        # Polars only understands DECIMAL128 via Arrow; cast smaller decimal
+        # types back up before export.
+        _small_decimal = {plc.TypeId.DECIMAL32, plc.TypeId.DECIMAL64}
+        cols = [
+            plc.unary.cast(
+                c.obj,
+                plc.DataType(plc.TypeId.DECIMAL128, c.obj.type().scale()),
+                stream=self.stream,
+            )
+            if c.obj.type().id() in _small_decimal
+            else c.obj
+            for c in self.columns
+        ]
         table_with_metadata = _ObjectWithArrowMetadata(
-            self.table, metadata, self.stream
+            plc.Table(cols), metadata, self.stream
         )
         df = pl.DataFrame(table_with_metadata)
         return df.rename(name_map).with_columns(
@@ -185,11 +198,23 @@ class DataFrame:
         New dataframe representing the input.
         """
         plc_table = plc.Table.from_arrow(df, stream=stream)
+
+        def _make_column(
+            d_col: plc.Column, h_col: pl.Series, name: str
+        ) -> Column:
+            dtype = DataType(h_col.dtype)
+            # Arrow always gives DECIMAL128; cast down to DECIMAL32/64 when
+            # the declared Polars precision fits in a smaller type.
+            if (
+                plc.traits.is_fixed_point(d_col.type())
+                and d_col.type().id() != dtype.plc_type.id()
+            ):
+                d_col = plc.unary.cast(d_col, dtype.plc_type, stream=stream)
+            return Column(d_col, name=name, dtype=dtype).copy_metadata(h_col)
+
         return cls(
             (
-                Column(d_col, name=name, dtype=DataType(h_col.dtype)).copy_metadata(
-                    h_col
-                )
+                _make_column(d_col, h_col, name)
                 for d_col, h_col, name in zip(
                     plc_table.columns(), df.iter_columns(), df.columns, strict=True
                 )
@@ -238,9 +263,21 @@ class DataFrame:
         """
         if table.num_columns() != len(names):
             raise ValueError("Mismatching name and table length.")
+
+        def _make_column(c: plc.Column, name: str, dtype: DataType) -> Column:
+            # Normalize decimal width to match the declared schema type.
+            # Readers (parquet, etc.) may produce a different decimal width
+            # than the schema declares; cast to the correct type either way.
+            if (
+                plc.traits.is_fixed_point(c.type())
+                and c.type().id() != dtype.plc_type.id()
+            ):
+                c = plc.unary.cast(c, dtype.plc_type, stream=stream)
+            return Column(c, name=name, dtype=dtype)
+
         return cls(
             (
-                Column(c, name=name, dtype=dtype)
+                _make_column(c, name, dtype)
                 for c, name, dtype in zip(table.columns(), names, dtypes, strict=True)
             ),
             stream=stream,

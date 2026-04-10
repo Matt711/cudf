@@ -812,9 +812,18 @@ class Scan(IR):
                     ),
                     stream=stream,
                 )
+            # Choose the narrowest decimal width that fits all decimal columns
+            # in the schema. from_table will normalize to the exact schema type.
+            _cols_to_read = with_columns if with_columns is not None else list(schema)
+            _decimal_width = plc.TypeId.DECIMAL64
+            for _name in _cols_to_read:
+                _tid = schema[_name].plc_type.id()
+                if _tid == plc.TypeId.DECIMAL128:
+                    _decimal_width = plc.TypeId.DECIMAL128
+                    break
             parquet_reader_options = (
                 plc.io.parquet.ParquetReaderOptions.builder(plc.io.SourceInfo(paths))
-                .decimal_width(plc.TypeId.DECIMAL128)
+                .decimal_width(_decimal_width)
                 .build()
             )
 
@@ -2055,7 +2064,15 @@ def _align_decimal_binop_types(
         decimal_expr, float_expr = (
             (left_expr, right_expr) if is_decimal_left else (right_expr, left_expr)
         )
-        _add_cast(decimal_expr.dtype, float_expr, left_casts, right_casts)
+        decimal_type = decimal_expr.dtype
+        if decimal_type.id() != plc.TypeId.DECIMAL128:
+            # libcudf AST only supports DECIMAL128 for decimal-float comparisons.
+            # Cast both sides to a DECIMAL128 type.
+            target = DataType(pl.Decimal(38, abs(decimal_type.scale())))
+            _add_cast(target, decimal_expr, left_casts, right_casts)
+            _add_cast(target, float_expr, left_casts, right_casts)
+        else:
+            _add_cast(decimal_type, float_expr, left_casts, right_casts)
 
 
 def _collect_decimal_binop_casts(

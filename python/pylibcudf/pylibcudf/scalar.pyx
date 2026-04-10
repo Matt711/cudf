@@ -43,7 +43,7 @@ from pylibcudf.libcudf.wrappers.durations cimport (
     duration_s,
     duration_D,
 )
-from pylibcudf.libcudf.fixed_point.fixed_point cimport scale_type, decimal128
+from pylibcudf.libcudf.fixed_point.fixed_point cimport scale_type, decimal32, decimal64, decimal128
 from pylibcudf.libcudf.wrappers.timestamps cimport (
     timestamp_s,
     timestamp_ms,
@@ -342,6 +342,18 @@ cdef class Scalar:
             return (<numeric_scalar[uint32_t]*>slr).value(stream.view())
         elif tid == type_id.UINT64:
             return (<numeric_scalar[uint64_t]*>slr).value(stream.view())
+        elif tid == type_id.DECIMAL32:
+            return decimal.Decimal(
+                (<fixed_point_scalar[decimal32]*>slr).value(stream.view()).value()
+            ).scaleb(
+                (<fixed_point_scalar[decimal32]*>slr).type().scale()
+            )
+        elif tid == type_id.DECIMAL64:
+            return decimal.Decimal(
+                (<fixed_point_scalar[decimal64]*>slr).value(stream.view()).value()
+            ).scaleb(
+                (<fixed_point_scalar[decimal64]*>slr).type().scale()
+            )
         elif tid == type_id.DECIMAL128:
             return decimal.Decimal(
                 (<fixed_point_scalar[decimal128]*>slr).value(stream.view()).value()
@@ -795,18 +807,34 @@ def _(
     as_int = int(py_val.scaleb(-scale))
 
     cdef int128_t val = <int128_t>as_int
+    cdef unique_ptr[scalar] c_obj
 
-    dtype = DataType(type_id.DECIMAL128, scale)
+    requested_tid = type_id.DECIMAL128 if dtype is None else dtype.id()
 
-    if dtype.id() != type_id.DECIMAL128:
-        raise TypeError("Expected dtype to be DECIMAL128")
-
-    cdef unique_ptr[scalar] c_obj = make_fixed_point_scalar[decimal128](
-        val,
-        scale_type(<int32_t>scale),
-        stream.view(),
-        mr.get_mr()
-    )
+    if requested_tid == type_id.DECIMAL32:
+        dtype = DataType(type_id.DECIMAL32, scale)
+        c_obj = make_fixed_point_scalar[decimal32](
+            val,
+            scale_type(<int32_t>scale),
+            stream.view(),
+            mr.get_mr()
+        )
+    elif requested_tid == type_id.DECIMAL64:
+        dtype = DataType(type_id.DECIMAL64, scale)
+        c_obj = make_fixed_point_scalar[decimal64](
+            val,
+            scale_type(<int32_t>scale),
+            stream.view(),
+            mr.get_mr()
+        )
+    else:
+        dtype = DataType(type_id.DECIMAL128, scale)
+        c_obj = make_fixed_point_scalar[decimal128](
+            val,
+            scale_type(<int32_t>scale),
+            stream.view(),
+            mr.get_mr()
+        )
     return _new_scalar(move(c_obj), dtype)
 
 
