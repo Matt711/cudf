@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -70,6 +75,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 91."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=91,
@@ -165,7 +171,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
                     "cd_education_status",
                 ]
             )
-            .agg([pl.col("cr_net_loss").sum().alias("sum(cr_net_loss)")])
+            .agg([sql_sum("cr_net_loss", validate=validate).alias("sum(cr_net_loss)")])
             .select(
                 [
                     pl.col("cc_call_center_id").alias("Call_Center"),

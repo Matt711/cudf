@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -81,6 +86,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 53."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=53,
@@ -122,15 +128,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
             )
         )
         .group_by(["i_manufact_id", "d_qoy"])
-        .agg([pl.col("ss_sales_price").sum().alias("sum_sales_raw")])
-        .with_columns(
-            [
-                pl.when(pl.col("sum_sales_raw").is_not_null())
-                .then(pl.col("sum_sales_raw"))
-                .otherwise(None)
-                .alias("sum(ss_sales_price)")
-            ]
-        )
+        .agg([sql_sum("ss_sales_price", validate=validate).alias("sum(ss_sales_price)")])
     )
     non_null_data = grouped_data.filter(pl.col("i_manufact_id").is_not_null())
     null_data = grouped_data.filter(pl.col("i_manufact_id").is_null())

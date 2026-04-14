@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -54,12 +59,16 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 
 def _rollup_level(
-    base: pl.LazyFrame, group_cols: list[str] | None, lochierarchy: int
+    base: pl.LazyFrame,
+    group_cols: list[str] | None,
+    lochierarchy: int,
+    *,
+    validate: bool,
 ) -> pl.LazyFrame:
     if group_cols:
         out = (
             base.group_by(group_cols)
-            .agg(pl.col("ws_net_paid").sum().alias("total_sum"))
+            .agg(sql_sum("ws_net_paid", validate=validate).alias("total_sum"))
             .with_columns(pl.lit(lochierarchy, dtype=pl.Int64).alias("lochierarchy"))
         )
         if group_cols == ["i_category", "i_class"]:
@@ -84,7 +93,7 @@ def _rollup_level(
             )
     else:
         out = (
-            base.select(pl.col("ws_net_paid").sum().alias("total_sum"))
+            base.select(sql_sum("ws_net_paid", validate=validate).alias("total_sum"))
             .with_columns(pl.lit(lochierarchy, dtype=pl.Int64).alias("lochierarchy"))
             .select(
                 [
@@ -100,6 +109,7 @@ def _rollup_level(
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 86."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=86,
@@ -124,9 +134,9 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         .select(["ws_net_paid", "i_category", "i_class"])
     )
 
-    lvl0 = _rollup_level(base, ["i_category", "i_class"], 0)
-    lvl1 = _rollup_level(base, ["i_category"], 1)
-    lvl2 = _rollup_level(base, None, 2)
+    lvl0 = _rollup_level(base, ["i_category", "i_class"], 0, validate=validate)
+    lvl1 = _rollup_level(base, ["i_category"], 1, validate=validate)
+    lvl2 = _rollup_level(base, None, 2, validate=validate)
 
     combined = pl.concat([lvl0, lvl1, lvl2])
 

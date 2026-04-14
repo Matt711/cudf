@@ -36,9 +36,11 @@ if _use_new_frontend():
         RunConfig,
         build_parser,
         get_data,
+        is_duckdb_validate,
         parse_args,
         run_duckdb,
         run_polars,
+        sql_sum,
     )
 else:
     from cudf_polars.experimental.benchmarks.utils_legacy import (  # type: ignore[assignment]
@@ -47,9 +49,11 @@ else:
         RunConfig,
         build_parser,
         get_data,
+        is_duckdb_validate,
         parse_args,
         run_duckdb,
         run_polars,
+        sql_sum,
     )
 
 __all__: list[str] = [
@@ -58,7 +62,9 @@ __all__: list[str] = [
     "RunConfig",
     "build_parser",
     "get_data",
+    "is_duckdb_validate",
     "parse_args",
     "run_duckdb",
     "run_polars",
+    "sql_sum",
 ]

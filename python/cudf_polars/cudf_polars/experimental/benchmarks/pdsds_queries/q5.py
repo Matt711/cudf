@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -173,6 +178,7 @@ def _channel_agg(
     net_loss_col: str,
     start_date: date,
     end_date: date,
+    validate: bool,
 ) -> pl.LazyFrame:
     """Aggregate sales and returns for one channel via UNION ALL, producing (entity_id, sales, profit, returns1, profit_loss)."""
     target_dates = date_dim.filter(
@@ -202,16 +208,17 @@ def _channel_agg(
         .join(entity, left_on="entity_sk", right_on=entity_join_key)
         .group_by(entity_id_col)
         .agg(
-            pl.col("sales_price").sum().alias("sales"),
-            pl.col("profit").sum().alias("profit"),
-            pl.col("return_amt").sum().alias("returns1"),
-            pl.col("net_loss").sum().alias("profit_loss"),
+            sql_sum("sales_price", validate=validate).alias("sales"),
+            sql_sum("profit", validate=validate).alias("profit"),
+            sql_sum("return_amt", validate=validate).alias("returns1"),
+            sql_sum("net_loss", validate=validate).alias("profit_loss"),
         )
     )
 
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 5."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor), query_id=5, qualification=run_config.qualification
     )
@@ -265,6 +272,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         net_loss_col="sr_net_loss",
         start_date=start_date,
         end_date=end_date,
+        validate=validate,
     )
     csr = _channel_agg(
         catalog_sales,
@@ -283,6 +291,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         net_loss_col="cr_net_loss",
         start_date=start_date,
         end_date=end_date,
+        validate=validate,
     )
     wsr = _channel_agg(
         web_sales,
@@ -301,6 +310,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         net_loss_col="wr_net_loss",
         start_date=start_date,
         end_date=end_date,
+        validate=validate,
     )
 
     store_channel = ssr.select(
@@ -330,9 +340,9 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         frame=(
             all_channels.group_by(["channel", "id"])
             .agg(
-                pl.col("sales").sum().alias("sales"),
-                pl.col("returns1").sum().alias("returns1"),
-                pl.col("profit").sum().alias("profit"),
+                sql_sum("sales", validate=validate).alias("sales"),
+                sql_sum("returns1", validate=validate).alias("returns1"),
+                sql_sum("profit", validate=validate).alias("profit"),
             )
             .sort(["channel", "id"])
             .limit(100)

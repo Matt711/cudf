@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -107,6 +112,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 78."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=78,
@@ -145,18 +151,9 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         .group_by(["ws_item_sk", "ws_bill_customer_sk"])
         .agg(
             [
-                pl.when(pl.col("ws_quantity").count() > 0)
-                .then(pl.col("ws_quantity").sum())
-                .otherwise(None)
-                .alias("ws_qty"),
-                pl.when(pl.col("ws_wholesale_cost").count() > 0)
-                .then(pl.col("ws_wholesale_cost").sum())
-                .otherwise(None)
-                .alias("ws_wc"),
-                pl.when(pl.col("ws_sales_price").count() > 0)
-                .then(pl.col("ws_sales_price").sum())
-                .otherwise(None)
-                .alias("ws_sp"),
+                sql_sum("ws_quantity", validate=validate).alias("ws_qty"),
+                sql_sum("ws_wholesale_cost", validate=validate).alias("ws_wc"),
+                sql_sum("ws_sales_price", validate=validate).alias("ws_sp"),
             ]
         )
         .rename({"ws_bill_customer_sk": "ws_customer_sk"})
@@ -172,18 +169,9 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         .group_by(["cs_item_sk", "cs_bill_customer_sk"])
         .agg(
             [
-                pl.when(pl.col("cs_quantity").count() > 0)
-                .then(pl.col("cs_quantity").sum())
-                .otherwise(None)
-                .alias("cs_qty"),
-                pl.when(pl.col("cs_wholesale_cost").count() > 0)
-                .then(pl.col("cs_wholesale_cost").sum())
-                .otherwise(None)
-                .alias("cs_wc"),
-                pl.when(pl.col("cs_sales_price").count() > 0)
-                .then(pl.col("cs_sales_price").sum())
-                .otherwise(None)
-                .alias("cs_sp"),
+                sql_sum("cs_quantity", validate=validate).alias("cs_qty"),
+                sql_sum("cs_wholesale_cost", validate=validate).alias("cs_wc"),
+                sql_sum("cs_sales_price", validate=validate).alias("cs_sp"),
             ]
         )
         .rename({"cs_bill_customer_sk": "cs_customer_sk"})
@@ -199,18 +187,9 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         .group_by(["ss_item_sk", "ss_customer_sk"])
         .agg(
             [
-                pl.when(pl.col("ss_quantity").count() > 0)
-                .then(pl.col("ss_quantity").sum())
-                .otherwise(None)
-                .alias("ss_qty"),
-                pl.when(pl.col("ss_wholesale_cost").count() > 0)
-                .then(pl.col("ss_wholesale_cost").sum())
-                .otherwise(None)
-                .alias("ss_wc"),
-                pl.when(pl.col("ss_sales_price").count() > 0)
-                .then(pl.col("ss_sales_price").sum())
-                .otherwise(None)
-                .alias("ss_sp"),
+                sql_sum("ss_quantity", validate=validate).alias("ss_qty"),
+                sql_sum("ss_wholesale_cost", validate=validate).alias("ss_wc"),
+                sql_sum("ss_sales_price", validate=validate).alias("ss_sp"),
             ]
         )
     )

@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -100,6 +105,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 60."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=60,
@@ -166,7 +172,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
                 & (pl.col("ca_gmt_offset") == gmt_offset)
             )
             .group_by("i_item_id")
-            .agg([pl.col(price_col).sum().alias("total_sales")])
+            .agg([sql_sum(price_col, validate=validate).alias("total_sales")])
             .select(["i_item_id", "total_sales"])
         )
 
@@ -176,7 +182,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         frame=(
             pl.concat(parts)
             .group_by("i_item_id")
-            .agg([pl.col("total_sales").sum().alias("total_sales")])
+            .agg([sql_sum("total_sales", validate=validate).alias("total_sales")])
             .sort(sort_by.keys(), nulls_last=True)
             .limit(limit)
         ),

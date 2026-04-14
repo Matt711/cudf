@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -87,6 +92,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 23."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=23,
@@ -124,7 +130,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         .join(date_dim, left_on="ss_sold_date_sk", right_on="d_date_sk")
         .filter(pl.col("d_year").is_in([year, year + 1, year + 2, year + 3]))
         .group_by("ss_customer_sk")
-        .agg((pl.col("ss_quantity") * pl.col("ss_sales_price")).sum().alias("csales"))
+        .agg(sql_sum(pl.col("ss_quantity") * pl.col("ss_sales_price"), validate=validate).alias("csales"))
     )
 
     threshold = customer_sales.select(
@@ -134,7 +140,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
     best_customers = (
         store_sales.filter(pl.col("ss_customer_sk").is_not_null())
         .group_by("ss_customer_sk")
-        .agg((pl.col("ss_quantity") * pl.col("ss_sales_price")).sum().alias("ssales"))
+        .agg(sql_sum(pl.col("ss_quantity") * pl.col("ss_sales_price"), validate=validate).alias("ssales"))
         .join(threshold, how="cross")
         .filter(pl.col("ssales") > pl.col("threshold"))
         .select("ss_customer_sk")
@@ -161,7 +167,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
             how="semi",
         )
         .group_by(["c_last_name", "c_first_name"])
-        .agg((pl.col("cs_quantity") * pl.col("cs_list_price")).sum().alias("sales"))
+        .agg(sql_sum(pl.col("cs_quantity") * pl.col("cs_list_price"), validate=validate).alias("sales"))
     )
 
     web_part = (
@@ -179,7 +185,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
             how="semi",
         )
         .group_by(["c_last_name", "c_first_name"])
-        .agg((pl.col("ws_quantity") * pl.col("ws_list_price")).sum().alias("sales"))
+        .agg(sql_sum(pl.col("ws_quantity") * pl.col("ws_list_price"), validate=validate).alias("sales"))
     )
 
     sort_by = {"c_last_name": False, "c_first_name": False, "sales": False}

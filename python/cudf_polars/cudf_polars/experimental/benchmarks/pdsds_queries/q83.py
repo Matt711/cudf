@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -106,6 +111,7 @@ def q83_segment(
     returned_date_key: str,
     qty_col: str,
     out_qty_name: str,
+    validate: bool,
 ) -> pl.LazyFrame:
     """Aggregate a returns table to per-item quantities over selected dates."""
     return (
@@ -116,24 +122,14 @@ def q83_segment(
         )
         .join(dates, left_on=returned_date_key, right_on="d_date_sk")
         .group_by("i_item_id")
-        .agg(
-            [
-                pl.col(qty_col).count().alias(f"{out_qty_name}_count"),
-                pl.col(qty_col).sum().alias(f"{out_qty_name}_sum"),
-            ]
-        )
-        .with_columns(
-            pl.when(pl.col(f"{out_qty_name}_count") > 0)
-            .then(pl.col(f"{out_qty_name}_sum"))
-            .otherwise(None)
-            .alias(out_qty_name)
-        )
+        .agg([sql_sum(qty_col, validate=validate).alias(out_qty_name)])
         .select(["i_item_id", out_qty_name])
     )
 
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 83."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=83,
@@ -171,6 +167,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         returned_date_key="sr_returned_date_sk",
         qty_col="sr_return_quantity",
         out_qty_name="sr_item_qty",
+        validate=validate,
     )
     cr_items = q83_segment(
         catalog_returns,
@@ -180,6 +177,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         returned_date_key="cr_returned_date_sk",
         qty_col="cr_return_quantity",
         out_qty_name="cr_item_qty",
+        validate=validate,
     )
     wr_items = q83_segment(
         web_returns,
@@ -189,6 +187,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         returned_date_key="wr_returned_date_sk",
         qty_col="wr_return_quantity",
         out_qty_name="wr_item_qty",
+        validate=validate,
     )
 
     sort_by = {"item_id": False, "sr_item_qty": False}

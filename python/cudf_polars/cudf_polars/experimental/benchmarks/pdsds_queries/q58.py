@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -109,18 +114,21 @@ def _build_sales_agg(
     sales_date_sk: str,
     price_col: str,
     alias: str,
+    *,
+    validate: bool,
 ) -> pl.LazyFrame:
     return (
         sales.join(item_lf, left_on=sales_item_sk, right_on="i_item_sk")
         .join(week_dates, left_on=sales_date_sk, right_on="d_date_sk")
         .group_by("i_item_id")
-        .agg(pl.col(price_col).sum().alias(alias))
+        .agg(sql_sum(price_col, validate=validate).alias(alias))
         .select(pl.col("i_item_id").alias("item_id"), pl.col(alias))
     )
 
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 58."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=58,
@@ -154,6 +162,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         "ss_sold_date_sk",
         "ss_ext_sales_price",
         "ss_item_rev",
+        validate=validate,
     )
     cs_items = _build_sales_agg(
         catalog_sales,
@@ -163,6 +172,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         "cs_sold_date_sk",
         "cs_ext_sales_price",
         "cs_item_rev",
+        validate=validate,
     )
     ws_items = _build_sales_agg(
         web_sales,
@@ -172,6 +182,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         "ws_sold_date_sk",
         "ws_ext_sales_price",
         "ws_item_rev",
+        validate=validate,
     )
 
     sort_by = {"item_id": False, "ss_item_rev": False}

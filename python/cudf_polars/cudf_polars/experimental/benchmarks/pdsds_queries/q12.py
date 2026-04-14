@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -61,6 +66,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 12."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=12,
@@ -96,22 +102,14 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
                 ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price"]
             )
             .agg(
-                [
-                    pl.when(pl.col("ws_ext_sales_price").count() > 0)
-                    .then(pl.col("ws_ext_sales_price").sum())
-                    .otherwise(None)
-                    .alias("itemrevenue")
-                ]
+                [sql_sum("ws_ext_sales_price", validate=validate).alias("itemrevenue")]
             )
             .with_columns(
                 [
                     (
                         pl.col("itemrevenue")
                         * 100
-                        / pl.when(pl.col("itemrevenue").count() > 0)
-                        .then(pl.col("itemrevenue").sum())
-                        .otherwise(None)
-                        .over("i_class")
+                        / sql_sum("itemrevenue", validate=validate, over="i_class")
                     ).alias("revenueratio")
                 ]
             )

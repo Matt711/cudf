@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -111,6 +116,7 @@ def channel_total(  # noqa: D103
     year: int,
     month: int,
     gmt: float,
+    validate: bool,
 ) -> pl.LazyFrame:
     return (
         sales.join(date_dim, left_on=sold_date_key, right_on="d_date_sk")
@@ -123,24 +129,13 @@ def channel_total(  # noqa: D103
             & (pl.col("ca_gmt_offset") == gmt)
         )
         .group_by("i_manufact_id")
-        .agg(
-            [
-                pl.col(price_col).sum().alias("total_sales"),
-                pl.col(price_col).count().alias("_n"),
-            ]
-        )
-        .with_columns(
-            pl.when(pl.col("_n") > 0)
-            .then(pl.col("total_sales"))
-            .otherwise(None)
-            .alias("total_sales")
-        )
-        .drop("_n")
+        .agg([sql_sum(price_col, validate=validate).alias("total_sales")])
     )
 
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 33."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=33,
@@ -180,6 +175,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         year=year,
         month=month,
         gmt=gmt,
+        validate=validate,
     )
     cs = channel_total(
         catalog_sales,
@@ -194,6 +190,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         year=year,
         month=month,
         gmt=gmt,
+        validate=validate,
     )
     ws = channel_total(
         web_sales,
@@ -208,6 +205,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         year=year,
         month=month,
         gmt=gmt,
+        validate=validate,
     )
 
     sort_by = {"total_sales": False}
@@ -216,19 +214,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         frame=(
             pl.concat([ss, cs, ws])
             .group_by("i_manufact_id")
-            .agg(
-                [
-                    pl.col("total_sales").sum().alias("total_sales"),
-                    pl.col("total_sales").count().alias("_n"),
-                ]
-            )
-            .with_columns(
-                pl.when(pl.col("_n") > 0)
-                .then(pl.col("total_sales"))
-                .otherwise(None)
-                .alias("total_sales")
-            )
-            .drop("_n")
+            .agg([sql_sum("total_sales", validate=validate).alias("total_sales")])
             .select(["i_manufact_id", "total_sales"])
             .sort(sort_by.keys(), nulls_last=True)
             .limit(limit)

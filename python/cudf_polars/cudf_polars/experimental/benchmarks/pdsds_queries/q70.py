@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -71,6 +76,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 70."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=70,
@@ -100,13 +106,13 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
 
     detail = (
         base.group_by(["s_state", "s_county"])
-        .agg(pl.col("ss_net_profit").sum().alias("total_sum"))
+        .agg(sql_sum("ss_net_profit", validate=validate).alias("total_sum"))
         .with_columns(pl.lit(0, dtype=pl.Int64).alias("lochierarchy"))
     )
 
     by_state = (
         detail.group_by("s_state")
-        .agg(pl.col("total_sum").sum())
+        .agg(sql_sum("total_sum", validate=validate))
         .with_columns(
             [
                 pl.lit(None, dtype=pl.Utf8).alias("s_county"),
@@ -117,7 +123,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
     )
 
     total = (
-        detail.select(pl.col("total_sum").sum())
+        detail.select(sql_sum("total_sum", validate=validate))
         .with_columns(
             [
                 pl.lit(None, dtype=pl.Utf8).alias("s_state"),

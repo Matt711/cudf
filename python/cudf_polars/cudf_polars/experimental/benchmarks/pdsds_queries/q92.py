@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -55,6 +60,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 92."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=92,
@@ -100,7 +106,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
                 & (pl.col("ws_ext_discount_amt") > pl.col("threshold_discount"))
             )
             .select(
-                [pl.col("ws_ext_discount_amt").sum().alias("Excess Discount Amount")]
+                [sql_sum("ws_ext_discount_amt", validate=validate).alias("Excess Discount Amount")]
             )
             .sort("Excess Discount Amount", nulls_last=True)
             .limit(100)

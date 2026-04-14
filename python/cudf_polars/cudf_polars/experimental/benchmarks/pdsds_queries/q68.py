@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -76,6 +81,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 68."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=68,
@@ -115,9 +121,9 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         .group_by(["ss_ticket_number", "ss_customer_sk", "ss_addr_sk", "ca_city"])
         .agg(
             [
-                pl.col("ss_ext_sales_price").sum().alias("extended_price"),
-                pl.col("ss_ext_list_price").sum().alias("list_price"),
-                pl.col("ss_ext_tax").sum().alias("extended_tax"),
+                sql_sum("ss_ext_sales_price", validate=validate).alias("extended_price"),
+                sql_sum("ss_ext_list_price", validate=validate).alias("list_price"),
+                sql_sum("ss_ext_tax", validate=validate).alias("extended_tax"),
             ]
         )
         .with_columns([pl.col("ca_city").alias("bought_city")])

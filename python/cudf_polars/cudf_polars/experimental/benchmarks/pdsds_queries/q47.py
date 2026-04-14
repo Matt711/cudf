@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -103,6 +108,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 47."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=47,
@@ -137,21 +143,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
                 "d_moy",
             ]
         )
-        .agg(
-            [
-                pl.col("ss_sales_price").sum().alias("sales_sum"),
-                pl.col("ss_sales_price").count().alias("sales_count"),
-            ]
-        )
-        .with_columns(
-            [
-                pl.when(pl.col("sales_count") > 0)
-                .then(pl.col("sales_sum"))
-                .otherwise(None)
-                .alias("sum_sales")
-            ]
-        )
-        .drop(["sales_sum", "sales_count"])
+        .agg([sql_sum("ss_sales_price", validate=validate).alias("sum_sales")])
         .with_columns(
             [
                 # Window function: AVG over partition by category, brand, store, company, year

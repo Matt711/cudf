@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -153,6 +158,7 @@ def q80_segment(
     net_profit_col: str,
     ret_amt_col: str,
     ret_loss_col: str,
+    validate: bool,
 ) -> pl.LazyFrame:
     """
     Builds one channel sub-aggregation (sales, returns, profit) grouped by an ID column.
@@ -175,11 +181,12 @@ def q80_segment(
         .group_by(id_out_col)
         .agg(
             [
-                pl.col(ext_sales_col).sum().alias("sales"),
+                sql_sum(ext_sales_col, validate=validate).alias("sales"),
                 pl.col(ret_amt_col).fill_null(0).sum().alias("returns1"),
-                (pl.col(net_profit_col) - pl.col(ret_loss_col).fill_null(0))
-                .sum()
-                .alias("profit"),
+                sql_sum(
+                    pl.col(net_profit_col) - pl.col(ret_loss_col).fill_null(0),
+                    validate=validate,
+                ).alias("profit"),
             ]
         )
     )
@@ -202,6 +209,7 @@ def q80_channel_frame(
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 80."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=80,
@@ -255,6 +263,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         net_profit_col="ss_net_profit",
         ret_amt_col="sr_return_amt",
         ret_loss_col="sr_net_loss",
+        validate=validate,
     ).select([pl.col("s_store_id").alias("store_id"), "sales", "returns1", "profit"])
 
     csr = q80_segment(
@@ -276,6 +285,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         net_profit_col="cs_net_profit",
         ret_amt_col="cr_return_amount",
         ret_loss_col="cr_net_loss",
+        validate=validate,
     ).select(
         [
             pl.col("cp_catalog_page_id").alias("catalog_page_id"),
@@ -304,6 +314,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         net_profit_col="ws_net_profit",
         ret_amt_col="wr_return_amt",
         ret_loss_col="wr_net_loss",
+        validate=validate,
     ).select(["web_site_id", "sales", "returns1", "profit"])
 
     combined = pl.concat(
@@ -318,9 +329,9 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
 
     level1 = combined.group_by(["channel", "id"]).agg(
         [
-            pl.col("sales").sum().alias("sales"),
-            pl.col("returns1").sum().alias("returns1"),
-            pl.col("profit").sum().alias("profit"),
+            sql_sum("sales", validate=validate).alias("sales"),
+            sql_sum("returns1", validate=validate).alias("returns1"),
+            sql_sum("profit", validate=validate).alias("profit"),
         ]
     )
 
@@ -328,9 +339,9 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         combined.group_by("channel")
         .agg(
             [
-                pl.col("sales").sum().alias("sales"),
-                pl.col("returns1").sum().alias("returns1"),
-                pl.col("profit").sum().alias("profit"),
+                sql_sum("sales", validate=validate).alias("sales"),
+                sql_sum("returns1", validate=validate).alias("returns1"),
+                sql_sum("profit", validate=validate).alias("profit"),
             ]
         )
         .with_columns(pl.lit(None).cast(pl.Utf8).alias("id"))

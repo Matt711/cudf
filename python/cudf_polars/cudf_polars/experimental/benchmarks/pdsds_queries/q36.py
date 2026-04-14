@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -68,19 +73,21 @@ def level(  # noqa: D103
     group_cols: list[str],
     null_sentinel: str,
     lochierarchy: int,
+    *,
+    validate: bool,
 ) -> pl.LazyFrame:
     if group_cols:
         lf = base_data.group_by(group_cols).agg(
             [
-                pl.col("ss_net_profit").sum().alias("total_net_profit"),
-                pl.col("ss_ext_sales_price").sum().alias("total_ext_sales_price"),
+                sql_sum("ss_net_profit", validate=validate).alias("total_net_profit"),
+                sql_sum("ss_ext_sales_price", validate=validate).alias("total_ext_sales_price"),
             ]
         )
     else:
         lf = base_data.select(
             [
-                pl.col("ss_net_profit").sum().alias("total_net_profit"),
-                pl.col("ss_ext_sales_price").sum().alias("total_ext_sales_price"),
+                sql_sum("ss_net_profit", validate=validate).alias("total_net_profit"),
+                sql_sum("ss_ext_sales_price", validate=validate).alias("total_ext_sales_price"),
             ]
         )
     missing = [c for c in ["i_category", "i_class"] if c not in group_cols]
@@ -101,6 +108,7 @@ def level(  # noqa: D103
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 36."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=36,
@@ -123,9 +131,9 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         .filter((pl.col("d_year") == year) & (pl.col("s_state").is_in(state)))
     )
 
-    level0 = level(base_data, ["i_category", "i_class"], null_sentinel, 0)
-    level1 = level(base_data, ["i_category"], null_sentinel, 1)
-    level2 = level(base_data, [], null_sentinel, 2)
+    level0 = level(base_data, ["i_category", "i_class"], null_sentinel, 0, validate=validate)
+    level1 = level(base_data, ["i_category"], null_sentinel, 1, validate=validate)
+    level2 = level(base_data, [], null_sentinel, 2, validate=validate)
 
     combined = pl.concat([level0, level1, level2])
 

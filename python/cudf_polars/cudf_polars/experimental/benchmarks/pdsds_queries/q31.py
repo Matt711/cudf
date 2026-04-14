@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -105,6 +110,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 31."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=31,
@@ -142,7 +148,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
             sales_table.join(date_q, left_on=date_key, right_on="d_date_sk")
             .join(customer_address, left_on=addr_key, right_on="ca_address_sk")
             .group_by("ca_county")
-            .agg([pl.col(price_col).sum().alias(agg_alias)])
+            .agg([sql_sum(price_col, validate=validate).alias(agg_alias)])
         )
 
     ss1 = build_quarter_agg(

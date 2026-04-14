@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -185,6 +190,8 @@ def build_sales_agg(
     sold_date_key: str,
     customer_key: str,
     col_prefix: str,
+    *,
+    validate: bool,
 ) -> pl.LazyFrame:
     """Aggregate sales to (customer_sk, year_total) without joining customer table."""
     profit_expr = (
@@ -199,13 +206,14 @@ def build_sales_agg(
     return (
         sales_df.join(date_df, left_on=sold_date_key, right_on="d_date_sk")
         .group_by(customer_key)
-        .agg(profit_expr.sum().alias("year_total"))
+        .agg(sql_sum(profit_expr, validate=validate).alias("year_total"))
         .rename({customer_key: "customer_sk"})
     )
 
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 4."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor), query_id=4, qualification=run_config.qualification
     )
@@ -225,22 +233,22 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
 
     # Aggregate each channel x year to (customer_sk, year_total)
     t_s_fy = build_sales_agg(
-        store_sales, date_firstyear, "ss_sold_date_sk", "ss_customer_sk", "ss_"
+        store_sales, date_firstyear, "ss_sold_date_sk", "ss_customer_sk", "ss_", validate=validate
     ).filter(pl.col("year_total") > 0)
     t_s_sy = build_sales_agg(
-        store_sales, date_secyear, "ss_sold_date_sk", "ss_customer_sk", "ss_"
+        store_sales, date_secyear, "ss_sold_date_sk", "ss_customer_sk", "ss_", validate=validate
     )
     t_c_fy = build_sales_agg(
-        catalog_sales, date_firstyear, "cs_sold_date_sk", "cs_bill_customer_sk", "cs_"
+        catalog_sales, date_firstyear, "cs_sold_date_sk", "cs_bill_customer_sk", "cs_", validate=validate
     ).filter(pl.col("year_total") > 0)
     t_c_sy = build_sales_agg(
-        catalog_sales, date_secyear, "cs_sold_date_sk", "cs_bill_customer_sk", "cs_"
+        catalog_sales, date_secyear, "cs_sold_date_sk", "cs_bill_customer_sk", "cs_", validate=validate
     )
     t_w_fy = build_sales_agg(
-        web_sales, date_firstyear, "ws_sold_date_sk", "ws_bill_customer_sk", "ws_"
+        web_sales, date_firstyear, "ws_sold_date_sk", "ws_bill_customer_sk", "ws_", validate=validate
     ).filter(pl.col("year_total") > 0)
     t_w_sy = build_sales_agg(
-        web_sales, date_secyear, "ws_sold_date_sk", "ws_bill_customer_sk", "ws_"
+        web_sales, date_secyear, "ws_sold_date_sk", "ws_bill_customer_sk", "ws_", validate=validate
     )
 
     # Join all 6 subqueries on customer_sk

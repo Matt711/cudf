@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -80,6 +85,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 71."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=71,
@@ -144,17 +150,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
             )
             .join(filtered_time, left_on="time_sk", right_on="t_time_sk")
             .group_by(["i_brand", "i_brand_id", "t_hour", "t_minute"])
-            .agg(
-                pl.col("ext_price").sum().alias("ext_price"),
-                pl.col("ext_price").count().alias("_ext_price_count"),
-            )
-            .with_columns(
-                pl.when(pl.col("_ext_price_count") > 0)
-                .then(pl.col("ext_price"))
-                .otherwise(None)
-                .alias("ext_price")
-            )
-            .drop("_ext_price_count")
+            .agg(sql_sum("ext_price", validate=validate).alias("ext_price"))
             .select(
                 pl.col("i_brand_id").alias("brand_id"),
                 pl.col("i_brand").alias("brand"),

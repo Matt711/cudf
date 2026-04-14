@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -278,19 +283,19 @@ def build_average_sales(  # noqa: D103
     )
 
 
-def rollup_level(y: pl.LazyFrame, group_cols: list[str]) -> pl.LazyFrame:  # noqa: D103
+def rollup_level(y: pl.LazyFrame, group_cols: list[str], *, validate: bool) -> pl.LazyFrame:  # noqa: D103
     if group_cols:
         lf = y.group_by(group_cols).agg(
             [
-                pl.col("sales").sum().alias("sum_sales"),
-                pl.col("number_sales").sum().alias("sum_number_sales"),
+                sql_sum("sales", validate=validate).alias("sum_sales"),
+                sql_sum("number_sales", validate=validate).alias("sum_number_sales"),
             ]
         )
     else:
         lf = y.select(
             [
-                pl.col("sales").sum().alias("sum_sales"),
-                pl.col("number_sales").sum().alias("sum_number_sales"),
+                sql_sum("sales", validate=validate).alias("sum_sales"),
+                sql_sum("number_sales", validate=validate).alias("sum_number_sales"),
             ]
         )
 
@@ -318,6 +323,7 @@ def rollup_level(y: pl.LazyFrame, group_cols: list[str]) -> pl.LazyFrame:  # noq
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 14."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=14,
@@ -397,7 +403,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         .group_by(["channel", "i_brand_id", "i_class_id", "i_category_id"])
         .agg(
             [
-                (pl.col("quantity") * pl.col("list_price")).sum().alias("sales"),
+                sql_sum(pl.col("quantity") * pl.col("list_price"), validate=validate).alias("sales"),
                 pl.len().alias("number_sales"),
             ]
         )
@@ -415,11 +421,11 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         )
     )
 
-    level1 = rollup_level(y, ["channel", "i_brand_id", "i_class_id", "i_category_id"])
-    level2 = rollup_level(y, ["channel", "i_brand_id", "i_class_id"])
-    level3 = rollup_level(y, ["channel", "i_brand_id"])
-    level4 = rollup_level(y, ["channel"])
-    level5 = rollup_level(y, [])
+    level1 = rollup_level(y, ["channel", "i_brand_id", "i_class_id", "i_category_id"], validate=validate)
+    level2 = rollup_level(y, ["channel", "i_brand_id", "i_class_id"], validate=validate)
+    level3 = rollup_level(y, ["channel", "i_brand_id"], validate=validate)
+    level4 = rollup_level(y, ["channel"], validate=validate)
+    level5 = rollup_level(y, [], validate=validate)
 
     return QueryResult(
         frame=(

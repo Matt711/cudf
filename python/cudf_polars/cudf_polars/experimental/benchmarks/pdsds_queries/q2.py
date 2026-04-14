@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -108,6 +113,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 2."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor), query_id=2, qualification=run_config.qualification
     )
@@ -173,19 +179,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
             ]
         )
         .group_by("d_week_seq")
-        .agg(
-            *(pl.col(name).sum().alias(name) for name in day_cols),
-            *(pl.col(name).count().alias(f"{name}_count") for name in day_cols),
-        )
-        .with_columns(
-            [
-                pl.when(pl.col(f"{name}_count") > 0)
-                .then(pl.col(name))
-                .otherwise(None)
-                .alias(name)
-                for name in day_cols
-            ]
-        )
+        .agg(*(pl.col(name).sum().alias(name) for name in day_cols))
         .select(["d_week_seq", *day_cols])
     )
 

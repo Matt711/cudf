@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -53,6 +58,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 1."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor), query_id=1, qualification=run_config.qualification
     )
@@ -74,7 +80,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         )
         .filter(pl.col("d_year") == year)
         .group_by(["sr_customer_sk", "sr_store_sk"])
-        .agg(pl.col("sr_return_amt").sum().alias("ctr_total_return"))
+        .agg(sql_sum("sr_return_amt", validate=validate).alias("ctr_total_return"))
         .rename(
             {
                 "sr_customer_sk": "ctr_customer_sk",

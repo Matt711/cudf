@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -53,6 +58,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 93."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=93,
@@ -106,21 +112,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
                 ]
             )
             .group_by("ss_customer_sk")
-            .agg(
-                [
-                    pl.col("act_sales").count().alias("sumsales_count"),
-                    pl.col("act_sales").sum().alias("sumsales_sum"),
-                ]
-            )
-            .select(
-                [
-                    "ss_customer_sk",
-                    pl.when(pl.col("sumsales_count") == 0)
-                    .then(None)
-                    .otherwise(pl.col("sumsales_sum"))
-                    .alias("sumsales"),
-                ]
-            )
+            .agg([sql_sum("act_sales", validate=validate).alias("sumsales")])
             .sort(["sumsales", "ss_customer_sk"], nulls_last=True)
             .limit(100)
         ),

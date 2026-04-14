@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -90,10 +95,10 @@ def duckdb_impl(run_config: RunConfig) -> str:
     """
 
 
-def _get_agg_expr(col_name: str, agg_func: str, alias: str) -> pl.Expr:
+def _get_agg_expr(col_name: str, agg_func: str, alias: str, *, validate: bool) -> pl.Expr:
     col = pl.col(col_name)
     if agg_func == "sum":
-        return col.sum().alias(alias)
+        return sql_sum(col_name, validate=validate).alias(alias)
     elif agg_func == "min":
         return col.min().alias(alias)
     elif agg_func == "max":
@@ -109,6 +114,7 @@ def _get_agg_expr(col_name: str, agg_func: str, alias: str) -> pl.Expr:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 35."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=35,
@@ -192,32 +198,34 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         .agg(
             [
                 pl.len().alias("cnt1"),
-                _get_agg_expr("cd_dep_count", aggone, f"{aggone}(cd_dep_count)"),
-                _get_agg_expr("cd_dep_count", aggtwo, f"{aggtwo}(cd_dep_count)"),
-                _get_agg_expr("cd_dep_count", aggthree, f"{aggthree}(cd_dep_count)_1"),
+                _get_agg_expr("cd_dep_count", aggone, f"{aggone}(cd_dep_count)", validate=validate),
+                _get_agg_expr("cd_dep_count", aggtwo, f"{aggtwo}(cd_dep_count)", validate=validate),
+                _get_agg_expr("cd_dep_count", aggthree, f"{aggthree}(cd_dep_count)_1", validate=validate),
                 pl.len().alias("cnt2"),
                 _get_agg_expr(
-                    "cd_dep_employed_count", aggone, f"{aggone}(cd_dep_employed_count)"
+                    "cd_dep_employed_count", aggone, f"{aggone}(cd_dep_employed_count)", validate=validate
                 ),
                 _get_agg_expr(
-                    "cd_dep_employed_count", aggtwo, f"{aggtwo}(cd_dep_employed_count)"
+                    "cd_dep_employed_count", aggtwo, f"{aggtwo}(cd_dep_employed_count)", validate=validate
                 ),
                 _get_agg_expr(
                     "cd_dep_employed_count",
                     aggthree,
                     f"{aggthree}(cd_dep_employed_count)_1",
+                    validate=validate,
                 ),
                 pl.len().alias("cnt3"),
                 _get_agg_expr(
-                    "cd_dep_college_count", aggone, f"{aggone}(cd_dep_college_count)"
+                    "cd_dep_college_count", aggone, f"{aggone}(cd_dep_college_count)", validate=validate
                 ),
                 _get_agg_expr(
-                    "cd_dep_college_count", aggtwo, f"{aggtwo}(cd_dep_college_count)"
+                    "cd_dep_college_count", aggtwo, f"{aggtwo}(cd_dep_college_count)", validate=validate
                 ),
                 _get_agg_expr(
                     "cd_dep_college_count",
                     aggthree,
                     f"{aggthree}(cd_dep_college_count)_1",
+                    validate=validate,
                 ),
             ]
         )

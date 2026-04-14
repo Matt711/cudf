@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -124,6 +129,8 @@ def build_year_total(
     list_price_col: str,
     discount_col: str,
     year_dates: pl.LazyFrame,
+    *,
+    validate: bool,
 ) -> pl.LazyFrame:
     """
     Aggregate sales per customer_sk for a single year.
@@ -136,13 +143,14 @@ def build_year_total(
         sales_table.join(year_dates, left_on=date_sk_col, right_on="d_date_sk")
         .group_by(customer_sk_col)
         .agg(
-            [(pl.col(list_price_col) - pl.col(discount_col)).sum().alias("year_total")]
+            [sql_sum(pl.col(list_price_col) - pl.col(discount_col), validate=validate).alias("year_total")]
         )
     )
 
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 11."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=11,
@@ -169,6 +177,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
             "ss_ext_list_price",
             "ss_ext_discount_amt",
             date_first,
+            validate=validate,
         )
         .rename({"ss_customer_sk": "customer_sk", "year_total": "s_first_year_total"})
         .filter(pl.col("s_first_year_total") > 0)
@@ -181,6 +190,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         "ss_ext_list_price",
         "ss_ext_discount_amt",
         date_second,
+        validate=validate,
     ).rename({"ss_customer_sk": "customer_sk", "year_total": "s_sec_year_total"})
 
     t_w_first = (
@@ -191,6 +201,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
             "ws_ext_list_price",
             "ws_ext_discount_amt",
             date_first,
+            validate=validate,
         )
         .rename(
             {"ws_bill_customer_sk": "customer_sk", "year_total": "w_first_year_total"}
@@ -205,6 +216,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         "ws_ext_list_price",
         "ws_ext_discount_amt",
         date_second,
+        validate=validate,
     ).rename({"ws_bill_customer_sk": "customer_sk", "year_total": "w_sec_year_total"})
 
     # Join all four aggregates on customer_sk, then join customer once for display cols.

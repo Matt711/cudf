@@ -100,20 +100,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
             (pl.col("ss_store_sk") == store_sk) & (pl.col("ss_cdemo_sk").is_null())
         )
         .group_by("ss_store_sk")
-        .agg(
-            [
-                pl.col("ss_net_profit").mean().alias("profit_mean"),
-                pl.col("ss_net_profit").count().alias("profit_count"),
-            ]
-        )
-        .with_columns(
-            [
-                pl.when(pl.col("profit_count") > 0)
-                .then(pl.col("profit_mean"))
-                .otherwise(None)
-                .alias("benchmark_profit")
-            ]
-        )
+        .agg([pl.col("ss_net_profit").mean().alias("benchmark_profit")])
         .select("benchmark_profit")
     )
 
@@ -121,21 +108,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
     item_profits = (
         store_sales.filter(pl.col("ss_store_sk") == store_sk)
         .group_by("ss_item_sk")
-        .agg(
-            [
-                pl.col("ss_net_profit").mean().alias("profit_mean"),
-                pl.col("ss_net_profit").count().alias("profit_count"),
-            ]
-        )
-        .with_columns(
-            [
-                pl.when(pl.col("profit_count") > 0)
-                .then(pl.col("profit_mean"))
-                .otherwise(None)
-                .alias("avg(ss_net_profit)")
-            ]
-        )
-        .drop(["profit_mean", "profit_count"])
+        .agg([pl.col("ss_net_profit").mean().alias("avg(ss_net_profit)")])
         .join(benchmark, how="cross")
         .filter(pl.col("avg(ss_net_profit)") > (0.9 * pl.col("benchmark_profit")))
     )

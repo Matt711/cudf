@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from cudf_polars.experimental.benchmarks.pdsds_parameters import load_parameters
-from cudf_polars.experimental.benchmarks.utils import QueryResult, get_data
+from cudf_polars.experimental.benchmarks.utils import (
+    QueryResult,
+    get_data,
+    is_duckdb_validate,
+    sql_sum,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.experimental.benchmarks.utils import RunConfig
@@ -87,6 +92,7 @@ def duckdb_impl(run_config: RunConfig) -> str:
 
 def polars_impl(run_config: RunConfig) -> QueryResult:
     """Query 24."""
+    validate = is_duckdb_validate(run_config)
     params = load_parameters(
         int(run_config.scale_factor),
         query_id=24,
@@ -137,14 +143,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
                 "i_size",
             ]
         )
-        .agg(
-            # Polars sum() returns 0 for all-null groups; SQL returns NULL.
-            # See https://github.com/rapidsai/cudf/issues/19560.
-            pl.when(pl.col(amountone).count() > 0)
-            .then(pl.col(amountone).sum())
-            .otherwise(None)
-            .alias("netpaid")
-        )
+        .agg(sql_sum(amountone, validate=validate).alias("netpaid"))
     )
 
     threshold_table = ssales.select(
@@ -157,14 +156,7 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         frame=(
             ssales.filter(pl.col("i_color") == color)
             .group_by(["c_last_name", "c_first_name", "s_store_name"])
-            .agg(
-                # Polars sum() returns 0 for all-null groups; SQL returns NULL.
-                # See https://github.com/rapidsai/cudf/issues/19560.
-                pl.when(pl.col("netpaid").count() > 0)
-                .then(pl.col("netpaid").sum())
-                .otherwise(None)
-                .alias("paid")
-            )
+            .agg(sql_sum("netpaid", validate=validate).alias("paid"))
             .join(threshold_table, how="cross")
             .filter(pl.col("paid") > pl.col("threshold"))
             .select(["c_last_name", "c_first_name", "s_store_name", "paid"])
