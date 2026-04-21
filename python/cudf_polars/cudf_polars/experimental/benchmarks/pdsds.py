@@ -59,9 +59,12 @@ class PDSDSQueriesMeta(type):
         """Query lookup."""
         if valid_query(name):
             q_num = int(name[1:])
-            module: ModuleType = importlib.import_module(
-                f"cudf_polars.experimental.benchmarks.pdsds_queries.q{q_num}"
+            pkg = getattr(
+                cls,
+                "query_package",
+                "cudf_polars.experimental.benchmarks.pdsds_queries",
             )
+            module: ModuleType = importlib.import_module(f"{pkg}.q{q_num}")
             return getattr(module, cls.q_impl)
         raise AttributeError(f"{name} is not a valid query name")
 
@@ -235,7 +238,16 @@ class PDSDSPolarsQueries(PDSDSQueries):
             pl.col("inv_before").cast(pl.Int32),
             pl.col("inv_after").cast(pl.Int32),
         ],
+        28: [
+            pl.col("B1_CNT").cast(pl.Int64),
+            pl.col("B2_CNT").cast(pl.Int64),
+            pl.col("B3_CNT").cast(pl.Int64),
+            pl.col("B4_CNT").cast(pl.Int64),
+            pl.col("B5_CNT").cast(pl.Int64),
+            pl.col("B6_CNT").cast(pl.Int64),
+        ],
         34: [pl.col("cnt").cast(COUNT_DTYPE)],
+        36: [pl.col("rank_within_parent").cast(pl.Int64)],
         35: [
             pl.col("cnt1").cast(COUNT_DTYPE),
             pl.col("cnt2").cast(COUNT_DTYPE),
@@ -276,7 +288,7 @@ class PDSDSPolarsQueries(PDSDSQueries):
             pl.col("cnt2").cast(COUNT_DTYPE),
             pl.col("cnt3").cast(COUNT_DTYPE),
         ],
-        70: [pl.col("rank_within_parent").cast(pl.UInt32())],
+        70: [pl.col("rank_within_parent").cast(pl.UInt32()), pl.col("lochierarchy").cast(pl.Int64)],
         72: [
             pl.col("total_cnt").cast(COUNT_DTYPE),
             pl.col("no_promo").cast(COUNT_DTYPE),
@@ -292,6 +304,7 @@ class PDSDSPolarsQueries(PDSDSQueries):
             pl.col("store_qty").cast(pl.Int64),
             pl.col("other_chan_qty").cast(pl.Int64),
         ],
+        76: [pl.col("sales_cnt").cast(pl.Int64)],
         83: [
             pl.col("sr_item_qty").cast(pl.Int64),
             pl.col("cr_item_qty").cast(pl.Int64),
@@ -299,6 +312,7 @@ class PDSDSPolarsQueries(PDSDSQueries):
         ],
         94: [pl.col("order count").cast(COUNT_DTYPE)],
         95: [pl.col("order count").cast(COUNT_DTYPE)],
+        87: [pl.col("count_star()").cast(COUNT_DTYPE)],
         96: [pl.col("count_star()").cast(COUNT_DTYPE)],
         97: [
             pl.col("store_only").cast(pl.Int32),
@@ -326,6 +340,36 @@ class PDSDSDuckDBQueries(PDSDSQueries):
     q_impl = "duckdb_impl"
 
 
+class _UnoptimizedMeta(PDSDSQueriesMeta):
+    """Metaclass that wraps polars_impl to set validation mode from run_config."""
+
+    def __getattr__(cls, name: str):  # type: ignore[no-untyped-def]
+        """Wrap polars_impl to enable/disable validation mode around each call."""
+        impl = super().__getattr__(name)
+        if not valid_query(name) or cls.q_impl != "polars_impl":
+            return impl
+        try:
+            import cudf_polars.experimental.benchmarks.unoptimized_pdsds_queries.sql_helpers as _sh
+        except ImportError:
+            return impl
+
+        def _wrapped(run_config: object, _impl: object = impl, _sh: object = _sh) -> object:
+            if getattr(run_config, "validation_method", None) is not None:
+                _sh.enable_validation_mode()
+            try:
+                return _impl(run_config)
+            finally:
+                _sh.disable_validation_mode()
+
+        return _wrapped
+
+
+class PDSDSUnoptimizedPolarsQueries(PDSDSPolarsQueries, metaclass=_UnoptimizedMeta):
+    """Naive (unoptimized) Polars TPC-DS queries for correctness comparison."""
+
+    query_package = "cudf_polars.experimental.benchmarks.unoptimized_pdsds_queries"
+
+
 if __name__ == "__main__":
     parser = build_parser(num_queries=99)
     parser.add_argument(
@@ -334,10 +378,17 @@ if __name__ == "__main__":
         default="polars",
         help="Which engine to use for executing the benchmarks or to validate results.",
     )
+    parser.add_argument(
+        "--unoptimized",
+        action="store_true",
+        default=False,
+        help="Use naive (unoptimized) Polars query translations instead of the default optimized ones.",
+    )
     args = parse_args(parser=parser)
 
     if args.engine == "polars":
-        run_polars(PDSDSPolarsQueries, args)
+        qcls = PDSDSUnoptimizedPolarsQueries if args.unoptimized else PDSDSPolarsQueries
+        run_polars(qcls, args)
     elif args.engine == "duckdb":
         run_duckdb(PDSDSDuckDBQueries, args)
     else:
