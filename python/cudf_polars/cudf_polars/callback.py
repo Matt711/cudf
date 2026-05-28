@@ -26,6 +26,7 @@ from rmm._cuda import gpu
 import cudf_polars.dsl.tracing
 from cudf_polars.dsl.ir import IRExecutionContext
 from cudf_polars.dsl.tracing import CUDF_POLARS_NVTX_DOMAIN
+from cudf_polars.dsl import translate_rust
 from cudf_polars.dsl.translate import Translator
 from cudf_polars.utils.config import (
     MemoryResourceConfig,
@@ -360,8 +361,13 @@ def execute_with_cudf(
 
     with nvtx.annotate(message="ConvertIR", domain=CUDF_POLARS_NVTX_DOMAIN):
         translator = Translator(nt, config)
-        ir = translator.translate_ir()
-        ir_translation_errors = translator.errors
+        if os.environ.get("CUDF_POLARS_USE_RUST_TRANSLATOR"):
+            ir, ir_translation_errors = translate_rust.translate_ir(
+                nt, translator.config_options
+            )
+        else:
+            ir = translator.translate_ir()
+            ir_translation_errors = translator.errors
         if timer is not None:
             timer.store(start, time.monotonic_ns(), "gpu-ir-translation")
 
