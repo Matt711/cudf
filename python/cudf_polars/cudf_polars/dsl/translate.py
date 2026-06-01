@@ -152,7 +152,7 @@ class Translator:
         # IR is versioned with major.minor, minor is bumped for backwards
         # compatible changes (e.g. adding new nodes), major is bumped for
         # incompatible changes (e.g. renaming nodes).
-        if (version := self.visitor.version()) >= (12, 2):
+        if (version := self.visitor.version()) >= (14, 0):
             e = NotImplementedError(
                 f"No support for polars IR {version=}"
             )  # pragma: no cover; no such version for now.
@@ -371,6 +371,15 @@ def _(node: plrs._ir_nodes.Scan, translator: Translator, schema: Schema) -> ir.I
                     f"Reading compressed {typ.upper()} files is not supported."
                 )
 
+    partition_schema: Schema | None = None
+    hive_parts: tuple[tuple[Any, ...], ...] | None = None
+    if (hive_pydf := node.hive_parts) is not None:
+        hive_df = pl.DataFrame._from_pydf(hive_pydf)
+        partition_schema = {
+            name: DataType(dtype) for name, dtype in hive_df.schema.items()
+        }
+        hive_parts = tuple(tuple(row) for row in hive_df.iter_rows())
+
     return ir.Scan(
         schema,
         typ,
@@ -389,6 +398,8 @@ def _(node: plrs._ir_nodes.Scan, translator: Translator, schema: Schema) -> ir.I
             else translate_named_expr(translator, n=node.predicate, schema=schema)
         ),
         parquet_options,
+        partition_schema,
+        hive_parts,
     )
 
 

@@ -406,7 +406,13 @@ async def scan_node(
             local_paths = ir.paths[path_offset : path_offset + path_count]
             sindex = local_offset % plan.factor
             splits_created = 0
-            for path in local_paths:
+            for local_path_idx, path in enumerate(local_paths, start=path_offset):
+                if ir.partition_schema is not None and ir.hive_parts is not None:
+                    sub_hive_parts: tuple[tuple[Any, ...], ...] | None = (
+                        (ir.hive_parts[local_path_idx],)
+                    )
+                else:
+                    sub_hive_parts = None
                 base_scan = Scan(
                     ir.schema,
                     ir.typ,
@@ -420,6 +426,8 @@ async def scan_node(
                     ir.include_file_paths,
                     ir.predicate,
                     parquet_options,
+                    ir.partition_schema,
+                    sub_hive_parts,
                 )
                 while sindex < plan.factor and splits_created < local_count:
                     scans.append(
@@ -444,6 +452,10 @@ async def scan_node(
             for offset in range(paths_offset_start, paths_offset_end, plan.factor):
                 local_paths = ir.paths[offset : offset + plan.factor]
                 if len(local_paths) > 0:  # Only add scan if there are paths
+                    if ir.partition_schema is not None and ir.hive_parts is not None:
+                        sub_hive_parts = ir.hive_parts[offset : offset + plan.factor]
+                    else:
+                        sub_hive_parts = None
                     scans.append(
                         Scan(
                             ir.schema,
@@ -458,6 +470,8 @@ async def scan_node(
                             ir.include_file_paths,
                             ir.predicate,
                             parquet_options,
+                            ir.partition_schema,
+                            sub_hive_parts,
                         )
                     )
 
@@ -661,6 +675,9 @@ def _(
         and ir.n_rows == -1
         and ir.skip_rows == 0
         and not distributed_split_files
+        # TODO: native reader cannot inject hive partition columns; needs
+        # per-chunk source row counts from rapidsmpf to enable.
+        and ir.partition_schema is None
     ):
         # Create new channel to so ch_out can be used to add metadata
         ch_in = rec.state["context"].create_channel()

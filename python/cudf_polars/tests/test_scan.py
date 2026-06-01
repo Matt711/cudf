@@ -15,11 +15,15 @@ from werkzeug import Response
 
 import polars as pl
 
+from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.testing.asserts import (
     assert_gpu_result_equal,
     assert_ir_translation_raises,
 )
-from cudf_polars.testing.engine_utils import is_streaming_engine
+from cudf_polars.testing.engine_utils import (
+    configure_streaming_engine,
+    is_streaming_engine,
+)
 from cudf_polars.testing.io import make_partitioned_source
 from cudf_polars.utils.versions import (
     POLARS_VERSION_LT_138,
@@ -795,3 +799,108 @@ def test_scan_parquet_is_between_literal_dtype_mismatch_22622(
     )
 
     assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.fixture
+def hive_dataset(tmp_path: Path) -> Path:
+    rows_per_file = 50
+    leaves = [
+        {"year": 2024, "month": 1},
+        {"year": 2024, "month": 2},
+        {"year": 2024, "month": 3},
+        {"year": 2023, "month": 11},
+        {"year": 2023, "month": 12},
+    ]
+    for i, keys in enumerate(leaves):
+        path = tmp_path
+        for k, v in keys.items():
+            path = path / f"{k}={v}"
+        path.mkdir(parents=True)
+        start = i * rows_per_file
+        frame = pl.DataFrame(
+            {
+                "a": list(range(start, start + rows_per_file)),
+                "b": [f"v{start + j}" for j in range(rows_per_file)],
+            }
+        )
+        frame.write_parquet(path / "part-0.parquet", row_group_size=10)
+    return tmp_path
+
+
+@pytest.fixture
+def hive_date_dataset(tmp_path: Path) -> Path:
+    rows_per_file = 50
+    dates = ["2024-01-01", "2024-01-02", "2024-02-15", "2023-12-31"]
+    for i, d in enumerate(dates):
+        path = tmp_path / f"shipdate={d}"
+        path.mkdir(parents=True)
+        start = i * rows_per_file
+        frame = pl.DataFrame(
+            {
+                "a": list(range(start, start + rows_per_file)),
+                "b": [f"v{start + j}" for j in range(rows_per_file)],
+            }
+        )
+        frame.write_parquet(path / "part-0.parquet", row_group_size=10)
+    return tmp_path
+
+
+@pytest.mark.parametrize("chunked", [True, False], ids=["chunked", "unchunked"])
+def test_scan_parquet_hive_partitioning(
+    engine: pl.GPUEngine, hive_dataset: Path, chunked: bool
+) -> None:
+    q = pl.scan_parquet(hive_dataset, hive_partitioning=True)
+    if is_streaming_engine(engine):
+        # chunked has no effect on streaming engines.
+        # Force a small target_partition_size so every backend exercises
+        # SPLIT_FILES / FUSED_FILES rather than fusing the whole dataset
+        # into one task.
+        engine = configure_streaming_engine(
+            engine,
+            StreamingOptions(
+                target_partition_size=10,
+                max_rows_per_partition=4,
+                allow_gpu_sharing=True,
+            ),
+        )
+        # Multi-worker concat does not preserve row order.
+        assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+    else:
+        engine = pl.GPUEngine(
+            executor="in-memory",
+            raise_on_fail=True,
+            parquet_options={"chunked": chunked},
+        )
+        assert_gpu_result_equal(q, engine=engine)
+
+
+def test_scan_parquet_hive_date_partition(
+    engine: pl.GPUEngine, hive_date_dataset: Path
+) -> None:
+    q = pl.scan_parquet(hive_date_dataset, hive_partitioning=True)
+    if is_streaming_engine(engine):
+        assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+    else:
+        assert_gpu_result_equal(q, engine=NO_CHUNK_ENGINE)
+
+
+def test_scan_parquet_hive_with_include_file_paths(
+    engine: pl.GPUEngine, hive_dataset: Path
+) -> None:
+    q = pl.scan_parquet(
+        hive_dataset, hive_partitioning=True, include_file_paths="files"
+    )
+    if is_streaming_engine(engine):
+        assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+    else:
+        assert_gpu_result_equal(q, engine=NO_CHUNK_ENGINE)
+
+
+def test_scan_parquet_hive_with_row_index(
+    engine: pl.GPUEngine, hive_dataset: Path
+) -> None:
+    q = pl.scan_parquet(hive_dataset, hive_partitioning=True, row_index_name="idx")
+    if is_streaming_engine(engine):
+        assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+    else:
+        assert_gpu_result_equal(q, engine=NO_CHUNK_ENGINE)

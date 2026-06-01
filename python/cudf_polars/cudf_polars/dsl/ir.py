@@ -420,9 +420,11 @@ class Scan(IR):
 
     __slots__ = (
         "cloud_options",
+        "hive_parts",
         "include_file_paths",
         "n_rows",
         "parquet_options",
+        "partition_schema",
         "paths",
         "predicate",
         "reader_options",
@@ -444,8 +446,10 @@ class Scan(IR):
         "include_file_paths",
         "predicate",
         "parquet_options",
+        "partition_schema",
+        "hive_parts",
     )
-    _n_non_child_args = 11
+    _n_non_child_args = 13
     typ: str
     """What type of file are we reading? Parquet, CSV, etc..."""
     reader_options: dict[str, Any]
@@ -468,6 +472,10 @@ class Scan(IR):
     """Mask to apply to the read dataframe."""
     parquet_options: ParquetOptions
     """Parquet-specific options."""
+    partition_schema: Schema | None
+    """Schema of hive partition columns, or None if the scan is not hive-partitioned."""
+    hive_parts: tuple[tuple[Any, ...], ...] | None
+    """Per-file hive partition values, indexed like ``paths``; each inner tuple is ordered like ``partition_schema``."""
 
     PARQUET_DEFAULT_CHUNK_SIZE: int = 0  # unlimited
     PARQUET_DEFAULT_PASS_LIMIT: int = 16 * 1024**3  # 16GiB
@@ -486,6 +494,8 @@ class Scan(IR):
         include_file_paths: str | None,
         predicate: expr.NamedExpr | None,
         parquet_options: ParquetOptions,
+        partition_schema: Schema | None = None,
+        hive_parts: tuple[tuple[Any, ...], ...] | None = None,
     ):
         self.schema = schema
         self.typ = typ
@@ -498,6 +508,8 @@ class Scan(IR):
         self.row_index = row_index
         self.include_file_paths = include_file_paths
         self.predicate = predicate
+        self.partition_schema = partition_schema
+        self.hive_parts = hive_parts
         self._non_child_args = (
             schema,
             typ,
@@ -510,6 +522,8 @@ class Scan(IR):
             include_file_paths,
             predicate,
             parquet_options,
+            partition_schema,
+            hive_parts,
         )
         self.children = ()
         self.parquet_options = parquet_options
@@ -593,6 +607,10 @@ class Scan(IR):
             raise NotImplementedError(
                 "Reading only parquet metadata to produce row index."
             )
+        if self.partition_schema is not None and self.typ != "parquet":
+            raise NotImplementedError(
+                f"Hive partitioning is not supported for {self.typ} scans."
+            )
 
     def get_hashable(self) -> Hashable:
         """
@@ -616,6 +634,10 @@ class Scan(IR):
             self.include_file_paths,
             self.predicate,
             self.parquet_options,
+            tuple(self.partition_schema.items())
+            if self.partition_schema is not None
+            else None,
+            self.hive_parts,
         )
 
     @staticmethod
@@ -687,11 +709,14 @@ class Scan(IR):
         include_file_paths: str | None,
         predicate: expr.NamedExpr | None,
         parquet_options: ParquetOptions,
+        partition_schema: Schema | None,
+        hive_parts: tuple[tuple[Any, ...], ...] | None,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
         stream = context.get_cuda_stream()
+        rows_per_source: list[int] | None = None
         if typ == "csv":
 
             def read_csv_header(
@@ -836,8 +861,12 @@ class Scan(IR):
                 # TODO: Nested column names
                 names = chunk.column_names(include_children=False)
                 concatenated_columns = chunk.tbl.columns()
+                rows_per_source = list(chunk.num_rows_per_source)
                 while reader.has_next():
-                    columns = reader.read_chunk().tbl.columns()
+                    next_chunk = reader.read_chunk()
+                    for i, n in enumerate(next_chunk.num_rows_per_source):
+                        rows_per_source[i] += n
+                    columns = next_chunk.tbl.columns()
                     # Discard columns while concatenating to reduce memory footprint.
                     # Reverse order to avoid O(n^2) list popping cost.
                     for i in reversed(range(len(concatenated_columns))):
@@ -858,7 +887,7 @@ class Scan(IR):
                 )
                 if include_file_paths is not None:
                     df = Scan.add_file_paths(  # pragma: no cover
-                        include_file_paths, paths, chunk.num_rows_per_source, df
+                        include_file_paths, paths, rows_per_source, df
                     )
             else:
                 tbl_w_meta = plc.io.parquet.read_parquet(
@@ -878,9 +907,10 @@ class Scan(IR):
                     stream=stream,
                     num_rows=num_rows,
                 )
+                rows_per_source = tbl_w_meta.num_rows_per_source
                 if include_file_paths is not None:
                     df = Scan.add_file_paths(
-                        include_file_paths, paths, tbl_w_meta.num_rows_per_source, df
+                        include_file_paths, paths, rows_per_source, df
                     )
             if filters is not None:
                 # Mask must have been applied.
@@ -914,6 +944,36 @@ class Scan(IR):
             raise NotImplementedError(
                 f"Unhandled scan type: {typ}"
             )  # pragma: no cover; post init trips first
+        if partition_schema is not None:
+            assert hive_parts is not None
+            assert rows_per_source is not None
+            offsets = list(itertools.accumulate(rows_per_source, initial=0))
+            slice_indices: list[int] = []
+            for i in range(len(rows_per_source)):
+                slice_indices.append(offsets[i])
+                slice_indices.append(offsets[i + 1])
+            sub_tables = plc.copying.slice(df.table, slice_indices, stream=stream)
+            col_names = df.column_names
+            dtypes = df.dtypes
+            sub_dfs: list[DataFrame] = []
+            for sub_tbl, values in zip(sub_tables, hive_parts, strict=True):
+                sub_df = DataFrame.from_table(
+                    sub_tbl, col_names, dtypes, stream=stream
+                )
+                named_exprs = [
+                    expr.NamedExpr(name, expr.Literal(dtype, value))
+                    for (name, dtype), value in zip(
+                        partition_schema.items(), values, strict=True
+                    )
+                ]
+                sub_dfs.append(
+                    HStack.do_evaluate(
+                        named_exprs, True, sub_df, context=context  # noqa: FBT003
+                    )
+                )
+            df = Union.do_evaluate(None, *sub_dfs, context=context)
+            col_order = [n for n in schema if row_index is None or n != row_index[0]]
+            df = df.select(col_order)
         if row_index is not None:
             name, offset = row_index
             offset += skip_rows

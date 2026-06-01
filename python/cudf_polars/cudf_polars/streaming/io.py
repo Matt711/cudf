@@ -127,7 +127,7 @@ class SplitScan(IR):
         "total_splits",
         "parquet_options",
     )
-    _n_non_child_args = 13
+    _n_non_child_args = 15
     base_scan: Scan
     """Scan operation this node is based on."""
     split_index: int
@@ -163,6 +163,8 @@ class SplitScan(IR):
             base_scan.include_file_paths,
             base_scan.predicate,
             base_scan.parquet_options,
+            base_scan.partition_schema,
+            base_scan.hive_parts,
         )
         self.parquet_options = parquet_options
         self.children = ()
@@ -187,6 +189,8 @@ class SplitScan(IR):
         include_file_paths: str | None,
         predicate: NamedExpr | None,
         parquet_options: ParquetOptions,
+        partition_schema: Schema | None,
+        hive_parts: tuple[tuple[Any, ...], ...] | None,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
@@ -249,6 +253,8 @@ class SplitScan(IR):
             include_file_paths,
             predicate,
             parquet_options,
+            partition_schema,
+            hive_parts,
             context=context,
         )
 
