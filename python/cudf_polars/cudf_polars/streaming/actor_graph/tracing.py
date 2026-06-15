@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+import time as _time
+from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.streaming.core.message import Message
 
@@ -44,9 +45,13 @@ class ActorTracer:
     duplicated
         Whether the output rows are duplicated across ranks
         (e.g., after an allgather). Affects how rows are merged.
+    actor_instance_id
+        Unique integer ID assigned by shutdown_on_error when stream tracing
+        is enabled. Zero when tracing is disabled.
     """
 
     __slots__ = (
+        "actor_instance_id",
         "chunk_count",
         "decision",
         "duplicated",
@@ -62,6 +67,7 @@ class ActorTracer:
         self.chunk_count: int = 0
         self.decision: str | None = None
         self.duplicated: bool = False
+        self.actor_instance_id: int = 0
 
     def add_chunk(self, *, chunk: TableChunk | None = None) -> None:
         """
@@ -91,6 +97,7 @@ async def send_chunk(
     sequence_number: int,
     *,
     tracer: ActorTracer | None,
+    ir_context: Any = None,
 ) -> None:
     """
     Trace and send a TableChunk.
@@ -107,10 +114,92 @@ async def send_chunk(
         The sequence number of the chunk.
     tracer
         The tracer to use to trace the chunk.
+    ir_context
+        IR execution context. When provided and stream tracing is enabled,
+        a MessageEnqueuedEvent is emitted for this send.
     """
+    import time as _time
+
+    from cudf_polars.streaming.actor_graph.events import (
+        STREAM_TRACE_ENABLED,
+        MessageEnqueuedEvent,
+        get_buffer_for_query,
+    )
+
     if tracer is not None:
         tracer.add_chunk(chunk=chunk)
+
+    if STREAM_TRACE_ENABLED and ir_context is not None:
+        _buf = get_buffer_for_query(str(ir_context.query_id))
+        if _buf is not None and _buf.should_emit_message():
+            from cudf_polars.streaming.actor_graph.channel_registry import get_registry
+
+            _reg = get_registry(_buf.query_id)
+            _ch_id = _reg.get(ch_out) if _reg is not None else None
+            if _ch_id is not None:
+                _buf.emit(
+                    MessageEnqueuedEvent(
+                        timestamp_ns=_time.monotonic_ns(),
+                        query_id=_buf.query_id,
+                        actor_instance_id=tracer.actor_instance_id if tracer else 0,
+                        channel_id=_ch_id,
+                        sequence_number=sequence_number,
+                        size_bytes=chunk.data_alloc_size(),
+                        spillable=chunk.is_spillable(),
+                    )
+                )
+
     await ch_out.send(context, Message(sequence_number, chunk))
+
+
+def record_scheduling_decision(
+    tracer: ActorTracer | None,
+    decision: str,
+    ir_context: Any = None,
+    *,
+    left_rows: int | None = None,
+    right_rows: int | None = None,
+) -> None:
+    """
+    Record an algorithm decision on the tracer and emit a SchedulingDecisionEvent.
+
+    Parameters
+    ----------
+    tracer
+        The actor tracer. If None the assignment is skipped.
+    decision
+        The decision string (e.g. "broadcast_left", "shuffle", "chunkwise").
+    ir_context
+        IR execution context for buffer lookup. When provided and tracing is
+        enabled, a SchedulingDecisionEvent is emitted.
+    left_rows
+        Optional row count of the left input (join context).
+    right_rows
+        Optional row count of the right input (join context).
+    """
+    if tracer is not None:
+        tracer.decision = decision
+
+    from cudf_polars.streaming.actor_graph.events import (
+        STREAM_TRACE_ENABLED,
+        SchedulingDecisionEvent,
+        get_buffer_for_query,
+    )
+
+    if STREAM_TRACE_ENABLED and tracer is not None and ir_context is not None:
+        _buf = get_buffer_for_query(str(ir_context.query_id))
+        if _buf is not None:
+            _buf.emit(
+                SchedulingDecisionEvent(
+                    timestamp_ns=_time.monotonic_ns(),
+                    query_id=_buf.query_id,
+                    actor_instance_id=tracer.actor_instance_id,
+                    ir_type=tracer.ir_type,
+                    decision=decision,
+                    left_rows=left_rows,
+                    right_rows=right_rows,
+                )
+            )
 
 
 def log_query_plan(ir: IR, config_options: ConfigOptions) -> None:

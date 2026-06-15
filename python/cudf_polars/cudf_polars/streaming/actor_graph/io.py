@@ -39,6 +39,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     empty_table_chunk,
     gather_in_task_group,
     process_children,
+    recv_chunk,
     recv_metadata,
     send_metadata,
 )
@@ -66,6 +67,52 @@ if TYPE_CHECKING:
     from cudf_polars.streaming.io import FusedScan, SplitScan
 
 
+def _emit_lineariser_enqueue(
+    ch_out: Any,
+    seq_num: int,
+    tracer: Any,
+    ir_context: Any,
+) -> None:
+    """Emit a MessageEnqueuedEvent for a chunk forwarded by the Lineariser.
+
+    The Lineariser forwards Message objects (not raw TableChunks), so we cannot
+    use send_chunk directly.  We emit the trace event here after the send so
+    that the visualizer shows particles on the Scan→Projection channel.
+    """
+    from cudf_polars.streaming.actor_graph.events import (
+        STREAM_TRACE_ENABLED,
+        MessageEnqueuedEvent,
+        get_buffer_for_query,
+    )
+
+    if not STREAM_TRACE_ENABLED or ir_context is None:
+        return
+    _buf = get_buffer_for_query(str(ir_context.query_id))
+    if _buf is None or not _buf.should_emit_message():
+        return
+
+    import time as _time
+
+    from cudf_polars.streaming.actor_graph.channel_registry import get_registry
+
+    _reg = get_registry(_buf.query_id)
+    _ch_id = _reg.get(ch_out) if _reg is not None else None
+    if _ch_id is None:
+        return
+
+    _buf.emit(
+        MessageEnqueuedEvent(
+            timestamp_ns=_time.monotonic_ns(),
+            query_id=_buf.query_id,
+            actor_instance_id=tracer.actor_instance_id if tracer is not None else 0,
+            channel_id=_ch_id,
+            sequence_number=seq_num,
+            size_bytes=0,
+            spillable=True,
+        )
+    )
+
+
 class Lineariser:
     """
     Linearizer that ensures ordered delivery from multiple concurrent producers.
@@ -75,12 +122,19 @@ class Lineariser:
     """
 
     def __init__(
-        self, context: Context, ch_out: Channel[TableChunk], num_producers: int
+        self,
+        context: Context,
+        ch_out: Channel[TableChunk],
+        num_producers: int,
+        tracer: ActorTracer | None = None,
+        ir_context: Any = None,
     ):
         self.context = context
         self.ch_out = ch_out
         self.num_producers = num_producers
         self.input_channels = [context.create_channel() for _ in range(num_producers)]
+        self.tracer = tracer
+        self.ir_context = ir_context
 
     async def drain(self) -> None:
         """
@@ -112,12 +166,18 @@ class Lineariser:
 
             # Forward consecutive messages
             while next_seq in buffer:
-                await self.ch_out.send(self.context, buffer.pop(next_seq))
+                msg = buffer.pop(next_seq)
+                await self.ch_out.send(self.context, msg)
+                _emit_lineariser_enqueue(
+                    self.ch_out, next_seq, self.tracer, self.ir_context
+                )
                 next_seq += 1
 
         # Forward any remaining buffered messages
         for seq in sorted(buffer.keys()):
-            await self.ch_out.send(self.context, buffer.pop(seq))
+            msg = buffer.pop(seq)
+            await self.ch_out.send(self.context, msg)
+            _emit_lineariser_enqueue(self.ch_out, seq, self.tracer, self.ir_context)
 
         await self.ch_out.drain(self.context)
 
@@ -226,7 +286,10 @@ async def dataframescan_node(
 
         # Use Lineariser to ensure ordered delivery
         num_producers = min(num_producers, len(ir_slices))
-        lineariser = Lineariser(context, ch_out, num_producers)
+        lineariser = Lineariser(
+            context, ch_out, num_producers,
+            tracer=tracer, ir_context=ir_context,
+        )
 
         # Assign tasks to producers using round-robin
         producer_tasks: list[list[tuple[int, DataFrameScan]]] = [
@@ -338,7 +401,7 @@ async def read_chunk(
         exclusive_view=True,
         br=context.br(),
     )
-    await send_chunk(context, ch_out, chunk, seq_num, tracer=tracer)
+    await send_chunk(context, ch_out, chunk, seq_num, tracer=tracer, ir_context=ir_context)
 
 
 @define_actor()
@@ -405,7 +468,10 @@ async def scan_node(
 
         # Use Lineariser to ensure ordered delivery
         num_producers = min(num_producers, len(scans))
-        lineariser = Lineariser(context, ch_out, num_producers)
+        lineariser = Lineariser(
+            context, ch_out, num_producers,
+            tracer=tracer, ir_context=ir_context,
+        )
 
         # Assign tasks to producers using round-robin
         producer_tasks: list[list[tuple[int, SplitScan | FusedScan]]] = [
@@ -611,6 +677,27 @@ def _(
                 ),
             )
         ]
+
+    # Store scan topology so the actor graph event can include sub-actor metadata.
+    from cudf_polars.streaming.actor_graph.events import STREAM_TRACE_ENABLED
+
+    if STREAM_TRACE_ENABLED:
+        scans = getattr(ir, "scans", [])
+        eff_producers = min(num_producers, len(scans)) if scans else 1
+        # Collect file paths from each scan
+        files = []
+        for scan in scans:
+            if hasattr(scan, 'paths'):
+                files.extend(str(p) for p in scan.paths)
+        rec.state.setdefault("_actor_scan_meta", {})[id(ir)] = {
+            "num_scans": len(scans),
+            "num_producers": eff_producers,
+            "scan_type": type(scans[0]).__name__ if scans else "scan",
+            "has_lineariser": len(scans) > 1 and eff_producers > 1,
+            "native": use_native,
+            "files": files,
+        }
+
     return nodes, channels
 
 
@@ -675,7 +762,7 @@ async def sink_node(
         if ir.sink_to_directory:
             _prepare_sink_directory(ir.sink.path)
             i = 0
-            while (msg := await ch_in.recv(context)) is not None:
+            while (msg := await recv_chunk(context, ch_in, ir_context=ir_context)) is not None:
                 chunk = TableChunk.from_message(
                     msg, br=context.br()
                 ).make_available_and_spill(context.br(), allow_overbooking=True)
@@ -695,7 +782,7 @@ async def sink_node(
         else:
             # Write chunks to a single file
             writer_state = None
-            while (msg := await ch_in.recv(context)) is not None:
+            while (msg := await recv_chunk(context, ch_in, ir_context=ir_context)) is not None:
                 chunk = TableChunk.from_message(
                     msg, br=context.br()
                 ).make_available_and_spill(context.br(), allow_overbooking=True)

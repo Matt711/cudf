@@ -319,7 +319,7 @@ async def _tree_reduce(
         aggregated = await evaluate_chunk(
             context, aggregated, decomposed.select_ir, ir_context=ir_context
         )
-    await send_chunk(context, ch_out, aggregated, 0, tracer=tracer)
+    await send_chunk(context, ch_out, aggregated, 0, tracer=tracer, ir_context=ir_context)
 
     await ch_out.drain(context)
 
@@ -439,7 +439,7 @@ async def _shuffle_reduce(
             *extract_irs,
             ir_context=ir_context,
         )
-        await send_chunk(context, ch_out, partition_chunk, partition_id, tracer=tracer)
+        await send_chunk(context, ch_out, partition_chunk, partition_id, tracer=tracer, ir_context=ir_context)
 
     await ch_out.drain(context)
 
@@ -516,6 +516,7 @@ async def _choose_strategy(
     target_partition_size: int,
     skip_global_comm: bool,  # noqa: FBT001
     tracer: ActorTracer | None,
+    ir_context: Any = None,
 ) -> int:
     """
     Select the best algorithm for the given context and metadata.
@@ -575,8 +576,10 @@ async def _choose_strategy(
 
     output_count_limit = local_count if skip_global_comm else total_chunk_count
     output_count = min(ideal_count, output_count_limit)
-    if tracer is not None:
-        tracer.decision = (
+    from cudf_polars.streaming.actor_graph.tracing import record_scheduling_decision
+    record_scheduling_decision(
+        tracer,
+        (
             "tree_local"
             if skip_global_comm and use_tree
             else "shuffle_local"
@@ -584,7 +587,9 @@ async def _choose_strategy(
             else "tree_allgather"
             if use_tree
             else "shuffle"
-        )
+        ),
+        ir_context,
+    )
 
     return output_count
 
@@ -649,8 +654,8 @@ async def groupby_actor(
         )
 
         if fully_partitioned or fallback_case:
-            if tracer is not None:
-                tracer.decision = "chunkwise"
+            from cudf_polars.streaming.actor_graph.tracing import record_scheduling_decision
+            record_scheduling_decision(tracer, "chunkwise", ir_context)
             metadata_out = ChannelMetadata(
                 local_count=metadata_in.local_count,
                 partitioning=maybe_remap_partitioning(
@@ -695,6 +700,7 @@ async def groupby_actor(
             target_partition_size,
             skip_global_comm,
             tracer,
+            ir_context,
         )
 
         if output_count == 1:

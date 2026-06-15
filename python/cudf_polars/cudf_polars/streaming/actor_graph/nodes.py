@@ -631,10 +631,13 @@ def generate_ir_sub_network_wrapper(
         count = fanout_info.num_consumers
         manager = ChannelManager(rec.state["context"], count=count)
         fanout_node: Any
+        # Save the pre-fanout manager (primary actor's output → fanout's input)
+        # before replacing channels[ir] so tracing can wire the edge correctly.
+        pre_fanout_manager = channels[ir]
         if fanout_info.unbounded:
             fanout_node = fanout_node_unbounded(
                 rec.state["context"],
-                channels[ir].reserve_output_slot(),
+                pre_fanout_manager.reserve_output_slot(),
                 *[manager.reserve_input_slot() for _ in range(count)],
                 trace_ir=ir,
                 ir_context=rec.state["ir_context"],
@@ -642,13 +645,17 @@ def generate_ir_sub_network_wrapper(
         else:  # "bounded"
             fanout_node = fanout_node_bounded(
                 rec.state["context"],
-                channels[ir].reserve_output_slot(),
+                pre_fanout_manager.reserve_output_slot(),
                 *[manager.reserve_input_slot() for _ in range(count)],
                 trace_ir=ir,
                 ir_context=rec.state["ir_context"],
             )
         nodes[ir].append(fanout_node)
         channels[ir] = manager
+        rec.state.setdefault("_fanout_wiring", {})[id(ir)] = {
+            "ir": ir,
+            "pre_fanout_manager": pre_fanout_manager,
+        }
     return nodes, channels
 
 

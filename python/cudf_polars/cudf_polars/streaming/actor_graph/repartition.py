@@ -168,7 +168,7 @@ async def concatenate_node(
                     result_table, stream, exclusive_view=True, br=context.br()
                 )
 
-            await send_chunk(context, ch_out, output_chunk, 0, tracer=tracer)
+            await send_chunk(context, ch_out, output_chunk, 0, tracer=tracer, ir_context=ir_context)
         else:
             # Local repartitioning (tree reduction).
 
@@ -225,7 +225,7 @@ async def concatenate_node(
                         br=context.br(),
                     )
                     await send_chunk(
-                        context, ch_out, output_chunk, seq_num, tracer=tracer
+                        context, ch_out, output_chunk, seq_num, tracer=tracer, ir_context=ir_context
                     )
                     seq_num += 1
                     del df

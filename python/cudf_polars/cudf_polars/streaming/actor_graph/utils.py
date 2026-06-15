@@ -128,6 +128,9 @@ async def gather_in_task_group(*coroutines: Coroutine[Any, Any, Any]) -> list[An
     return [task.result() for task in tasks]
 
 
+_actor_instance_counter = itertools.count(1)
+
+
 @asynccontextmanager
 async def shutdown_on_error(
     context: Context,
@@ -175,6 +178,34 @@ async def shutdown_on_error(
 
     with cudf_polars.dsl.tracing.bound_contextvars(**contextvars):
         start = time.monotonic_ns()
+
+        # Stream tracing: assign a unique instance ID and emit actor_created.
+        # Look up buffer via global query registry (not thread-local) because
+        # run_actor_network runs actor coroutines on a different thread.
+        from cudf_polars.streaming.actor_graph.events import (
+            STREAM_TRACE_ENABLED,
+            ActorCreatedEvent,
+            get_buffer_for_query,
+        )
+
+        _trace_buf = None
+        if STREAM_TRACE_ENABLED and ir_context is not None:
+            _trace_buf = get_buffer_for_query(str(ir_context.query_id))
+        actor_instance_id: int = next(_actor_instance_counter) if _trace_buf is not None else 0
+        if tracer is not None:
+            tracer.actor_instance_id = actor_instance_id
+        if _trace_buf is not None:
+            _trace_buf.drain_thread_queue()
+            _trace_buf.emit(
+                ActorCreatedEvent(
+                    timestamp_ns=start,
+                    query_id=_trace_buf.query_id,
+                    actor_instance_id=actor_instance_id,
+                    ir_id=ir_id,
+                    ir_type=ir_type,
+                )
+            )
+
         try:
             yield tracer
         except BaseException:
@@ -204,6 +235,82 @@ async def shutdown_on_error(
             cudf_polars.dsl.tracing.log(
                 "Streaming Actor", start=start, stop=stop, **record
             )
+
+            # Stream tracing: emit actor destroyed event.
+            if _trace_buf is not None:
+                from cudf_polars.streaming.actor_graph.events import ActorDestroyedEvent
+
+                _trace_buf.drain_thread_queue()
+                _trace_buf.emit(
+                    ActorDestroyedEvent(
+                        timestamp_ns=stop,
+                        query_id=_trace_buf.query_id,
+                        actor_instance_id=actor_instance_id,
+                        ir_id=ir_id,
+                        ir_type=ir_type,
+                        chunk_count=tracer.chunk_count if tracer else 0,
+                        row_count=tracer.row_count if tracer else None,
+                        decision=tracer.decision if tracer else None,
+                        duplicated=tracer.duplicated if tracer else False,
+                        duration_ns=stop - start,
+                    )
+                )
+
+
+async def recv_chunk(
+    context: Context,
+    ch_in: Channel[Any],
+    *,
+    tracer: ActorTracer | None = None,
+    ir_context: IRExecutionContext | None = None,
+) -> Any:
+    """
+    Receive a message from a channel, emitting a MessageDequeuedEvent when tracing.
+
+    This is a drop-in replacement for ``await ch_in.recv(context)`` at all
+    instrumented recv sites. When tracing is disabled the overhead is a single
+    branch check (~1 ns).
+
+    Parameters
+    ----------
+    context
+        The rapidsmpf context.
+    ch_in
+        The input channel to receive from.
+    tracer
+        The actor tracer (for actor_instance_id lookup).
+    ir_context
+        The IR execution context, used to look up the EventBuffer.
+
+    Returns
+    -------
+    The received Message, or None if the channel has been drained.
+    """
+    msg = await ch_in.recv(context)
+    from cudf_polars.streaming.actor_graph.events import (
+        STREAM_TRACE_ENABLED,
+        MessageDequeuedEvent,
+        get_buffer_for_query,
+    )
+
+    if msg is not None and STREAM_TRACE_ENABLED and ir_context is not None:
+        _buf = get_buffer_for_query(str(ir_context.query_id))
+        if _buf is not None and _buf.should_emit_message():
+            from cudf_polars.streaming.actor_graph.channel_registry import get_registry
+
+            _reg = get_registry(_buf.query_id)
+            _ch_id = _reg.get(ch_in) if _reg is not None else None
+            if _ch_id is not None:
+                _buf.emit(
+                    MessageDequeuedEvent(
+                        timestamp_ns=time.monotonic_ns(),
+                        query_id=_buf.query_id,
+                        actor_instance_id=tracer.actor_instance_id if tracer else 0,
+                        channel_id=_ch_id,
+                        sequence_number=msg.sequence_number,
+                    )
+                )
+    return msg
 
 
 def _scheme_column_indices(scheme: HashScheme | OrderScheme) -> tuple[int, ...]:
@@ -675,7 +782,7 @@ async def chunkwise_evaluate(
         tracer.set_duplicated()
 
     received_any = False
-    while (msg := await ch_in.recv(context)) is not None:
+    while (msg := await recv_chunk(context, ch_in, tracer=tracer, ir_context=ir_context)) is not None:
         received_any = True
         cd = msg.get_content_description()
         seq_num = msg.sequence_number
@@ -691,13 +798,13 @@ async def chunkwise_evaluate(
                 ir_context=ir_context,
             )
         del msg, cd
-        await send_chunk(context, ch_out, result, seq_num, tracer=tracer)
+        await send_chunk(context, ch_out, result, seq_num, tracer=tracer, ir_context=ir_context)
 
     if handle_empty_input and not received_any:
         chunk = empty_table_chunk(ir.children[0], context, ir_context.get_cuda_stream())
         result = await evaluate_chunk(context, chunk, ir, ir_context=ir_context)
         del chunk
-        await send_chunk(context, ch_out, result, 0, tracer=tracer)
+        await send_chunk(context, ch_out, result, 0, tracer=tracer, ir_context=ir_context)
 
     await ch_out.drain(context)
 
@@ -1043,6 +1150,24 @@ class ChannelManager:
         ]
         self._reserved_output_slots: int = 0
         self._reserved_input_slots: int = 0
+
+        # Register channels for stream tracing when a trace buffer is active.
+        from cudf_polars.streaming.actor_graph.events import (
+            STREAM_TRACE_ENABLED,
+            get_active_buffer,
+        )
+
+        if STREAM_TRACE_ENABLED:
+            _buf = get_active_buffer()
+            if _buf is not None:
+                from cudf_polars.streaming.actor_graph.channel_registry import (
+                    get_registry,
+                )
+
+                registry = get_registry(_buf.query_id)
+                if registry is not None:
+                    for ch in self._channel_slots:
+                        registry.register(ch)
 
     def reserve_input_slot(self) -> Channel[TableChunk]:
         """

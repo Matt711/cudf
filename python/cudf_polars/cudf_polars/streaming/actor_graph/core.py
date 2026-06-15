@@ -296,5 +296,228 @@ def generate_network(
     nodes: list[Any] = [node for node_list in nodes_dict.values() for node in node_list]
     nodes.extend([drain_node, output_node])
 
+    # Stream tracing: emit the static actor graph topology.
+    from cudf_polars.streaming.actor_graph.events import (
+        STREAM_TRACE_ENABLED,
+        get_active_buffer,
+    )
+
+    if STREAM_TRACE_ENABLED:
+        _buf = get_active_buffer()
+        if _buf is not None:
+            _emit_actor_graph_event(
+                _buf, nodes_dict, channels, ir_context,
+                actor_scan_meta=state.get("_actor_scan_meta", {}),
+                fanout_wiring=state.get("_fanout_wiring", {}),
+            )
+
     # Return network and output hook
     return nodes, output
+
+
+def _emit_actor_graph_event(
+    buf: Any,
+    nodes_dict: dict[Any, list[Any]],
+    channels: dict[Any, Any],
+    ir_context: Any,
+    actor_scan_meta: dict | None = None,
+    fanout_wiring: dict | None = None,
+) -> None:
+    """
+    Build and emit an ActorGraphEvent from the generate_network artifacts.
+
+    Each IR node maps to one or more actors in nodes_dict. The first entry
+    is the "real" actor; extras (index > 0) are fanout actors inserted by
+    generate_ir_sub_network_wrapper. Channels are registered in the
+    ChannelRegistry by ChannelManager.__init__; we look them up here to
+    assign source/sink actor IDs.
+    """
+    import itertools as _itertools
+    import time as _time
+
+    from cudf_polars.streaming.actor_graph.channel_registry import get_registry
+    from cudf_polars.streaming.actor_graph.events import ActorGraphEvent, write_graph_json
+
+    registry = get_registry(buf.query_id)
+    if registry is None:
+        return
+
+    actor_counter = _itertools.count(1)
+
+    # First pass: assign actor_instance_ids and collect per-IR channel lists.
+    ir_to_actor_ids: dict[Any, list[int]] = {}
+    actor_records: list[dict] = []
+
+    for ir_node, actor_list in nodes_dict.items():
+        ir_id = ir_node.get_stable_id() if hasattr(ir_node, "get_stable_id") else None
+        ir_type = type(ir_node).__name__
+
+        for i, _actor in enumerate(actor_list):
+            aid = next(actor_counter)
+            if ir_node not in ir_to_actor_ids:
+                ir_to_actor_ids[ir_node] = []
+            ir_to_actor_ids[ir_node].append(aid)
+
+            # Fanout actors are entries beyond index 0 for a given IR node.
+            actual_ir_type = ir_type if i == 0 else f"fanout_{i}"
+            actual_ir_id = ir_id if i == 0 else None
+
+            record: dict = {
+                "actor_instance_id": aid,
+                "ir_id": actual_ir_id,
+                "ir_type": actual_ir_type,
+                "input_channel_ids": [],   # filled in second pass
+                "output_channel_ids": [],  # filled in second pass
+            }
+            if i == 0 and actor_scan_meta:
+                smeta = actor_scan_meta.get(id(ir_node))
+                if smeta is not None:
+                    record["scan_meta"] = smeta
+            # Add IR-specific metadata for the primary actor
+            if i == 0:
+                try:
+                    from cudf_polars.dsl.ir import Join, GroupBy, Sort, Filter
+                    ir_meta = {}
+                    if isinstance(ir_node, Join):
+                        ir_meta["how"] = ir_node.options[0] if ir_node.options else "?"
+                        ir_meta["left_on"] = [str(e.name) for e in ir_node.left_on]
+                        ir_meta["right_on"] = [str(e.name) for e in ir_node.right_on]
+                    elif isinstance(ir_node, GroupBy):
+                        ir_meta["keys"] = [str(e.name) for e in ir_node.keys]
+                        ir_meta["aggs"] = [str(e.name) for e in ir_node.agg_requests]
+                    elif isinstance(ir_node, Sort):
+                        import pylibcudf as plc
+                        ir_meta["by"] = [str(e.name) for e in ir_node.by]
+                        ir_meta["desc"] = [o == plc.types.Order.DESCENDING for o in ir_node.order]
+                    elif isinstance(ir_node, Filter):
+                        ir_meta["mask"] = str(ir_node.mask)
+                    if ir_meta:
+                        record["ir_meta"] = ir_meta
+                except Exception:
+                    pass
+            actor_records.append(record)
+
+    # Build actor_id -> record index for fast lookup.
+    aid_to_record: dict[int, dict] = {r["actor_instance_id"]: r for r in actor_records}
+
+    # Second pass: wire up input/output channel IDs using the channel map.
+    # For fanout IR nodes, channels[ir] holds the fanout actor's output manager
+    # (N slots to N consumers). The pre-fanout channel (primary→fanout) is saved
+    # in fanout_wiring. We emit both edges with correct actor IDs.
+    channel_records: list[dict] = []
+    _fw = fanout_wiring or {}
+
+    for ir_node, ch_manager in channels.items():
+        out_actor_ids = ir_to_actor_ids.get(ir_node, [])
+        if not out_actor_ids:
+            continue
+
+        primary_out_aid = out_actor_ids[0]
+        fw = _fw.get(id(ir_node))
+
+        if fw is not None and len(out_actor_ids) >= 2:
+            # Fanout case: wire primary→fanout (pre-fanout channel) and
+            # fanout→consumers (the N output slots now in ch_manager).
+            fanout_aid = out_actor_ids[1]
+
+            # primary → fanout edge
+            for ch in fw["pre_fanout_manager"]._channel_slots:
+                cid = registry.get(ch)
+                if cid is None:
+                    continue
+                if primary_out_aid in aid_to_record:
+                    aid_to_record[primary_out_aid]["output_channel_ids"].append(cid)
+                if fanout_aid in aid_to_record:
+                    aid_to_record[fanout_aid]["input_channel_ids"].append(cid)
+                channel_records.append(
+                    {
+                        "channel_id": cid,
+                        "source_actor_instance_id": primary_out_aid,
+                        "sink_actor_instance_id": fanout_aid,
+                        "is_metadata": False,
+                    }
+                )
+
+            # fanout → consumer edges (sinks resolved below)
+            for ch in ch_manager._channel_slots:
+                cid = registry.get(ch)
+                if cid is None:
+                    continue
+                if fanout_aid in aid_to_record:
+                    aid_to_record[fanout_aid]["output_channel_ids"].append(cid)
+                channel_records.append(
+                    {
+                        "channel_id": cid,
+                        "source_actor_instance_id": fanout_aid,
+                        "sink_actor_instance_id": None,  # resolved below
+                        "is_metadata": False,
+                    }
+                )
+        else:
+            # Normal case: channels belong to the primary actor.
+            for ch in ch_manager._channel_slots:
+                cid = registry.get(ch)
+                if cid is None:
+                    continue
+                if primary_out_aid in aid_to_record:
+                    aid_to_record[primary_out_aid]["output_channel_ids"].append(cid)
+                channel_records.append(
+                    {
+                        "channel_id": cid,
+                        "source_actor_instance_id": primary_out_aid,
+                        "sink_actor_instance_id": None,  # resolved below
+                        "is_metadata": False,
+                    }
+                )
+
+    # Resolve sink actor IDs: for each IR node, its children's output channels
+    # are its input channels. For fanout children, each parent claims exactly one
+    # slot (the slot it reserved, in visit order matching nodes_dict insertion order).
+    from collections import defaultdict as _defaultdict
+
+    cid_to_record: dict[int, dict] = {c["channel_id"]: c for c in channel_records}
+    child_claim_index: dict[int, int] = _defaultdict(int)
+
+    for ir_node, actor_list in nodes_dict.items():
+        if not hasattr(ir_node, "children"):
+            continue
+        for child_ir in ir_node.children:
+            if child_ir not in channels:
+                continue
+            ch_manager = channels[child_ir]
+            sink_actor_ids = ir_to_actor_ids.get(ir_node, [])
+            primary_sink_aid = sink_actor_ids[0] if sink_actor_ids else None
+
+            # Each parent gets exactly one output slot from the child's manager,
+            # in the order parents reserved slots (matching nodes_dict visit order).
+            slot_idx = child_claim_index[id(child_ir)]
+            child_claim_index[id(child_ir)] += 1
+
+            if slot_idx < len(ch_manager._channel_slots):
+                ch = ch_manager._channel_slots[slot_idx]
+                cid = registry.get(ch)
+                if cid is None:
+                    continue
+                if cid in cid_to_record and cid_to_record[cid]["sink_actor_instance_id"] is None:
+                    cid_to_record[cid]["sink_actor_instance_id"] = primary_sink_aid
+                if primary_sink_aid is not None and primary_sink_aid in aid_to_record:
+                    aid_to_record[primary_sink_aid]["input_channel_ids"].append(cid)
+
+    rank = 0
+    nranks = 1
+    if ir_context is not None and hasattr(ir_context, "query_id"):
+        try:
+            from rapidsmpf.communicator.communicator import Communicator  # type: ignore[import]
+        except ImportError:
+            pass
+
+    graph_event = ActorGraphEvent(
+        timestamp_ns=_time.monotonic_ns(),
+        query_id=buf.query_id,
+        actors=actor_records,
+        channels=channel_records,
+        rank=rank,
+        nranks=nranks,
+    )
+    buf.emit(graph_event)
+    write_graph_json(graph_event, buf.output_dir, buf.query_id)

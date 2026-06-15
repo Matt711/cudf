@@ -279,7 +279,7 @@ async def _broadcast_join_large_chunk(
     output_chunk = TableChunk.from_pylibcudf_table(
         df.table, df.stream, exclusive_view=True, br=context.br()
     )
-    await send_chunk(context, ch_out, output_chunk, seq_num, tracer=tracer)
+    await send_chunk(context, ch_out, output_chunk, seq_num, tracer=tracer, ir_context=ir_context)
     del df, large_df
 
 
@@ -313,8 +313,8 @@ async def _broadcast_join(
     broadcast_side = strategy.broadcast_side
     assert broadcast_side is not None
     left, right = ir.children
-    if tracer is not None:
-        tracer.decision = f"broadcast_{broadcast_side}"
+    from cudf_polars.streaming.actor_graph.tracing import record_scheduling_decision
+    record_scheduling_decision(tracer, f"broadcast_{broadcast_side}", ir_context)
 
     if broadcast_side == "right":
         small_ch, large_ch = ch_right, ch_left
@@ -479,6 +479,7 @@ async def _join_chunks(
             output_chunk,
             left_msg.sequence_number,
             tracer=tracer,
+            ir_context=ir_context,
         )
         del df
 
@@ -490,7 +491,10 @@ def _log_shuffle_strategy_decision(
     strategy: JoinStrategy,
     partitioning_left: NormalizedPartitioning,
     partitioning_right: NormalizedPartitioning,
+    ir_context: Any = None,
 ) -> None:
+    from cudf_polars.streaming.actor_graph.tracing import record_scheduling_decision
+
     left_scheme_desired = HashScheme(strategy.left_indices, strategy.shuffle_modulus)
     right_scheme_desired = HashScheme(strategy.right_indices, strategy.shuffle_modulus)
     left_partitioned = (
@@ -502,13 +506,13 @@ def _log_shuffle_strategy_decision(
         and partitioning_right.local_scheme == "inherit"
     )
     if left_partitioned and right_partitioned:
-        tracer.decision = "chunkwise"
+        record_scheduling_decision(tracer, "chunkwise", ir_context)
     elif left_partitioned:
-        tracer.decision = "shuffle_right"
+        record_scheduling_decision(tracer, "shuffle_right", ir_context)
     elif right_partitioned:
-        tracer.decision = "shuffle_left"
+        record_scheduling_decision(tracer, "shuffle_left", ir_context)
     else:
-        tracer.decision = "shuffle"
+        record_scheduling_decision(tracer, "shuffle", ir_context)
 
 
 async def passthrough_split(
@@ -726,8 +730,11 @@ async def _shuffle_join(
     left_rows, right_rows = row_counts
     bloom_tag = collective_ids.pop(0)
     if use_bloom_filter(ir.options[0], left_rows, right_rows, bloom_threshold):
-        if tracer is not None:
-            tracer.decision = f"{tracer.decision or 'shuffle'}_filtered"
+        from cudf_polars.streaming.actor_graph.tracing import record_scheduling_decision
+        record_scheduling_decision(
+            tracer, f"{tracer.decision or 'shuffle'}_filtered", ir_context,
+            left_rows=left_rows, right_rows=right_rows,
+        )
         ch_left, ch_right, filter_tasks, chs_to_shutdown = make_filter_tasks(
             context,
             comm,
@@ -887,11 +894,12 @@ async def _choose_strategy_from_samples(
     right_sample: TableSizeStats,
     chunkwise: bool,
     tracer: ActorTracer | None,
+    ir_context: Any = None,
 ) -> JoinStrategy:
     """Choose potential broadcast side and minimum shuffle modulus."""
     if chunkwise:
-        if tracer is not None:
-            tracer.decision = "chunkwise"
+        from cudf_polars.streaming.actor_graph.tracing import record_scheduling_decision
+        record_scheduling_decision(tracer, "chunkwise", ir_context)
         # TODO: Ensure this emits a "dynamic planning" decision of "chunkwise"
         # Or push it up a level to the caller?
         assert isinstance(left_partitioning.inter_rank_scheme, HashScheme)
@@ -991,6 +999,7 @@ async def _choose_strategy_from_samples(
             strategy,
             left_partitioning,
             right_partitioning,
+            ir_context=ir_context,
         )
     return strategy
 
@@ -1034,6 +1043,7 @@ async def _choose_strategy(
     collective_ids: list[int],
     *,
     tracer: ActorTracer | None,
+    ir_context: Any = None,
 ) -> tuple[TableSizeStats, TableSizeStats, JoinStrategy]:
     """Sample both sides, aggregate estimates, and choose broadcast vs shuffle."""
     nranks = comm.nranks
@@ -1095,6 +1105,7 @@ async def _choose_strategy(
         right_sample=right_sample,
         chunkwise=chunkwise,
         tracer=tracer,
+        ir_context=ir_context,
     )
 
     return left_sample, right_sample, strategy
@@ -1164,6 +1175,7 @@ async def join_actor(
             executor,
             collective_ids,
             tracer=tracer,
+            ir_context=ir_context,
         )
         ch_left_replay = context.create_channel()
         ch_right_replay = context.create_channel()

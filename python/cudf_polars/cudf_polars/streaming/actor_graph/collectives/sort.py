@@ -129,7 +129,7 @@ async def _simple_top_or_bottom_k(
             ir_context=ir_context,
         )
 
-    await send_chunk(context, ch_out, chunk, comm.rank, tracer=tracer)
+    await send_chunk(context, ch_out, chunk, comm.rank, tracer=tracer, ir_context=ir_context)
 
     await ch_out.drain(context)
 
@@ -448,7 +448,7 @@ async def _extract_partitions_and_send(
             chunk = TableChunk.from_pylibcudf_table(
                 table, stream, exclusive_view=True, br=context.br()
             )
-            await send_chunk(context, ch_out, chunk, partition_id, tracer=tracer)
+            await send_chunk(context, ch_out, chunk, partition_id, tracer=tracer, ir_context=ir_context)
 
     await ch_out.drain(context)
 
@@ -639,8 +639,8 @@ async def sort_actor(
             return
 
         if _is_already_sorted(metadata_in, _sort_to_order_keys(ir), comm.nranks):
-            if tracer is not None:
-                tracer.decision = "already_sorted"
+            from cudf_polars.streaming.actor_graph.tracing import record_scheduling_decision
+            record_scheduling_decision(tracer, "already_sorted", ir_context)
             await chunkwise_evaluate(
                 context,
                 ir,

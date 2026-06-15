@@ -418,7 +418,7 @@ async def _allgather_and_broadcast(
             ir_context,
             global_agg_per_row_size,
         )
-        await send_chunk(context, ch_out, result, msg.sequence_number, tracer=tracer)
+        await send_chunk(context, ch_out, result, msg.sequence_number, tracer=tracer, ir_context=ir_context)
 
     await ch_out.drain(context)
 
@@ -576,7 +576,7 @@ async def _reassemble_input_chunks(
                 exclusive_view=True,
                 br=context.br(),
             )
-        await send_chunk(context, ch_out, chunk, sequence_number, tracer=tracer)
+        await send_chunk(context, ch_out, chunk, sequence_number, tracer=tracer, ir_context=ir_context)
 
 
 async def _shuffle_and_reassemble(

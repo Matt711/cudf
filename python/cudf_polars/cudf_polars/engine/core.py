@@ -457,6 +457,31 @@ def execute_ir_on_rank(
     )
     metadata_collector: list[ChannelMetadata] = []
 
+    # Stream tracing: set up EventBuffer and ChannelRegistry before network
+    # construction so that ChannelManager.__init__ can register channels.
+    from cudf_polars.streaming.actor_graph.events import (
+        STREAM_TRACE_ENABLED,
+        STREAM_TRACE_DIR,
+        EventBuffer,
+        register_buffer,
+        set_active_buffer,
+        unregister_buffer,
+    )
+
+    _trace_buf: EventBuffer | None = None
+    if STREAM_TRACE_ENABLED:
+        from cudf_polars.streaming.actor_graph.channel_registry import (
+            create_registry,
+            destroy_registry,
+        )
+
+        _trace_buf = EventBuffer(str(query_id), STREAM_TRACE_DIR)
+        create_registry(str(query_id))
+        # Register in global dict so actors on the run_actor_network thread can find it.
+        register_buffer(_trace_buf)
+        # Also set thread-local so generate_network (on this thread) can find it.
+        set_active_buffer(_trace_buf)
+
     nodes, output = generate_network(
         ctx,
         comm,
@@ -484,6 +509,16 @@ def execute_ir_on_rank(
             raise MemoryError(hint) from e
         else:
             raise
+    finally:
+        # Stream tracing: flush buffer to disk and clean up registry.
+        if _trace_buf is not None:
+            try:
+                _trace_buf.flush()
+            except Exception:  # never let tracing failures abort a query
+                pass
+            set_active_buffer(None)
+            unregister_buffer(str(query_id))
+            destroy_registry(str(query_id))
 
     messages = output.release()
     chunks = [
