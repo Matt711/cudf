@@ -504,5 +504,5 @@ def pytest_collection_modifyitems(
             is not None
         ):
             item.add_marker(pytest.mark.xfail(reason=s_reason))
-        elif (reason := EXPECTED_FAILURES.get(item.nodeid, None)) is not None:
+        elif (reason := EXPECTED_FAILURES.get(item.nodeid)) is not None:
             item.add_marker(pytest.mark.xfail(reason=reason))
