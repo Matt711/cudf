@@ -215,7 +215,7 @@ def resolve_kvikio_nthreads(executor_options: dict[str, Any]) -> int:
 
 
 def configure_kvikio(nthreads: int) -> None:
-    """Configure the process-wide kvikio thread pool and remote I/O backend."""
+    """Set the remote I/O backend to ``EASY_THREADPOOL`` with ``nthreads`` threads."""
     kvikio.defaults.set(
         {
             "num_threads": nthreads,
@@ -752,8 +752,9 @@ class StreamingExecutor:
         Maximum number of workers for the Python ThreadPoolExecutor.
         Default is 8.
     kvikio_nthreads
-        Number of threads in the kvikio thread pool. Defaults to 256, which is
-        tuned for cloud object-store IO. This can be set via
+        Number of threads in the kvikio ``EASY_THREADPOOL`` thread pool.
+        Defaults to 256, which is tuned for cloud object-store IO. This can be
+        set via
 
         - ``executor_options`` passed to ``polars.GPUEngine``
         - the ``CUDF_POLARS__EXECUTOR__KVIKIO_NTHREADS`` environment variable
