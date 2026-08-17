@@ -7,7 +7,12 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+try:  # pragma: no cover; kvikio is optional
+    import kvikio
+except ImportError:
+    kvikio = None
 
 import pylibcudf as plc
 
@@ -52,6 +57,7 @@ class CachedParquetInfo:
     _hybrid_scan_metadata: list[plc.io.experimental.HybridScanMetadata] = field(
         default_factory=list, compare=False, repr=False
     )
+    _remote_handle: list[Any] = field(default_factory=list, compare=False, repr=False)
 
     def hybrid_scan_reader(  # pragma: no cover; only called from thread pool workers where coverage.py does not trace
         self,
@@ -67,6 +73,19 @@ class CachedParquetInfo:
         return plc.io.experimental.HybridScanReader.from_metadata(
             self._hybrid_scan_metadata[0]
         )
+
+    def remote_handle(self) -> Any:  # pragma: no cover; requires kvikio
+        """Return the kvikio handle for this file."""
+        if not self._remote_handle:
+            if kvikio is None:
+                raise ImportError("kvikio is required for hybrid scan prefetching")
+            if plc.io.SourceInfo._is_remote_uri(self.path):
+                self._remote_handle.append(
+                    kvikio.RemoteFile.open(self.path, nbytes=self.size)
+                )
+            else:
+                self._remote_handle.append(kvikio.CuFile(self.path))
+        return self._remote_handle[0]
 
 
 @nvtx_annotate_cudf_polars(message="fetch_parquet_footers_for_paths")
@@ -93,15 +112,10 @@ def _prefetch_parquet_footers_for_paths(paths: list[str]) -> list[CachedParquetI
     # For now, we'll just use kvikio to explicitly get the size.
     sizes: list[int | None] = []
 
-    try:  # pragma: no cover; kvikio is optional
-        import kvikio
-    except ImportError:
-        kvikio = None
-
     for path in paths:
-        if (
-            paths and kvikio is not None and plc.io.SourceInfo._is_remote_uri(path)
-        ):  # pragma: no cover; kvikio is optional
+        if kvikio is not None and plc.io.SourceInfo._is_remote_uri(
+            path
+        ):  # pragma: no cover
             # We're OK to use `kvikio.RemoteFile.open` here. It does make an HTTP HEAD
             # request for S3/HTTP endpoints, but that's the entire reason we're running
             # this code. So long as it makes just *one* HTTP request, there's no advantage
@@ -137,6 +151,11 @@ def _prefetch_parquet_footers_for_paths(paths: list[str]) -> list[CachedParquetI
                 info.file_metadata, options
             )
         )
+    if kvikio is not None:  # pragma: no cover; requires kvikio
+        # Open kvikio handles eagerly on the main thread before any prefetch workers
+        # start, so all splits sharing a file get the same handle without races.
+        for info in infos:
+            info.remote_handle()
     return infos
 
 

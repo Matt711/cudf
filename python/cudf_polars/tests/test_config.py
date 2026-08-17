@@ -325,6 +325,7 @@ def test_validate_cluster() -> None:
         "broadcast_limit",
         "sink_to_directory",
         "client_device_threshold",
+        "num_prefetch_workers",
         "max_concurrent_io_tasks",
         "num_py_executors",
     ],

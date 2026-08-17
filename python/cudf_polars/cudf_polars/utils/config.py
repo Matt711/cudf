@@ -747,6 +747,9 @@ class StreamingExecutor:
 
         - ``executor_options`` passed to ``polars.GPUEngine``
         - the ``CUDF_POLARS__EXECUTOR__MAX_CONCURRENT_IO_TASKS`` environment variable
+    num_prefetch_workers
+        Number of prefetch worker threads for the hybrid scan prefetch pipeline.
+        Default is 2. Set to ``None`` to use one worker per split.
     num_py_executors
         Maximum number of workers for the Python ThreadPoolExecutor.
         Default is 8.
@@ -814,6 +817,11 @@ class StreamingExecutor:
     max_concurrent_io_tasks: int = dataclasses.field(
         default_factory=_make_default_factory(
             f"{_env_prefix}__MAX_CONCURRENT_IO_TASKS", int, default=2
+        )
+    )
+    num_prefetch_workers: int | None = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__NUM_PREFETCH_WORKERS", int, default=2
         )
     )
     num_py_executors: int = dataclasses.field(
@@ -903,6 +911,10 @@ class StreamingExecutor:
             raise TypeError("client_device_threshold must be a float")
         if not isinstance(self.max_concurrent_io_tasks, int):
             raise TypeError("max_concurrent_io_tasks must be an int")
+        if self.num_prefetch_workers is not None and not isinstance(
+            self.num_prefetch_workers, int
+        ):
+            raise TypeError("num_prefetch_workers must be an int or None")
         if not isinstance(self.num_py_executors, int):
             raise TypeError("num_py_executors must be an int")
 
