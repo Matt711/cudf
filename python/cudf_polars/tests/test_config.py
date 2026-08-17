@@ -36,6 +36,7 @@ from cudf_polars.utils.config import (
     ParquetOptions,
     StreamingExecutor,
     Unspecified,
+    configure_kvikio,
 )
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 
@@ -907,6 +908,18 @@ def test_kvikio_nthreads_cudf_polars_env_takes_precedence(
         m.setenv("KVIKIO_NTHREADS", "32")
         config = ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
         assert config.executor.kvikio_nthreads == 64
+
+
+def test_configure_kvikio_sets_backend_and_threads() -> None:
+    import kvikio
+    import kvikio.defaults
+
+    configure_kvikio(42)
+    assert kvikio.defaults.get("num_threads") == 42
+    assert (
+        kvikio.defaults.get("remote_io_backend")
+        == kvikio.RemoteIOBackend.EASY_THREADPOOL
+    )
 
 
 def test_dask_sink_to_directory_false_raises() -> None:

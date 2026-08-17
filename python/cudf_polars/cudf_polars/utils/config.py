@@ -29,6 +29,9 @@ import json
 import os
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
+import kvikio
+import kvikio.defaults
+
 if TYPE_CHECKING:
     import uuid
     from collections.abc import Callable
@@ -208,6 +211,16 @@ def resolve_kvikio_nthreads(executor_options: dict[str, Any]) -> int:
                 os.environ.get("KVIKIO_NTHREADS", "256"),
             ),
         )
+    )
+
+
+def configure_kvikio(nthreads: int) -> None:
+    """Configure the process-wide kvikio thread pool and remote I/O backend."""
+    kvikio.defaults.set(
+        {
+            "num_threads": nthreads,
+            "remote_io_backend": kvikio.RemoteIOBackend.EASY_THREADPOOL,
+        }
     )
 
 
