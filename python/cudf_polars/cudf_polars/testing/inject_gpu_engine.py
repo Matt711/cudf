@@ -353,7 +353,7 @@ TESTS_TO_SKIP: dict[str, str] = {
 
 
 if packaging.version.parse(numpy.__version__) >= packaging.version.parse("2.5.0"):
-    # TODO: remove once cudf-polars depends on polars>=1.44.
+    # TODO: remove once cudf-polars supports polars==1.44
     EXPECTED_FAILURES.update(
         {
             "tests/unit/constructors/test_series.py::test_series_init_np_temporal_with_nat_15518": "DeprecationWarning from Numpy: https://github.com/pola-rs/polars/pull/28782",
