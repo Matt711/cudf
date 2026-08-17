@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 import kvikio
 import kvikio.defaults
 
+import pylibcudf.io.kvikio
+
 if TYPE_CHECKING:
     import uuid
     from collections.abc import Callable
@@ -216,6 +218,13 @@ def resolve_kvikio_nthreads(executor_options: dict[str, Any]) -> int:
 
 def configure_kvikio(nthreads: int) -> None:
     """Set the remote I/O backend to ``EASY_THREADPOOL`` with ``nthreads`` threads."""
+    # HACK: cudf calls set_up_kvikio() lazily on the first IO operation via std::call_once.
+    # That call reads KVIKIO_NTHREADS from the environment and resets the thread pool,
+    # undoing anything we set via kvikio.defaults. Setting the env var here means
+    # set_up_kvikio() will size the pool correctly when it fires, and calling it eagerly
+    # satisfies the once-flag so it becomes a no-op on the first IO.
+    os.environ["KVIKIO_NTHREADS"] = str(nthreads)
+    pylibcudf.io.kvikio.set_up_kvikio()
     kvikio.defaults.set(
         {
             "num_threads": nthreads,

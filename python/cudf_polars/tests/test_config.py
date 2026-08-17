@@ -910,10 +910,13 @@ def test_kvikio_nthreads_cudf_polars_env_takes_precedence(
         assert config.executor.kvikio_nthreads == 64
 
 
-def test_configure_kvikio_sets_backend_and_threads() -> None:
+def test_configure_kvikio_sets_backend_and_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import kvikio
     import kvikio.defaults
 
+    monkeypatch.delenv("KVIKIO_NTHREADS", raising=False)
     configure_kvikio(42)
     assert kvikio.defaults.get("num_threads") == 42
     assert (
