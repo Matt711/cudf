@@ -9,6 +9,7 @@ import sqlite3
 from functools import partialmethod
 from typing import TYPE_CHECKING
 
+import numpy
 import packaging.version
 import pytest
 
@@ -136,8 +137,7 @@ def pytest_report_header(config: pytest.Config) -> str:
     return f"injected GPU engine: {cls.__module__}.{cls.__name__}"
 
 
-EXPECTED_FAILURES: Mapping[str, str] = {
-    "tests/unit/constructors/test_series.py::test_series_init_np_temporal_with_nat_15518": "DeprecationWarning from Numpy: https://github.com/pola-rs/polars/pull/28782",
+EXPECTED_FAILURES: dict[str, str] = {
     "tests/unit/io/test_csv.py::test_read_csv_only_loads_selected_columns": "Memory usage won't be correct due to GPU",
     "tests/unit/io/test_delta.py::test_scan_delta_version": "Need to expose hive partitioning",
     "tests/unit/io/test_delta.py::test_scan_delta_relative": "Need to expose hive partitioning",
@@ -350,6 +350,15 @@ TESTS_TO_SKIP: dict[str, str] = {
     "tests/unit/lazyframe/test_predicates.py::test_hconcat_predicate": "polars 1.42: test uses deprecated how='horizontal' with strict=True in ways that behave differently across GPU engines",
     "tests/unit/functions/test_union.py::test_union_lazyframe_horizontal": "polars 1.42: test uses deprecated how='horizontal' with strict=True in ways that behave differently across GPU engines",
 }
+
+
+if packaging.version.parse(numpy.__version__) >= packaging.version.parse("2.5.0"):
+    # TODO: remove once cudf-polars depends on polars>=1.44.
+    EXPECTED_FAILURES.update(
+        {
+            "tests/unit/constructors/test_series.py::test_series_init_np_temporal_with_nat_15518": "DeprecationWarning from Numpy: https://github.com/pola-rs/polars/pull/28782",
+        }
+    )
 
 
 if packaging.version.parse(sqlite3.sqlite_version) <= packaging.version.parse("3.44.0"):
