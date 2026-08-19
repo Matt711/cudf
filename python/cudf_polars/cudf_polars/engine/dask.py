@@ -374,7 +374,6 @@ def _setup_worker(
 
     """
     assert dask_worker is not None
-    configure_kvikio(kvikio_nthreads)
     options = Options.deserialize(rapidsmpf_options_as_bytes)
     attr = f"_cudf_polars_mp_context_{uid}"
     mp_ctx: _WorkerContext | None = getattr(dask_worker, attr, None)
@@ -382,6 +381,7 @@ def _setup_worker(
     if mp_ctx is None:
         # Non-root worker: create communicator now.
         bind_to_gpu(hardware_binding)
+        configure_kvikio(kvikio_nthreads)
         memory_resource_config = (
             memory_resource_config or MemoryResourceConfig.default()
         )
@@ -402,6 +402,7 @@ def _setup_worker(
         base_mr = mp_ctx.base_mr
         comm = mp_ctx.comm
         statistics = mp_ctx.statistics
+        configure_kvikio(kvikio_nthreads)
 
     barrier(comm)
     worker_id = worker_ids[comm.rank]
