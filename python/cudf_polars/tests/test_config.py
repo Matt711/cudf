@@ -417,6 +417,19 @@ def test_prefetch_file_metadata_boolean_env_var(
         assert config.parquet_options.prefetch_file_metadata == expected
 
 
+def test_prefetch_file_metadata_invalid_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as m:
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_FILE_METADATA", "foo")
+        engine = pl.GPUEngine(executor="streaming")
+        with pytest.raises(
+            ValueError,
+            match="Invalid value for prefetch_file_metadata: 'foo'",
+        ):
+            ConfigOptions.from_polars_engine(engine)
+
+
 def test_config_option_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     with monkeypatch.context() as m:
         m.setenv("CUDF_POLARS__EXECUTOR__CLUSTER", "default_singleton")
