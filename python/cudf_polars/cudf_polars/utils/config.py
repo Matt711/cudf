@@ -363,7 +363,7 @@ class ParquetOptions:
             raise TypeError("max_row_group_samples must be an int")
         if self.prefetch_file_metadata not in {"remote_only", "always", "never"}:
             raise TypeError(
-                "prefetch_file_metadata must be one of 'auto', 'always', 'never'"
+                "prefetch_file_metadata must be one of 'remote_only', 'always', 'never'"
             )
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
