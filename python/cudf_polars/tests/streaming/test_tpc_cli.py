@@ -73,3 +73,4 @@ def test_tpcds_cli_parse(query_id: int, tmp_path: Path) -> None:
     assert run_config.iterations == 2
     assert run_config.qualification
     assert run_config.frontend == "spmd"
+    assert run_config.io_mode == "lukewarm"

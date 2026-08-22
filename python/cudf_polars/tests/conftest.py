@@ -347,7 +347,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 @pytest.fixture(scope="session")
 def tpc_iterations(request: pytest.FixtureRequest) -> int:
-    return request.config.getoption("--iterations")
+    iterations = request.config.getoption("--iterations")
+    if iterations < 1:
+        raise pytest.UsageError("--iterations must be >= 1")
+    return iterations
 
 
 def pytest_configure(config: pytest.Config):

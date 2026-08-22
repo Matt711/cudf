@@ -13,6 +13,7 @@ from cudf_polars.engine.spmd import SPMDEngine
 from cudf_polars.streaming.benchmarks.pdsds import PDSDSPolarsQueries
 from cudf_polars.streaming.benchmarks.pdsh import PDSHQueries
 from cudf_polars.streaming.benchmarks.utils import (
+    POLARS_VALIDATION_OPTIONS,
     RunOptions,
     ValidationMethod,
     _add_dataset_args,
@@ -98,8 +99,6 @@ def tpc_run_options(request: pytest.FixtureRequest) -> RunOptions:
 
 @pytest.fixture(scope="session")
 def tpc_validation_method(tpc_run_options: RunOptions) -> ValidationMethod:
-    from cudf_polars.streaming.benchmarks.utils import POLARS_VALIDATION_OPTIONS
-
     return ValidationMethod(
         expected_source="duckdb",
         comparison_method="polars",

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -48,19 +49,20 @@ EXPECTED_WARNINGS: dict[int, str] = {
 def tpcds_data_dir(
     request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
 ) -> str:
-    path = request.config.getoption("path")
+    path = request.config.getoption("path") or os.environ.get("TPCDS_DATA_DIR")
     if path is not None:
         return path
     scale = request.config.getoption("scale") or 1.0
     data_dir = tmp_path_factory.mktemp("tpcds")
-    conn = duckdb.connect()
-    conn.execute("INSTALL tpcds")
-    conn.execute("LOAD tpcds")
-    conn.execute("CALL dsdgen(sf=$1)", [scale])
-    for table in conn.execute("SHOW TABLES").df()["name"]:
-        conn.execute(
-            f"COPY {table} TO $1 (FORMAT PARQUET)", [f"{data_dir}/{table}.parquet"]
-        )
+    with duckdb.connect() as conn:
+        conn.execute("INSTALL tpcds")
+        conn.execute("LOAD tpcds")
+        conn.execute("CALL dsdgen(sf=$1)", [scale])
+        for table in conn.execute("SHOW TABLES").df()["name"]:
+            conn.execute(
+                f"COPY {table} TO $1 (FORMAT PARQUET)",
+                [f"{data_dir}/{table}.parquet"],
+            )
     return str(data_dir)
 
 
@@ -73,7 +75,7 @@ def tpcds_run_config(
 ) -> RunConfig:
     return RunConfig(
         engine_name="cudf-polars",
-        queries=list(range(1, 100)),
+        queries=list(range(1, PDSDSPolarsQueries.num_queries + 1)),
         query_set="pdsds",
         dataset_path=Path(tpcds_data_dir),
         scale_factor=request.config.getoption("scale") or 1.0,
@@ -139,6 +141,11 @@ def test_tpcds_query(
         record = qr.query_records[0]
         if isinstance(record, FailedRecord):
             raise RuntimeError(record.traceback)
+        if (
+            record.validation_result is not None
+            and record.validation_result.status == "Failed"
+        ):
+            raise RuntimeError(record.validation_result.message or "Validation failed")
     else:
         for record in qr.query_records:
             with subtests.test(msg=f"iter{record.iteration}"):

@@ -43,17 +43,23 @@ def tpch_data_dir(
     if path is not None:
         return path
     data_dir = tmp_path_factory.mktemp("tpch")
-    subprocess.run(
-        [
-            "tpchgen-cli",
-            "parquet",
-            "-s",
-            str(request.config.getoption("scale") or 1.0),
-            "--parts=4",
-            f"--output-dir={data_dir}",
-        ],
-        check=True,
-    )
+    try:
+        subprocess.run(
+            [
+                "tpchgen-cli",
+                "parquet",
+                "-s",
+                str(request.config.getoption("scale") or 1.0),
+                "--parts=4",
+                f"--output-dir={data_dir}",
+            ],
+            check=True,
+            timeout=1800,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "tpchgen-cli is not installed. Install it to generate TPC-H test data."
+        ) from e
     return str(data_dir)
 
 
@@ -66,7 +72,7 @@ def tpch_run_config(
 ) -> RunConfig:
     return RunConfig(
         engine_name="cudf-polars",
-        queries=list(range(1, 23)),
+        queries=list(range(1, PDSHQueries.num_queries + 1)),
         query_set="pdsh",
         dataset_path=Path(tpch_data_dir),
         scale_factor=request.config.getoption("scale") or 1.0,
@@ -131,6 +137,11 @@ def test_tpch_query(
         record = qr.query_records[0]
         if isinstance(record, FailedRecord):
             raise RuntimeError(record.traceback)
+        if (
+            record.validation_result is not None
+            and record.validation_result.status == "Failed"
+        ):
+            raise RuntimeError(record.validation_result.message or "Validation failed")
     else:
         for record in qr.query_records:
             with subtests.test(msg=f"iter{record.iteration}"):

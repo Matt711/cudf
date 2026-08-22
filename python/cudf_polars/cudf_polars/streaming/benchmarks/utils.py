@@ -2099,12 +2099,12 @@ def build_parser(num_queries: int = 22) -> argparse.ArgumentParser:
     parser.add_argument(
         "query",
         type=_query_type(num_queries),
-        help=textwrap.dedent("""\
+        help=textwrap.dedent(f"""\
             Query to run. One of the following:
             - A single number (e.g. 11)
             - A comma-separated list of query numbers (e.g. 1,3,7)
             - A range of query numbers (e.g. 1-11,23-34)
-            - The string 'all' to run all queries (1 through 22)"""),
+            - The string 'all' to run all queries (1 through {num_queries})"""),
     )
     _add_dataset_args(parser)
     parser.add_argument(
