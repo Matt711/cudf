@@ -168,6 +168,8 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
                 & (pl.col("ca_gmt_offset") == gmt_offset)
             )
             .group_by("i_item_id")
+            # Polars sum() returns 0 for all-null groups; SQL returns NULL.
+            # See https://github.com/NVIDIA/cudf/issues/19560.
             .agg(sql_sum(pl.col(str(ch["ext_col"]))).alias("total_sales"))
             .select(["i_item_id", "total_sales"])
         )
@@ -180,6 +182,8 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
         frame=(
             pl.concat(per_channel)
             .group_by("i_item_id")
+            # Polars sum() returns 0 for all-null groups; SQL returns NULL.
+            # See https://github.com/NVIDIA/cudf/issues/19560.
             .agg(sql_sum("total_sales").alias("total_sales"))
             .select(["i_item_id", "total_sales"])
             .sort(sort_by.keys(), nulls_last=True)

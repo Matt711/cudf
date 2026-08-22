@@ -363,6 +363,8 @@ def polars_impl(run_config: RunConfig) -> QueryResult:
             .agg(
                 [
                     pl.len().alias("cnt"),
+                    # Polars sum() returns 0 for all-null groups; SQL returns NULL.
+                    # See https://github.com/NVIDIA/cudf/issues/19560.
                     sql_sum("ss_wholesale_cost").alias("s1"),
                     sql_sum("ss_list_price").alias("s2"),
                     sql_sum("ss_coupon_amt").alias("s3"),

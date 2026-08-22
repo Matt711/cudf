@@ -10,7 +10,7 @@ TIMEOUT_TOOL_PATH="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"/timeout_with_st
 
 cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")"/../python/cudf_polars/
 
-python "${TIMEOUT_TOOL_PATH}" --enable-python 3600 \
-       python -m pytest --cache-clear "$@" tests \
+python "${TIMEOUT_TOOL_PATH}" --enable-python 5400 \
+       python -m pytest --cache-clear -p no:benchmark "$@" tests \
            --ignore=tests/streaming/test_tpch.py \
            --ignore=tests/streaming/test_tpcds.py

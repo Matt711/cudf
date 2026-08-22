@@ -113,9 +113,12 @@ def test_tpch_query(
         else contextlib.nullcontext()
     )
 
+    query_result = getattr(PDSHQueries, f"q{q_id}")(tpch_run_config)
+
     with ctx:
         qr = run_polars_query(
             q_id=q_id,
+            query_result=query_result,
             benchmark=PDSHQueries,
             run_config=tpch_run_config,
             run_options=tpc_run_options,

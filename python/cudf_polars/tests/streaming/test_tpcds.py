@@ -121,9 +121,12 @@ def test_tpcds_query(
         else contextlib.nullcontext()
     )
 
+    query_result = getattr(PDSDSPolarsQueries, f"q{q_id}")(tpcds_run_config)
+
     with ctx:
         qr = run_polars_query(
             q_id=q_id,
+            query_result=query_result,
             benchmark=PDSDSPolarsQueries,
             run_config=tpcds_run_config,
             run_options=tpc_run_options,
