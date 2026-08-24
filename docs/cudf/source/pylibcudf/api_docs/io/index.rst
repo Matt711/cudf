@@ -17,10 +17,12 @@ I/O Functions
 
     avro
     csv
+    experimental
     json
     kvikio
     orc
     parquet
+    parquet_io_utils
     parquet_metadata
     text
     timezone
