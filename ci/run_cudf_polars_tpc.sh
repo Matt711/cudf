@@ -41,18 +41,6 @@ rapids-pip-retry install \
 rapids-logger "Check GPU usage"
 nvidia-smi
 
-rapids-logger "Generating TPC-H data at SF=1"
-
-export TPCH_DATA_DIR
-TPCH_DATA_DIR=$(mktemp -d)
-python3 "$(dirname "$0")/generate_tpch_data.py" --scale 1 --output-dir "${TPCH_DATA_DIR}"
-
-rapids-logger "Generating TPC-DS data at SF=1"
-
-export TPCDS_DATA_DIR
-TPCDS_DATA_DIR=$(mktemp -d)
-python3 "$(dirname "$0")/generate_tpcds_data.py" --scale 1 --output-dir "${TPCDS_DATA_DIR}"
-
 rapids-logger "Running TPC-H and TPC-DS validation tests"
 
 cd python/cudf_polars
