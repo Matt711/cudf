@@ -219,12 +219,11 @@ def resolve_kvikio_nthreads(executor_options: dict[str, Any]) -> int:
 def configure_kvikio(nthreads: int) -> None:
     """Set the remote I/O backend to ``EASY_THREADPOOL`` with ``nthreads`` threads."""
     # HACK: libcudf calls set_up_kvikio() on the first IO op and that resets the thread
-    # pool by reading KVIKIO_NTHREADS (default is 4 if unset), undoing anything we set
-    # via kvikio.defaults. We set KVIKIO_NTHREADS first so it picks up the right size,
-    # then call it here so later when it's called in libcudf it's a no-op. The explicit
-    # kvikio.defaults.set below handles subsequent calls (call_once only fires once).
-    os.environ["KVIKIO_NTHREADS"] = str(nthreads)
-    pylibcudf.io.kvikio.set_up_kvikio()
+    # pool (default is 4 if KVIKIO_NTHREADS is unset), undoing anything we set via
+    # kvikio.defaults. We call it here with our nthreads so later when it's called in
+    # libcudf it's a no-op. The explicit kvikio.defaults.set below handles subsequent
+    # calls to configure_kvikio (call_once only fires once).
+    pylibcudf.io.kvikio.set_up_kvikio(nthreads)
     kvikio.defaults.set(
         {
             "num_threads": nthreads,
