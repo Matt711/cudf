@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 import kvikio
 import kvikio.defaults
 
-import pylibcudf.io.kvikio
+import pylibcudf.utils
 
 if TYPE_CHECKING:
     import uuid
@@ -223,7 +223,7 @@ def configure_kvikio(nthreads: int) -> None:
     # kvikio.defaults. We call it here with our nthreads so later when it's called in
     # libcudf it's a no-op. The explicit kvikio.defaults.set below handles subsequent
     # calls to configure_kvikio (call_once only fires once).
-    pylibcudf.io.kvikio.set_up_kvikio(nthreads)
+    pylibcudf.utils._set_up_kvikio(nthreads)
     kvikio.defaults.set(
         {
             "num_threads": nthreads,

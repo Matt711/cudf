@@ -7,7 +7,6 @@ from . import (
     datasource,
     experimental,
     json,
-    kvikio,
     orc,
     parquet,
     parquet_io_utils,

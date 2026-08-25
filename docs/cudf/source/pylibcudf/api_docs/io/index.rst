@@ -19,7 +19,6 @@ I/O Functions
     csv
     experimental
     json
-    kvikio
     orc
     parquet
     parquet_io_utils
