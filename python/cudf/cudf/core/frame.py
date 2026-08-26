@@ -716,24 +716,25 @@ class Frame(BinaryOperand, Scannable, Serializable):
             if ncol == 1:
                 to_dtype = next(self._dtypes)[1]
                 if (na_value is no_default or na_value is None) and (
+                    module is np
+                    and is_pandas_nullable_extension_dtype(to_dtype)
+                    and getattr(to_dtype, "kind", None) in ("i", "u", "f")
+                    and self._columns[0].has_nulls()
+                    and pd.options.future.distinguish_nan_and_na
+                ):
+                    to_dtype = np.dtype(object)
+                elif (na_value is no_default or na_value is None) and (
                     getattr(to_dtype, "kind", None) in ("i", "u")
                     and self._columns[0].has_nulls()
                 ):
-                    if (
-                        module is np
-                        and is_pandas_nullable_extension_dtype(to_dtype)
-                        and pd.options.future.distinguish_nan_and_na
-                    ):
-                        to_dtype = np.dtype(object)
-                    else:
-                        # A single nullable integer column must be promoted to
-                        # float64 so its nulls can be represented as NaN, matching
-                        # Series.to_numpy()/.values and the multi-column path
-                        # below. ``na_value`` is left unset (``no_default`` for
-                        # ``to_numpy`` / ``None`` for ``to_cupy``), so the nulls
-                        # are not being filled and the integer output buffer would
-                        # otherwise store the null sentinel instead.
-                        to_dtype = np.dtype("float64")
+                    # A single nullable integer column must be promoted to
+                    # float64 so its nulls can be represented as NaN, matching
+                    # Series.to_numpy()/.values and the multi-column path
+                    # below. ``na_value`` is left unset (``no_default`` for
+                    # ``to_numpy`` / ``None`` for ``to_cupy``), so the nulls
+                    # are not being filled and the integer output buffer would
+                    # otherwise store the null sentinel instead.
+                    to_dtype = np.dtype("float64")
             else:
                 column_dtypes = [dtype for _, dtype in self._dtypes]
                 if (
