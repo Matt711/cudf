@@ -35,7 +35,7 @@ from cudf.core.dtype.validators import (
 )
 from cudf.core.mixins import BinaryOperand, Scannable
 from cudf.utils.dtypes import (
-    _is_pandas_object_dtype_mix,
+    _is_dtypes_object_mixed_with_bool_with_numeric_or_datetime_with_timedelta,
     dtype_from_pylibcudf_column,
     find_common_type,
     is_pandas_nullable_extension_dtype,
@@ -724,7 +724,9 @@ class Frame(BinaryOperand, Scannable, Serializable):
                 if (
                     module is not cupy
                     and cudf.get_option("mode.pandas_compatible")
-                    and _is_pandas_object_dtype_mix(column_dtypes)
+                    and _is_dtypes_object_mixed_with_bool_with_numeric_or_datetime_with_timedelta(
+                        column_dtypes
+                    )
                 ):
                     # pandas coerces bool+numeric and datetime64+timedelta64
                     # mixes to `object` rather than promoting them; match

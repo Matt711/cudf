@@ -304,7 +304,9 @@ def _get_nan_for_dtype(dtype: DtypeObj) -> ScalarLike:
         return np.float64("nan")
 
 
-def _is_pandas_object_dtype_mix(dtypes: Iterable[DtypeObj]) -> bool:
+def _is_dtypes_object_mixed_with_bool_with_numeric_or_datetime_with_timedelta(
+    dtypes: Iterable[DtypeObj],
+) -> bool:
     """
     Whether ``dtypes`` mixes bool with numeric, or datetime64 with
     timedelta64. Pandas coerces these combinations to ``object`` rather
@@ -410,7 +412,12 @@ def find_common_type(dtypes: Iterable[DtypeObj]) -> DtypeObj:
             "not supported"
         )
 
-    if pandas_compatible and _is_pandas_object_dtype_mix(dtypes):
+    if (
+        pandas_compatible
+        and _is_dtypes_object_mixed_with_bool_with_numeric_or_datetime_with_timedelta(
+            dtypes
+        )
+    ):
         # cudf follows NumPy promotion: bool+int->int, bool+float->float,
         # datetime64+timedelta64->datetime64. Pandas returns `object` for
         # these mixes. Raise so that, when used as the cudf.pandas fast path
