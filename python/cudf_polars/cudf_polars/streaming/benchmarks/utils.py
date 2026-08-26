@@ -576,6 +576,7 @@ class RunConfig:
 
     # Run parameters
     iterations: int
+    sleep_between_iterations: float = 0
     io_mode: Literal["cold", "lukewarm", "hot"] = "lukewarm"
     collect_traces: bool = False
     # All streaming/rapidsmpf/engine knobs
@@ -723,6 +724,7 @@ class RunConfig:
             qualification=args.qualification,
             frontend=args.frontend,
             iterations=args.iterations,
+            sleep_between_iterations=args.sleep_between_iterations,
             io_mode=args.io_mode,
             collect_traces=args.collect_traces,
             streaming_options=streaming_options,
@@ -1183,6 +1185,14 @@ def run_polars_query(
     record: SuccessRecord | FailedRecord
 
     for i in range(run_config.iterations):
+        if i > 0 and run_config.sleep_between_iterations > 0:
+            print(
+                f"==> Sleeping {run_config.sleep_between_iterations} seconds "
+                "between iterations",
+                flush=True,
+            )
+            time.sleep(run_config.sleep_between_iterations)
+
         if _HAS_STRUCTLOG and run_config.collect_traces:
             setup_logging(q_id, i)
             if isinstance(engine, StreamingEngine):
@@ -2211,6 +2221,25 @@ def build_parser(num_queries: int = 22) -> argparse.ArgumentParser:
         default=1,
         type=int,
         help="Number of times to run the same query.",
+    )
+    parser.add_argument(
+        "--sleep-between-iterations",
+        default=0,
+        type=float,
+        dest="sleep_between_iterations",
+        metavar="SECONDS",
+        help="Sleep this many seconds between iterations (default: 0).",
+    )
+    parser.add_argument(
+        "--io-mode",
+        dest="io_mode",
+        default="lukewarm",
+        choices=["cold", "lukewarm", "hot"],
+        help=textwrap.dedent("""\
+            Cache state control for each timed iteration:
+                - cold     : Drop Linux page cache before each iteration (requires kvikio)
+                - lukewarm : No cache manipulation; OS cache state unchanged (default)
+                - hot      : One untimed warmup iteration to populate cache before measured runs"""),
     )
     parser.add_argument(
         "--collect-traces",
