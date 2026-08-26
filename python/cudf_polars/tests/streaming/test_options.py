@@ -143,7 +143,10 @@ def test_rapidsmpf_options_unspecified_fields_absent() -> None:
         k: os.environ.pop(k) for k in list(os.environ) if k.startswith("RAPIDSMPF_")
     }
     try:
-        assert StreamingOptions().to_rapidsmpf_options().get_strings() == {}
+        assert StreamingOptions().to_rapidsmpf_options().get_strings() == {
+            "pinned_memory": "True",
+            "pinned_initial_pool_size": "0",
+        }
     finally:
         os.environ.update(env_backup)
 
@@ -385,14 +388,22 @@ def test_from_argparse_omitted_flag_still_picks_up_env_var(
 # ---------------------------------------------------------------------------
 
 
-def test_to_dict_empty_when_all_unspecified() -> None:
-    assert StreamingOptions().to_dict() == {}
+def test_to_dict_only_defaulted_fields_when_all_unspecified() -> None:
+    assert StreamingOptions().to_dict() == {
+        "pinned_memory": True,
+        "pinned_initial_pool_size": 0,
+    }
 
 
 def test_to_dict_contains_only_set_fields() -> None:
     opts = StreamingOptions(fallback_mode="silent", num_streaming_threads=4)
     d = opts.to_dict()
-    assert d == {"fallback_mode": "silent", "num_streaming_threads": 4}
+    assert d == {
+        "fallback_mode": "silent",
+        "num_streaming_threads": 4,
+        "pinned_memory": True,
+        "pinned_initial_pool_size": 0,
+    }
 
 
 def test_to_dict_roundtrip() -> None:
