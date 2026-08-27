@@ -589,6 +589,7 @@ def _reset_worker(
     configure_kvikio(
         kvikio_nthreads,
         remote_io_backend=kvikio_remote_io_backend,
+        task_size=kvikio_task_size,
         bounce_buffer_bytes=kvikio_bounce_buffer_bytes,
         reactor_count=kvikio_reactor_count,
         reactor_dispatch=kvikio_reactor_dispatch,

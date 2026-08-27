@@ -1283,6 +1283,14 @@ class StreamingExecutor:
             raise TypeError("kvikio_bounce_buffer_bytes must be an int")
         if self.kvikio_bounce_buffer_bytes <= 0:
             raise ValueError("kvikio_bounce_buffer_bytes must be positive")
+        if (
+            self.kvikio_remote_io_backend == kvikio.RemoteIOBackend.MULTI_POLL
+            and self.kvikio_bounce_buffer_bytes < self.kvikio_task_size
+        ):
+            raise ValueError(
+                "kvikio_bounce_buffer_bytes must be at least kvikio_task_size "
+                "for the MULTI_POLL backend"
+            )
         if not isinstance(self.kvikio_reactor_count, int):
             raise TypeError("kvikio_reactor_count must be an int")
         if self.kvikio_reactor_count <= 0:

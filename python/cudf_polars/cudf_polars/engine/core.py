@@ -288,16 +288,20 @@ class StreamingEngine(pl.GPUEngine):
 
     Creating an engine sets the kvikio remote I/O backend to
     ``kvikio.RemoteIOBackend.MULTI_POLL`` by default (see the
-    ``kvikio_remote_io_backend`` executor option). Because kvikio's configuration
-    is a global singleton, this overrides any prior ``kvikio.defaults.set(...)``
-    calls made in the process. When the backend is ``EASY_THREADPOOL``, engine
-    creation also configures kvikio's thread pool (default 256 threads), which
-    blocks any concurrent kvikio IO in the process until in-flight IO completes.
-    Use the ``kvikio_nthreads`` executor option or the ``KVIKIO_NTHREADS``
-    environment variable to control the thread count; this is ignored under
-    ``MULTI_POLL``, which uses the ``kvikio_reactor_count``,
-    ``kvikio_reactor_dispatch``, and ``kvikio_request_ceiling`` executor options
-    instead.
+    ``kvikio_remote_io_backend`` executor option), along with the
+    ``kvikio_task_size`` executor option (16 MiB under ``MULTI_POLL``, 64 MiB
+    under ``EASY_THREADPOOL``). Because kvikio's configuration is a global
+    singleton, this overrides any prior ``kvikio.defaults.set(...)`` calls made
+    in the process. When the backend is ``EASY_THREADPOOL``, engine creation
+    also configures kvikio's thread pool (default 256 threads), which blocks
+    any concurrent kvikio IO in the process until in-flight IO completes. Use
+    the ``kvikio_nthreads`` executor option or the ``KVIKIO_NTHREADS``
+    environment variable to control the thread count. Under ``MULTI_POLL``,
+    cudf-polars does not resolve a thread-pool size at all (kvikio itself may
+    still honor ``KVIKIO_NTHREADS`` via its own deferred default); remote I/O
+    concurrency is instead controlled by the ``kvikio_reactor_count``,
+    ``kvikio_reactor_dispatch``, and ``kvikio_request_ceiling`` executor
+    options.
 
     Parameters
     ----------
