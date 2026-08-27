@@ -170,7 +170,7 @@ def test_prefetch_skips_paths_cached_by_stats_collection(
     )
 
     scan = _make_parquet_scan(paths)
-    fused = FusedScan(scan.schema, scan, tuple(paths), scan.parquet_options, None)
+    fused = FusedScan(scan.schema, scan, paths, scan.parquet_options, None)
     streaming_scan = StreamingScan([fused], scan, "fused")
 
     result = prefetch_parquet_file_metadata_for_ir(

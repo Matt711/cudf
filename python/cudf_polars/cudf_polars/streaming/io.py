@@ -1038,9 +1038,14 @@ class ParquetSourceInfo:
 
         file_count = len(paths)
         per_file_means: dict[str, int] = {}
+        cached_parquet_info = (
+            list(metadata.cached_parquet_info)
+            if metadata.cached_parquet_info is not None
+            else None
+        )
 
         if not (file_count and row_count and needed_cols):
-            return cls(row_count, {})
+            return cls(row_count, {}, cached_parquet_info=cached_parquet_info)
 
         rows_per_file = max(1, row_count // file_count)
         schema_map = dict(schema)
@@ -1080,13 +1085,7 @@ class ParquetSourceInfo:
                     else max(footer_mean, decoded_floor)
                 )
 
-        return cls(
-            row_count,
-            per_file_means,
-            cached_parquet_info=list(metadata.cached_parquet_info)
-            if metadata.cached_parquet_info is not None
-            else None,
-        )
+        return cls(row_count, per_file_means, cached_parquet_info=cached_parquet_info)
 
     def column_storage_size(self, column: str) -> int | None:
         """Return the average storage size for a single column in one file."""

@@ -296,6 +296,26 @@ def test_parquet_source_info_stores_sampled_footers_when_partially_sampled(
     assert cached_paths <= set(paths)
 
 
+def test_parquet_source_info_preserves_footers_on_empty_needed_cols(
+    tmp_path: pathlib.Path,
+    df_and_schema: tuple[pl.DataFrame, Schema],
+) -> None:
+    _clear_source_info_cache()
+    df, schema = df_and_schema
+    make_partitioned_source(df, tmp_path, "parquet", n_files=2)
+    paths = tuple(str(p) for p in sorted(tmp_path.iterdir()))
+    info = _build_parquet_source(
+        paths,
+        frozenset(),
+        tuple(schema.items()),
+        max_footer_samples=10,
+        max_row_group_samples=0,
+    )
+
+    assert info.cached_parquet_info is not None
+    assert len(info.cached_parquet_info) == len(paths)
+
+
 def test_parquet_metadata_reads_footers(
     tmp_path: pathlib.Path,
     df_and_schema: tuple[pl.DataFrame, Schema],
