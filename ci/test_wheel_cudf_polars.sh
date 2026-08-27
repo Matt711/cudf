@@ -35,9 +35,9 @@ if [[ "${POLARS_VERSIONS:-all}" == "endpoints" ]] && [[ ${#VERSIONS[@]} -eq 2 ]]
     # on whichever entry ends up testing it.
     read -r -a CUDA_MAJORS <<< "$(python ci/utils/get_matrix_values.py dependencies.yaml all cuda | tr ' ' '\n' | cut -d. -f1 | sort -nu | tr '\n' ' ')"
     THIS_CUDA_MAJOR="${RAPIDS_CUDA_VERSION%%.*}"
-    if [[ ${#CUDA_MAJORS[@]} -eq 2 ]] && [[ "${THIS_CUDA_MAJOR}" == "${CUDA_MAJORS[0]}" ]]; then
+    if [[ "${THIS_CUDA_MAJOR}" == "${CUDA_MAJORS[0]}" ]]; then
         VERSIONS=("${VERSIONS[0]}")
-    elif [[ ${#CUDA_MAJORS[@]} -eq 2 ]] && [[ "${THIS_CUDA_MAJOR}" == "${CUDA_MAJORS[-1]}" ]]; then
+    else
         VERSIONS=("${VERSIONS[-1]}")
     fi
 fi
