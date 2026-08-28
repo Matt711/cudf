@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import functools
 import itertools
@@ -36,7 +37,7 @@ from cudf_polars.streaming.base import (
     SerializedDataSourceInfo,
 )
 from cudf_polars.streaming.dispatch import lower_ir_node
-from cudf_polars.utils.config import Cluster
+from cudf_polars.utils.config import Cluster, HybridScanFetchMode
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 from cudf_polars.utils.versions import POLARS_VERSION_LT_137
 
@@ -221,6 +222,40 @@ def hybrid_scan_eligible(
     )
 
 
+def _fetch_filter_and_payload_concurrently(
+    source_info: plc.io.SourceInfo,
+    filter_ranges: list[Any],
+    payload_ranges: list[Any],
+    *,
+    stream: Stream,
+) -> tuple[list[Any], list[Any]]:
+    """
+    Fetch filter and payload column-chunk bytes on separate threads.
+
+    Both byte-range lists only depend on the already-pruned row groups, not on
+    each other, so the two fetches can run concurrently instead of one after
+    the other. ``fetch_byte_ranges_to_device`` releases the GIL for the
+    underlying I/O, so this is a real overlap, not just interleaved Python.
+    """
+    if not payload_ranges:
+        filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+            source_info, filter_ranges, stream=stream
+        )
+        return filter_chunks, []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        payload_future = executor.submit(
+            plc.io.parquet_io_utils.fetch_byte_ranges_to_device,
+            source_info,
+            payload_ranges,
+            stream=stream,
+        )
+        filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+            source_info, filter_ranges, stream=stream
+        )
+        payload_chunks = payload_future.result()
+    return filter_chunks, payload_chunks
+
+
 def _read_with_hybrid_scan(
     schema: Schema,
     paths: list[str],
@@ -233,6 +268,7 @@ def _read_with_hybrid_scan(
     split_index: int = 0,
     total_splits: int = 1,
     stats_pruning: bool = True,
+    fetch_mode: HybridScanFetchMode = HybridScanFetchMode.SEQUENTIAL,
 ) -> DataFrame:
     """Two-pass parquet read via HybridScanReader for a row-group-aligned split."""
     assert len(paths) == 1, (
@@ -290,11 +326,29 @@ def _read_with_hybrid_scan(
         # the page index for all files, which may be too expensive.
         row_mask = reader.build_all_true_row_mask(row_group_indices, stream=stream)
 
-        filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-            source_info,
-            reader.filter_column_chunks_byte_ranges(row_group_indices, options),
-            stream=stream,
-        )
+        if fetch_mode is HybridScanFetchMode.CONCURRENT:
+            # A second reader instance is required here, not just for concurrency:
+            # HybridScanReader's column-selection state lives on the instance, so
+            # computing payload ranges on `reader` before it has materialized the
+            # filter columns would silently clobber that state.
+            payload_reader = cached_info.hybrid_scan_reader(options)
+            filter_chunks, payload_chunks = _fetch_filter_and_payload_concurrently(
+                source_info,
+                reader.filter_column_chunks_byte_ranges(row_group_indices, options),
+                payload_reader.payload_column_chunks_byte_ranges(
+                    row_group_indices, options
+                ),
+                stream=stream,
+            )
+        else:
+            payload_reader = reader
+            filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                source_info,
+                reader.filter_column_chunks_byte_ranges(row_group_indices, options),
+                stream=stream,
+            )
+            payload_chunks = None
+
         filter_tbl_w_meta = reader.materialize_filter_columns(
             row_group_indices,
             filter_chunks,
@@ -315,12 +369,15 @@ def _read_with_hybrid_scan(
         requested_columns = with_columns if with_columns is not None else list(schema)
         columns = filter_df.columns
         if set(requested_columns) - set(filter_names):
-            payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-                source_info,
-                reader.payload_column_chunks_byte_ranges(row_group_indices, options),
-                stream=stream,
-            )
-            payload_tbl_w_meta = reader.materialize_payload_columns(
+            if payload_chunks is None:
+                payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                    source_info,
+                    payload_reader.payload_column_chunks_byte_ranges(
+                        row_group_indices, options
+                    ),
+                    stream=stream,
+                )
+            payload_tbl_w_meta = payload_reader.materialize_payload_columns(
                 row_group_indices,
                 payload_chunks,
                 row_mask,
@@ -532,6 +589,7 @@ class SplitScan(IR):
                         split_index=split_index,
                         total_splits=total_splits,
                         stats_pruning=parquet_options._hybrid_scan_stats_pruning,
+                        fetch_mode=parquet_options.fetch_mode,
                     )
         else:
             # There are not enough row-groups to align

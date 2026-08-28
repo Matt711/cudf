@@ -59,6 +59,7 @@ __all__ = [
     "ConfigOptions",
     "DaskContext",
     "DynamicPlanningOptions",
+    "HybridScanFetchMode",
     "InMemoryExecutor",
     "JoinFilterPushdownOptions",
     "MaxConcurrentIOTasks",
@@ -213,6 +214,28 @@ class StreamingFallbackMode(enum.StrEnum):
     SILENT = "silent"
 
 
+class HybridScanFetchMode(enum.StrEnum):
+    """
+    How a hybrid-scan ``SplitScan`` fetches its filter and payload column-chunk bytes.
+
+    This is a fetch-concurrency setting, not a prefetch setting: both modes
+    fetch bytes at the same point in the read, right when a producer needs
+    them. Neither mode starts I/O ahead of demand or runs it in the
+    background independent of a producer.
+
+    * ``HybridScanFetchMode.SEQUENTIAL`` : Fetch filter bytes, then payload
+      bytes, one after the other. This is the original ``HybridScanReader``
+      behavior.
+    * ``HybridScanFetchMode.CONCURRENT`` : Compute both byte ranges up front
+      and fetch them concurrently, before evaluating the filter. Only the two
+      fetches overlap; materializing the payload columns still waits for the
+      row mask produced by materializing the filter columns.
+    """
+
+    SEQUENTIAL = "sequential"
+    CONCURRENT = "concurrent"
+
+
 class Cluster(enum.StrEnum):
     """
     The cluster configuration for the streaming executor.
@@ -357,6 +380,11 @@ class ParquetOptions:
         Whether to use the two-pass ``HybridScanReader`` for ``SplitScan``
         tasks when a predicate can be pushed down to a parquet filter.
         Default is False.
+    fetch_mode
+        How a hybrid-scan ``SplitScan`` fetches its filter and payload
+        column-chunk bytes. See :class:`HybridScanFetchMode`. Ignored when
+        ``use_hybrid_scan`` is False. Default is
+        ``HybridScanFetchMode.SEQUENTIAL``.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -405,6 +433,13 @@ class ParquetOptions:
             default=False,
         )
     )
+    fetch_mode: HybridScanFetchMode = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__FETCH_MODE",
+            HybridScanFetchMode.__call__,
+            default=HybridScanFetchMode.SEQUENTIAL,
+        )
+    )
     # Internal benchmarking flag. When False, skips stats and bloom-filter pruning
     # before the first pass of a hybrid scan so you can measure two-pass read
     # overhead in isolation. No reason to set this to False in production.
@@ -446,6 +481,8 @@ class ParquetOptions:
             raise ValueError(
                 "use_hybrid_scan requires prefetch_file_metadata to be enabled"
             )
+        if not isinstance(self.fetch_mode, HybridScanFetchMode):
+            raise TypeError("fetch_mode must be a HybridScanFetchMode")
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
 
