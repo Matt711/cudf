@@ -12,6 +12,13 @@ cpdef list fetch_byte_ranges_to_device(
     DeviceMemoryResource mr=*,
 )
 
+cpdef tuple fetch_byte_ranges_to_device_async(
+    SourceInfo source_info,
+    list byte_ranges,
+    object stream=*,
+    DeviceMemoryResource mr=*,
+)
+
 cpdef bytes fetch_page_index_to_host(
     SourceInfo source_info,
     ByteRangeInfo page_index_range,

@@ -381,9 +381,8 @@ fetch_byte_ranges_to_device_async_impl(
   device_read_tasks.reserve(io_offsets.size());
   host_read_tasks.reserve(io_offsets.size());
 
-  // Vectors to store intermediate host buffers and relevant pointers
-  std::vector<host_read_buffer> host_buffers{};
-  std::vector<void const*> copy_srcs{};
+  // Destinations and sizes for the host-to-device copy, resolved once the host reads below
+  // complete. The reads themselves, and this copy, happen inside the returned future.
   std::vector<void*> copy_dsts{};
   std::vector<size_t> copy_sizes{};
   copy_dsts.reserve(io_offsets.size());
@@ -416,17 +415,6 @@ fetch_byte_ranges_to_device_async_impl(
     });
   }
 
-  // Complete host reads
-  if (not host_read_tasks.empty()) {
-    copy_srcs.reserve(host_read_tasks.size());
-    host_buffers.reserve(host_read_tasks.size());
-
-    for (auto& task : host_read_tasks) {
-      host_buffers.emplace_back(task.get());
-      copy_srcs.push_back(host_buffers.back().get()->data());
-    }
-  }
-
   // `device_read_async` is not guaranteed to follow stream-ordering (see datasource API docs)
   stream.sync();
 
@@ -448,25 +436,55 @@ fetch_byte_ranges_to_device_async_impl(
           datasource.device_read_async(io_offset, io_size, dest, stream));
       }
     });
-
-    // Schedule a batched memcpy from host buffers to device
-    if (not host_buffers.empty()) {
-      CUDF_CUDA_TRY(cudf::detail::memcpy_batch_async(
-        copy_dsts.data(), copy_srcs.data(), copy_sizes.data(), copy_dsts.size(), stream));
-    }
   }
 
-  // Synchronize stream if `memcpy_batch_async` was called to safely discard the host buffers
-  if (not host_buffers.empty()) { stream.sync(); }
-
-  auto sync_function = [](decltype(device_read_tasks) device_read_tasks) {
+  // Completing host reads, and the resulting host-to-device copy, is deferred into the
+  // returned future's continuation rather than resolved here, so that concurrent calls to
+  // this function (e.g. for a hybrid scan's filter and payload column chunks) can have their
+  // host reads in flight at the same time instead of the second call waiting on the first.
+  auto sync_function = [](decltype(host_read_tasks) host_read_tasks,
+                          decltype(copy_dsts) copy_dsts,
+                          decltype(copy_sizes) copy_sizes,
+                          decltype(device_read_tasks) device_read_tasks,
+                          cuda::stream_ref stream) {
+    if (not host_read_tasks.empty()) {
+      std::vector<host_read_buffer> host_buffers;
+      std::vector<void const*> copy_srcs;
+      host_buffers.reserve(host_read_tasks.size());
+      copy_srcs.reserve(host_read_tasks.size());
+      for (auto& task : host_read_tasks) {
+        host_buffers.emplace_back(task.get());
+        copy_srcs.push_back(host_buffers.back().get()->data());
+      }
+      CUDF_CUDA_TRY(cudf::detail::memcpy_batch_async(
+        copy_dsts.data(), copy_srcs.data(), copy_sizes.data(), copy_dsts.size(), stream));
+      // Synchronize the stream to safely discard the host buffers on scope exit
+      stream.sync();
+    }
     for (auto& task : device_read_tasks) {
       task.get();
     }
   };
+  // A caller that discards the returned future (e.g. doesn't need the result, or an exception
+  // unwinds past it) must not leave host_read_tasks/device_read_tasks dangling against a
+  // datasource that's about to be destroyed. std::launch::async makes that safe automatically:
+  // per [futures.unique.future], the destructor of a future obtained from std::async blocks
+  // until the shared state is ready, as long as it's the last reference to it — so discarding
+  // this future degrades to synchronous completion, matching the old behavior, instead of
+  // orphaning an in-flight task. std::launch::deferred does not give this guarantee: a deferred
+  // function that's never explicitly waited on simply never runs, while the host_read_tasks it
+  // was going to await keep executing in the background regardless. Only pay for the thread this
+  // requires when there's actually work to wait for.
+  auto const has_deferred_work = not host_read_tasks.empty() or not device_read_tasks.empty();
   return {std::move(column_chunk_buffers),
           std::move(column_chunk_data_per_source),
-          std::async(std::launch::deferred, sync_function, std::move(device_read_tasks))};
+          std::async(has_deferred_work ? std::launch::async : std::launch::deferred,
+                     sync_function,
+                     std::move(host_read_tasks),
+                     std::move(copy_dsts),
+                     std::move(copy_sizes),
+                     std::move(device_read_tasks),
+                     stream)};
 }
 
 std::pair<std::vector<rmm::device_buffer>, std::vector<device_spans_per_source_type>>

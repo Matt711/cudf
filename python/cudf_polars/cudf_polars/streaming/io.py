@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import dataclasses
 import functools
 import itertools
@@ -230,29 +229,28 @@ def _fetch_filter_and_payload_concurrently(
     stream: Stream,
 ) -> tuple[list[Any], list[Any]]:
     """
-    Fetch filter and payload column-chunk bytes on separate threads.
+    Fetch filter and payload column-chunk bytes concurrently.
 
     Both byte-range lists only depend on the already-pruned row groups, not on
     each other, so the two fetches can run concurrently instead of one after
-    the other. ``fetch_byte_ranges_to_device`` releases the GIL for the
-    underlying I/O, so this is a real overlap, not just interleaved Python.
+    the other. ``fetch_byte_ranges_to_device_async`` starts the fetch on a
+    background thread and returns immediately, so issuing both before waiting
+    on either is enough to overlap them — no Python-level thread pool needed.
     """
     if not payload_ranges:
         filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
             source_info, filter_ranges, stream=stream
         )
         return filter_chunks, []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        payload_future = executor.submit(
-            plc.io.parquet_io_utils.fetch_byte_ranges_to_device,
-            source_info,
-            payload_ranges,
-            stream=stream,
+    payload_chunks, payload_future = (
+        plc.io.parquet_io_utils.fetch_byte_ranges_to_device_async(
+            source_info, payload_ranges, stream=stream
         )
-        filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-            source_info, filter_ranges, stream=stream
-        )
-        payload_chunks = payload_future.result()
+    )
+    filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+        source_info, filter_ranges, stream=stream
+    )
+    payload_future.wait()
     return filter_chunks, payload_chunks
 
 
