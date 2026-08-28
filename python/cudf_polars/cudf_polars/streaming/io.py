@@ -227,7 +227,7 @@ def _fetch_filter_and_payload_concurrently(
     payload_ranges: list[Any],
     *,
     stream: Stream,
-) -> tuple[list[Any], list[Any]]:
+) -> tuple[list[Any], list[Any], Any | None]:
     """
     Fetch filter and payload column-chunk bytes concurrently.
 
@@ -236,12 +236,20 @@ def _fetch_filter_and_payload_concurrently(
     the other. ``fetch_byte_ranges_to_device_async`` starts the fetch on a
     background thread and returns immediately, so issuing both before waiting
     on either is enough to overlap them — no Python-level thread pool needed.
+
+    Returns ``(filter_chunks, payload_chunks, payload_future)``. Deliberately
+    does not wait on ``payload_future`` here: the caller shouldn't touch
+    ``payload_chunks`` until it does, but waiting immediately would only
+    overlap the payload fetch with the filter fetch. Waiting later, right
+    before ``payload_chunks`` is actually consumed, overlaps it with
+    materializing the filter columns too, which is a GPU decode step and the
+    bigger piece of work between the two fetches.
     """
     if not payload_ranges:
         filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
             source_info, filter_ranges, stream=stream
         )
-        return filter_chunks, []
+        return filter_chunks, [], None
     payload_chunks, payload_future = (
         plc.io.parquet_io_utils.fetch_byte_ranges_to_device_async(
             source_info, payload_ranges, stream=stream
@@ -250,8 +258,7 @@ def _fetch_filter_and_payload_concurrently(
     filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
         source_info, filter_ranges, stream=stream
     )
-    payload_future.wait()
-    return filter_chunks, payload_chunks
+    return filter_chunks, payload_chunks, payload_future
 
 
 def _read_with_hybrid_scan(
@@ -330,13 +337,15 @@ def _read_with_hybrid_scan(
             # computing payload ranges on `reader` before it has materialized the
             # filter columns would silently clobber that state.
             payload_reader = cached_info.hybrid_scan_reader(options)
-            filter_chunks, payload_chunks = _fetch_filter_and_payload_concurrently(
-                source_info,
-                reader.filter_column_chunks_byte_ranges(row_group_indices, options),
-                payload_reader.payload_column_chunks_byte_ranges(
-                    row_group_indices, options
-                ),
-                stream=stream,
+            filter_chunks, payload_chunks, payload_future = (
+                _fetch_filter_and_payload_concurrently(
+                    source_info,
+                    reader.filter_column_chunks_byte_ranges(row_group_indices, options),
+                    payload_reader.payload_column_chunks_byte_ranges(
+                        row_group_indices, options
+                    ),
+                    stream=stream,
+                )
             )
         else:
             payload_reader = reader
@@ -346,6 +355,7 @@ def _read_with_hybrid_scan(
                 stream=stream,
             )
             payload_chunks = None
+            payload_future = None
 
         filter_tbl_w_meta = reader.materialize_filter_columns(
             row_group_indices,
@@ -367,6 +377,8 @@ def _read_with_hybrid_scan(
         requested_columns = with_columns if with_columns is not None else list(schema)
         columns = filter_df.columns
         if set(requested_columns) - set(filter_names):
+            if payload_future is not None:
+                payload_future.wait()
             if payload_chunks is None:
                 payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                     source_info,
