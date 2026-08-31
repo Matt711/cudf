@@ -664,6 +664,7 @@ def test_prefetch_file_metadata_default() -> None:
 
 
 def test_pass_mode_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CUDF_POLARS__PARQUET_OPTIONS__PASS_MODE", raising=False)
     config = ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
     assert isinstance(config.parquet_options.pass_mode, Unspecified)
 
