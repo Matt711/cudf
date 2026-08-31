@@ -6,9 +6,11 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, cast
 
-import pytest
-
 import polars as pl
+import pytest
+from rapidsmpf.memory.pinned_memory_resource import (
+    is_pinned_memory_resources_supported,
+)
 
 from cudf_polars import Translator
 from cudf_polars.containers import DataType
@@ -44,6 +46,8 @@ from cudf_polars.testing.engine_utils import SMALL_MAX_ROWS_PER_PARTITION
 from cudf_polars.testing.io import make_partitioned_source
 from cudf_polars.utils.config import (
     ConfigOptions,
+    HybridScanPrefetchMemoryMode,
+    HybridScanPrefetchOrderingMode,
     MaxConcurrentIOTasks,
     ParquetOptions,
 )
@@ -538,6 +542,57 @@ def test_split_scan_hybrid(
     q = pl.scan_parquet(tmp_path)
     if predicate is not None:
         q = q.filter(predicate)
+    if use_columns is not None:
+        q = q.select(use_columns)
+    assert_gpu_result_equal(q, engine=streaming_engine)
+
+
+@pytest.mark.parametrize(
+    "predicate,use_columns",
+    [
+        # row-group selective: TWO_PASS
+        (pl.col("x") < 1_000, None),
+        # not row-group selective: SINGLE_PASS
+        (pl.col("y").str.contains("cat"), ["x", "z"]),
+    ],
+)
+@pytest.mark.parametrize(
+    "prefetch_memory_mode,prefetch_ordering_mode",
+    [
+        (HybridScanPrefetchMemoryMode.FAIL_FAST, HybridScanPrefetchOrderingMode.ORDERED),
+        (HybridScanPrefetchMemoryMode.FAIL_FAST, HybridScanPrefetchOrderingMode.RACE),
+        (HybridScanPrefetchMemoryMode.WAIT, HybridScanPrefetchOrderingMode.ORDERED),
+    ],
+)
+@pytest.mark.skipif(
+    not is_pinned_memory_resources_supported(),
+    reason="Pinned memory requires CUDA 12.6+ driver and runtime",
+)
+def test_split_scan_hybrid_prefetch(
+    tmp_path: Path,
+    df: pl.DataFrame,
+    predicate: pl.Expr,
+    use_columns: list[str] | None,
+    prefetch_memory_mode: HybridScanPrefetchMemoryMode,
+    prefetch_ordering_mode: HybridScanPrefetchOrderingMode,
+    streaming_engine_factory: Callable[..., StreamingEngine],
+) -> None:
+    """Prefetched splits must match the same query with prefetching disabled."""
+    streaming_engine = streaming_engine_factory(
+        StreamingOptions(
+            target_partition_size=1_000,
+            pinned_memory=True,
+            pinned_initial_pool_size=4 * 1024 * 1024,
+            parquet_options={
+                "use_hybrid_scan": True,
+                "prefetch_file_metadata": True,
+                "prefetch_memory_mode": prefetch_memory_mode,
+                "prefetch_ordering_mode": prefetch_ordering_mode,
+            },
+        ),
+    )
+    make_partitioned_source(df, tmp_path, "parquet", n_files=1, row_group_size=100)
+    q = pl.scan_parquet(tmp_path).filter(predicate)
     if use_columns is not None:
         q = q.select(use_columns)
     assert_gpu_result_equal(q, engine=streaming_engine)

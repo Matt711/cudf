@@ -32,6 +32,8 @@ from cudf_polars.utils.config import (
     ConfigOptions,
     DynamicPlanningOptions,
     HybridScanPassMode,
+    HybridScanPrefetchMemoryMode,
+    HybridScanPrefetchOrderingMode,
     InMemoryExecutor,
     JoinFilterPushdownOptions,
     MaxConcurrentIOTasks,
@@ -381,6 +383,9 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_FILE_METADATA", "1")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__USE_JIT_FILTER", "1")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PASS_MODE", "single_pass")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_MEMORY_MODE", "wait")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_ALLOW_HOST_FALLBACK", "1")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_ORDERING_MODE", "race")
 
         # Test default
         engine = pl.GPUEngine()
@@ -396,6 +401,15 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         assert config.parquet_options.prefetch_file_metadata is True
         assert config.parquet_options.use_jit_filter is True
         assert config.parquet_options.pass_mode is HybridScanPassMode.SINGLE_PASS
+        assert (
+            config.parquet_options.prefetch_memory_mode
+            is HybridScanPrefetchMemoryMode.WAIT
+        )
+        assert config.parquet_options.prefetch_allow_host_fallback is True
+        assert (
+            config.parquet_options.prefetch_ordering_mode
+            is HybridScanPrefetchOrderingMode.RACE
+        )
 
     with monkeypatch.context() as m:
         # Env must win over the executor-derived default (streaming => True).
@@ -621,6 +635,9 @@ def test_fallback_mode_default(monkeypatch: pytest.MonkeyPatch) -> None:
         "use_hybrid_scan",
         "use_jit_filter",
         "pass_mode",
+        "prefetch_memory_mode",
+        "prefetch_allow_host_fallback",
+        "prefetch_ordering_mode",
     ],
 )
 def test_validate_parquet_options(option: str) -> None:
@@ -679,6 +696,57 @@ def test_pass_mode_default(monkeypatch: pytest.MonkeyPatch) -> None:
     with monkeypatch.context() as m:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PASS_MODE", "foo")
         with pytest.raises(ValueError, match="'foo' is not a valid HybridScanPassMode"):
+            ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
+
+
+def test_prefetch_memory_and_ordering_mode_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_MEMORY_MODE", raising=False)
+    monkeypatch.delenv(
+        "CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_ALLOW_HOST_FALLBACK", raising=False
+    )
+    monkeypatch.delenv(
+        "CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_ORDERING_MODE", raising=False
+    )
+    config = ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
+    assert config.parquet_options.prefetch_memory_mode is (
+        HybridScanPrefetchMemoryMode.FAIL_FAST
+    )
+    assert config.parquet_options.prefetch_allow_host_fallback is False
+    assert config.parquet_options.prefetch_ordering_mode is (
+        HybridScanPrefetchOrderingMode.ORDERED
+    )
+
+    config = ConfigOptions.from_polars_engine(
+        pl.GPUEngine(
+            executor="streaming",
+            parquet_options={
+                "prefetch_memory_mode": HybridScanPrefetchMemoryMode.WAIT,
+                "prefetch_allow_host_fallback": True,
+                "prefetch_ordering_mode": HybridScanPrefetchOrderingMode.RACE,
+            },
+        )
+    )
+    assert config.parquet_options.prefetch_memory_mode is HybridScanPrefetchMemoryMode.WAIT
+    assert config.parquet_options.prefetch_allow_host_fallback is True
+    assert (
+        config.parquet_options.prefetch_ordering_mode
+        is HybridScanPrefetchOrderingMode.RACE
+    )
+
+    with monkeypatch.context() as m:
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_MEMORY_MODE", "foo")
+        with pytest.raises(
+            ValueError, match="'foo' is not a valid HybridScanPrefetchMemoryMode"
+        ):
+            ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
+
+    with monkeypatch.context() as m:
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_ORDERING_MODE", "foo")
+        with pytest.raises(
+            ValueError, match="'foo' is not a valid HybridScanPrefetchOrderingMode"
+        ):
             ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
 
 

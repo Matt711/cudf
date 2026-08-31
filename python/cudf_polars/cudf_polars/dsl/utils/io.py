@@ -56,6 +56,10 @@ class CachedParquetInfo:
     _hybrid_scan_metadata: plc.io.experimental.HybridScanMetadata | None = field(
         default=None, init=False, compare=False, repr=False
     )
+    # For splits of the same file, the handle is opened once and shared.
+    _remote_handle: kvikio.RemoteFile | kvikio.CuFile | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         if self.parse_hybrid_metadata:
@@ -66,6 +70,9 @@ class CachedParquetInfo:
                     self.file_metadata, self.default_reader_options()
                 ),
             )
+            # Opened eagerly so splits of the same file sharing this handle from
+            # prefetch worker threads never race to open their own.
+            self.remote_handle()
 
     def hybrid_scan_reader(
         self,
@@ -79,6 +86,18 @@ class CachedParquetInfo:
             )
             object.__setattr__(self, "_hybrid_scan_metadata", metadata)
         return plc.io.experimental.HybridScanReader.from_metadata(metadata)
+
+    def remote_handle(self) -> kvikio.RemoteFile | kvikio.CuFile:
+        """Return the kvikio handle for this file, opened once and shared."""
+        handle = self._remote_handle
+        if handle is None:
+            handle = (
+                kvikio.RemoteFile.open(self.path, nbytes=self.size)
+                if plc.io.SourceInfo._is_remote_uri(self.path)
+                else kvikio.CuFile(self.path)
+            )
+            object.__setattr__(self, "_remote_handle", handle)
+        return handle
 
     def default_reader_options(self) -> plc.io.parquet.ParquetReaderOptions:
         """Return baseline ``ParquetReaderOptions`` for this cached parquet file."""
