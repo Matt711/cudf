@@ -97,11 +97,21 @@ def scan_partition_plan(
     if ir.typ == "parquet":
         blocksize: int = config_options.executor.target_partition_size
         single_file = len(ir.paths) == 1
-        # A single file always uses SplitScan when hybrid scan is enabled, so the
-        # hybrid reader can be used on it even when it would otherwise not split.
-        # The split factor is still size-based, so a large file is split into many.
-        hybrid_single_file = (
-            single_file and config_options.parquet_options.use_hybrid_scan
+        # A lone file still becomes its own task when hybrid scan is enabled
+        # and this scan could actually use the hybrid reader, so the reader
+        # can be used even when file size alone wouldn't call for that. Task
+        # count beyond that is still size-based.
+        #
+        # Using only the global `use_hybrid_scan` flag here, regardless of
+        # whether this particular scan has a predicate, used to force every
+        # lone-file scan down this path even when it could never use the
+        # hybrid reader, e.g. join-input tables with no filter — real
+        # overhead for no benefit.
+        hybrid_single_file = single_file and hybrid_scan_predicate_eligible(
+            config_options.parquet_options,
+            row_index=ir.row_index,
+            include_file_paths=ir.include_file_paths,
+            predicate=ir.predicate,
         )
         if source := stats.scan_stats.get(ir):
             column_sizes = [
@@ -212,6 +222,28 @@ def expand_scan_for_rank(
         )
 
 
+def hybrid_scan_predicate_eligible(
+    parquet_options: ParquetOptions,
+    *,
+    row_index: tuple[str, int] | None,
+    include_file_paths: str | None,
+    predicate: NamedExpr | None,
+) -> bool:
+    """
+    Whether a parquet scan's shape could use the HybridScanReader path.
+
+    Checks everything knowable before per-file metadata is available. See
+    :func:`hybrid_scan_eligible`, which adds the metadata-dependent check to
+    decide whether the hybrid reader can actually be used.
+    """
+    return (
+        parquet_options.use_hybrid_scan
+        and row_index is None
+        and include_file_paths is None
+        and predicate is not None
+    )
+
+
 def hybrid_scan_eligible(
     parquet_options: ParquetOptions,
     *,
@@ -220,13 +252,12 @@ def hybrid_scan_eligible(
     include_file_paths: str | None,
     predicate: NamedExpr | None,
 ) -> bool:
-    """Whether a parquet split is eligible for the HybridScanReader path."""
-    return (
-        parquet_options.use_hybrid_scan
-        and cached_parquet_info is not None
-        and row_index is None
-        and include_file_paths is None
-        and predicate is not None
+    """Whether a parquet scan is eligible for the HybridScanReader path."""
+    return cached_parquet_info is not None and hybrid_scan_predicate_eligible(
+        parquet_options,
+        row_index=row_index,
+        include_file_paths=include_file_paths,
+        predicate=predicate,
     )
 
 
