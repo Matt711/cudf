@@ -734,11 +734,16 @@ class SPMDContext:
         The active RapidsMPF context.
     py_executor
         Thread-pool executor used to drive the actor network on each rank.
+    prefetch_executor
+        Thread-pool executor used to offload hybrid scan prefetch
+        housekeeping on each rank, separate from ``py_executor`` so it
+        doesn't queue behind decode work.
     """
 
     comm: Communicator
     context: Context
     py_executor: ThreadPoolExecutor
+    prefetch_executor: ThreadPoolExecutor
     engine_id: uuid.UUID
     worker_id: uuid.UUID
     quent_logger: QuentLogger | None
@@ -878,6 +883,13 @@ class StreamingExecutor:
     num_py_executors
         Maximum number of workers for the Python ThreadPoolExecutor.
         Default is 8.
+    num_prefetch_executors
+        Maximum number of workers for the Python ThreadPoolExecutor used to
+        offload hybrid scan prefetch housekeeping (row-group pruning,
+        byte-range computation, pinned-memory allocation, and issuing
+        reads). Kept separate from ``num_py_executors`` so short prefetch
+        calls don't queue behind long-running decode work on the same
+        pool. Default is 8.
     kvikio_nthreads
         Number of threads in the kvikio ``EASY_THREADPOOL`` thread pool.
         Defaults to 256, which is tuned for cloud object-store IO. This can be
@@ -975,6 +987,11 @@ class StreamingExecutor:
             f"{_env_prefix}__NUM_PY_EXECUTORS", int, default=8
         )
     )
+    num_prefetch_executors: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__NUM_PREFETCH_EXECUTORS", int, default=8
+        )
+    )
     kvikio_nthreads: int = dataclasses.field(
         default_factory=lambda: resolve_kvikio_nthreads({})
     )
@@ -1064,6 +1081,8 @@ class StreamingExecutor:
             raise TypeError("client_device_threshold must be a float")
         if not isinstance(self.num_py_executors, int):
             raise TypeError("num_py_executors must be an int")
+        if not isinstance(self.num_prefetch_executors, int):
+            raise TypeError("num_prefetch_executors must be an int")
         if not isinstance(self.kvikio_nthreads, int):
             raise TypeError("kvikio_nthreads must be an int")
         if self.kvikio_nthreads <= 0:

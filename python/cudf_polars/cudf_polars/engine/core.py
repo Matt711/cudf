@@ -473,6 +473,7 @@ class StreamingEngine(pl.GPUEngine):
         The following inputs are fixed at construction time and cannot change:
           - ``num_ranks``
           - ``num_py_executors`` (in ``executor_options``)
+          - ``num_prefetch_executors`` (in ``executor_options``)
           - ``hardware_binding`` (in ``engine_options``)
           - ``memory_resource_config`` (in ``engine_options``)
 
@@ -504,7 +505,10 @@ class StreamingEngine(pl.GPUEngine):
         engine_options = engine_options or {}
         check_reserved_keys(executor_options, engine_options)
 
-        _disallowed_exec = {"num_py_executors"} & executor_options.keys()
+        _disallowed_exec = {
+            "num_py_executors",
+            "num_prefetch_executors",
+        } & executor_options.keys()
         if _disallowed_exec:
             raise ValueError(
                 f"executor_options keys {sorted(_disallowed_exec)} cannot be "
@@ -819,6 +823,7 @@ def evaluate_on_rank(
     ctx: Context,
     comm: Communicator,
     py_executor: ThreadPoolExecutor,
+    prefetch_executor: ThreadPoolExecutor,
     ir: IR,
     config_options: ConfigOptions[StreamingExecutor],
     *,
@@ -845,6 +850,9 @@ def evaluate_on_rank(
         The active RapidsMPF communicator for this rank.
     py_executor
         Thread-pool executor used to drive the actor network.
+    prefetch_executor
+        Thread-pool executor used to offload hybrid scan prefetch
+        housekeeping, separate from ``py_executor``.
     ir
         Root of the **pre-lowered** IR graph.
     config_options
@@ -907,7 +915,10 @@ def evaluate_on_rank(
             logical_op_by_id=logical_op_by_id,
         )
     ir_context = IRExecutionContext(
-        py_executor, get_cuda_stream=ctx.br().stream_pool.get_stream, query_id=query_id
+        py_executor,
+        prefetch_executor,
+        get_cuda_stream=ctx.br().stream_pool.get_stream,
+        query_id=query_id,
     )
 
     prefetch_file_metadata = config_options.parquet_options.prefetch_file_metadata

@@ -173,10 +173,10 @@ async def reserve_pinned_batch(
             )
         finally:
             nvtx.end_range(wait_range)
-        buf = await ir_context.to_thread(
+        buf = await ir_context.to_prefetch_thread(
             br.make_buffer, total, br.stream_pool.get_stream(), reservation
         )
-        host, futures = await ir_context.to_thread(
+        host, futures = await ir_context.to_prefetch_thread(
             issue_reads_into_pinned_buffer, buf, handle, ranges
         )
     finally:
@@ -287,7 +287,7 @@ async def prefetch_scan_byte_ranges(
     Prune row groups for one scan task and prefetch its byte ranges.
 
     Pruning and byte-range computation are offloaded to ``ir_context``'s
-    thread pool and run freely, out of order across tasks. Claiming pinned
+    prefetch thread pool and run freely, out of order across tasks. Claiming pinned
     memory and issuing reads waits for ``wait_for`` first (the previous
     task's own attempt, within the same producer), so a task due for
     consumption soon can't lose its reservation to one that isn't, then
@@ -319,7 +319,7 @@ async def prefetch_scan_byte_ranges(
         message="prefetch_scan_byte_ranges", domain=CUDF_POLARS_NVTX_DOMAIN
     )
     try:
-        prepared = await ir_context.to_thread(prepare_prefetch, scan)
+        prepared = await ir_context.to_prefetch_thread(prepare_prefetch, scan)
         if wait_for is not None:
             wait_range = nvtx.start_range(
                 message="prefetch_wait_for_turn", domain=CUDF_POLARS_NVTX_DOMAIN
