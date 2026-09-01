@@ -331,8 +331,9 @@ async def prefetch_scan_byte_ranges(
     Prune row groups for one scan task and prefetch its byte ranges.
 
     Pruning and byte-range computation are offloaded to ``ir_context``'s
-    prefetch thread pool and run freely, out of order across tasks. Claiming pinned
-    memory and issuing reads waits for ``wait_for`` first (the previous
+    main thread pool and run freely, out of order across tasks. Claiming
+    pinned memory and issuing reads is offloaded to the dedicated prefetch
+    thread pool instead, and waits for ``wait_for`` first (the previous
     task's own attempt, within the same producer), so a task due for
     consumption soon can't lose its reservation to one that isn't, then
     signals ``own_turn`` before returning, whether or not a reservation
@@ -363,7 +364,7 @@ async def prefetch_scan_byte_ranges(
         message="prefetch_scan_byte_ranges", domain=CUDF_POLARS_NVTX_DOMAIN
     )
     try:
-        prepared = await ir_context.to_prefetch_thread(prepare_prefetch, scan)
+        prepared = await ir_context.to_thread(prepare_prefetch, scan)
         if wait_for is not None:
             wait_range = nvtx.start_range(
                 message="prefetch_wait_for_turn", domain=CUDF_POLARS_NVTX_DOMAIN
