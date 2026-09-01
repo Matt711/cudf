@@ -522,15 +522,12 @@ class SPMDEngine(StreamingEngine):
             exit_stack.callback(
                 self._py_executor.shutdown, wait=True, cancel_futures=True
             )
-            self._prefetch_executor = ThreadPoolExecutor(
-                max_workers=cast(
-                    "int", executor_options.get("num_prefetch_executors", 8)
-                ),
-                thread_name_prefix="spmd-prefetch-executor",
-            )
-            exit_stack.callback(
-                self._prefetch_executor.shutdown, wait=True, cancel_futures=True
-            )
+            # TODO: experiment, aliased to py_executor rather than a real second
+            # pool, to test whether real concurrency between prefetch
+            # housekeeping and decode work (not the two-pool code structure
+            # itself) is what's causing materialize_all_columns slowdowns.
+            # Revert to a real ThreadPoolExecutor once that's settled.
+            self._prefetch_executor = self._py_executor
 
             super().__init__(
                 nranks=comm.nranks,
