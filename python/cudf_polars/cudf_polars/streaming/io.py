@@ -230,10 +230,26 @@ def hybrid_scan_eligible(
     )
 
 
-def _split_row_group_indices(
+def split_row_group_indices(
     total_row_groups: int, total_splits: int, split_index: int
 ) -> list[int]:
-    """Return the row group indices assigned to one row-group-aligned SplitScan."""
+    """
+    Return the row group indices assigned to one row-group-aligned scan task.
+
+    Parameters
+    ----------
+    total_row_groups
+        Total number of row groups in the file.
+    total_splits
+        Number of tasks the file is divided into.
+    split_index
+        Index of the task to compute row group indices for.
+
+    Returns
+    -------
+    Row group indices assigned to ``split_index``. The last task absorbs any
+    remainder, so it always reads through the final row group.
+    """
     rg_stride = total_row_groups // total_splits
     skip_rgs = rg_stride * split_index
     end_rg = (
@@ -242,7 +258,7 @@ def _split_row_group_indices(
     return list(range(skip_rgs, end_rg))
 
 
-def _decide_pass_mode(
+def decide_pass_mode(
     pass_mode: HybridScanPassMode | Unspecified,
     row_group_indices: list[int],
     row_group_count_before_pruning: int,
@@ -250,6 +266,23 @@ def _decide_pass_mode(
     """
     Decide HybridScanPassMode, the same way for a synchronous read or a prefetch.
 
+    Parameters
+    ----------
+    pass_mode
+        User-requested pass mode, or ``UNSPECIFIED`` to choose automatically.
+    row_group_indices
+        Row groups surviving stats/bloom-filter pruning.
+    row_group_count_before_pruning
+        Row group count for this task before pruning.
+
+    Returns
+    -------
+    ``pass_mode`` unchanged when explicitly requested. Otherwise
+    ``HybridScanPassMode.TWO_PASS`` if pruning eliminated any row groups,
+    ``HybridScanPassMode.SINGLE_PASS`` if not.
+
+    Notes
+    -----
     ``row_group_indices`` already reflects both stats and bloom-filter
     pruning, so this covers selectivity at those two levels. It misses
     page-level stats pruning (not yet implemented) and exact row-level
@@ -295,7 +328,8 @@ def _read_with_hybrid_scan(
             options.set_column_names(with_columns)
         options.set_filter(plc_filter)
 
-        reader = cached_info.hybrid_scan_reader(options)
+        with nvtx_annotate_cudf_polars(message="hybrid_scan_reader_construct"):
+            reader = cached_info.hybrid_scan_reader(options)
 
         if prefetched is not None:
             row_group_indices = prefetched.row_group_indices
@@ -303,30 +337,37 @@ def _read_with_hybrid_scan(
         else:
             row_group_count_before_pruning = len(row_group_indices)
             if stats_pruning:
-                row_group_indices = reader.filter_row_groups_with_stats(
-                    row_group_indices, options, stream=stream
-                )
+                with nvtx_annotate_cudf_polars(message="filter_row_groups_with_stats"):
+                    row_group_indices = reader.filter_row_groups_with_stats(
+                        row_group_indices, options, stream=stream
+                    )
 
                 if row_group_indices:
-                    bloom_ranges = reader.bloom_filters_byte_ranges(
-                        row_group_indices, options
-                    )
-                    if bloom_ranges:
-                        bloom_chunks = (
-                            plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-                                source_info, bloom_ranges, stream=stream
+                    with nvtx_annotate_cudf_polars(message="bloom_filter_pruning"):
+                        bloom_ranges = reader.bloom_filters_byte_ranges(
+                            row_group_indices, options
+                        )
+                        if bloom_ranges:
+                            bloom_chunks = (
+                                plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                                    source_info, bloom_ranges, stream=stream
+                                )
                             )
-                        )
-                        row_group_indices = reader.filter_row_groups_with_bloom_filters(
-                            bloom_chunks, row_group_indices, options, stream=stream
-                        )
+                            row_group_indices = (
+                                reader.filter_row_groups_with_bloom_filters(
+                                    bloom_chunks,
+                                    row_group_indices,
+                                    options,
+                                    stream=stream,
+                                )
+                            )
 
             # TODO: Consider implementing page-index stats pruning. For SplitScans, we
             # can reuse the same page index for all splits of the same file, so the
             # overhead of reading the page index can be amortized. For FusedScans, we
             # would need to read the page index for all files, which may be too
             # expensive.
-            effective_pass_mode = _decide_pass_mode(
+            effective_pass_mode = decide_pass_mode(
                 pass_mode, row_group_indices, row_group_count_before_pruning
             )
 
@@ -348,18 +389,17 @@ def _read_with_hybrid_scan(
 
         if effective_pass_mode is HybridScanPassMode.SINGLE_PASS:
             if prefetched is not None and prefetched.all_columns is not None:
-                all_chunks = _copy_pinned_batch_to_device(
-                    prefetched.all_columns, stream
-                )
+                all_chunks = copy_pinned_batch_to_device(prefetched.all_columns, stream)
             else:
                 all_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                     source_info,
                     reader.all_column_chunks_byte_ranges(row_group_indices, options),
                     stream=stream,
                 )
-            tbl_w_meta = reader.materialize_all_columns(
-                row_group_indices, all_chunks, options, stream=stream
-            )
+            with nvtx_annotate_cudf_polars(message="materialize_all_columns"):
+                tbl_w_meta = reader.materialize_all_columns(
+                    row_group_indices, all_chunks, options, stream=stream
+                )
             names = tbl_w_meta.column_names(include_children=False)
             result = DataFrame.from_table(
                 tbl_w_meta.tbl,
@@ -368,28 +408,31 @@ def _read_with_hybrid_scan(
                 stream=stream,
             ).select(list(schema.keys()))
             if prefetched is not None:
-                stream.synchronize()
+                with nvtx_annotate_cudf_polars(message="stream_synchronize"):
+                    stream.synchronize()
                 prefetched.release()
             return result
 
-        row_mask = reader.build_all_true_row_mask(row_group_indices, stream=stream)
+        with nvtx_annotate_cudf_polars(message="build_all_true_row_mask"):
+            row_mask = reader.build_all_true_row_mask(row_group_indices, stream=stream)
 
         if prefetched is not None and prefetched.filter is not None:
-            filter_chunks = _copy_pinned_batch_to_device(prefetched.filter, stream)
+            filter_chunks = copy_pinned_batch_to_device(prefetched.filter, stream)
         else:
             filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                 source_info,
                 reader.filter_column_chunks_byte_ranges(row_group_indices, options),
                 stream=stream,
             )
-        filter_tbl_w_meta = reader.materialize_filter_columns(
-            row_group_indices,
-            filter_chunks,
-            row_mask,
-            plc.io.experimental.UseDataPageMask.YES,
-            options,
-            stream=stream,
-        )
+        with nvtx_annotate_cudf_polars(message="materialize_filter_columns"):
+            filter_tbl_w_meta = reader.materialize_filter_columns(
+                row_group_indices,
+                filter_chunks,
+                row_mask,
+                plc.io.experimental.UseDataPageMask.YES,
+                options,
+                stream=stream,
+            )
 
         filter_names = filter_tbl_w_meta.column_names(include_children=False)
         filter_df = DataFrame.from_table(
@@ -403,9 +446,7 @@ def _read_with_hybrid_scan(
         columns = filter_df.columns
         if set(requested_columns) - set(filter_names):
             if prefetched is not None and prefetched.payload is not None:
-                payload_chunks = _copy_pinned_batch_to_device(
-                    prefetched.payload, stream
-                )
+                payload_chunks = copy_pinned_batch_to_device(prefetched.payload, stream)
             else:
                 payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                     source_info,
@@ -414,14 +455,15 @@ def _read_with_hybrid_scan(
                     ),
                     stream=stream,
                 )
-            payload_tbl_w_meta = reader.materialize_payload_columns(
-                row_group_indices,
-                payload_chunks,
-                row_mask,
-                plc.io.experimental.UseDataPageMask.YES,
-                options,
-                stream=stream,
-            )
+            with nvtx_annotate_cudf_polars(message="materialize_payload_columns"):
+                payload_tbl_w_meta = reader.materialize_payload_columns(
+                    row_group_indices,
+                    payload_chunks,
+                    row_mask,
+                    plc.io.experimental.UseDataPageMask.YES,
+                    options,
+                    stream=stream,
+                )
             payload_names = payload_tbl_w_meta.column_names(include_children=False)
             payload_df = DataFrame.from_table(
                 payload_tbl_w_meta.tbl,
@@ -433,14 +475,32 @@ def _read_with_hybrid_scan(
 
         result = DataFrame(columns, stream=stream).select(list(schema.keys()))
         if prefetched is not None:
-            stream.synchronize()
+            with nvtx_annotate_cudf_polars(message="stream_synchronize"):
+                stream.synchronize()
             prefetched.release()
         return result
 
 
 @dataclasses.dataclass
-class _PinnedBatch:
-    """Byte ranges read into a single pinned host buffer."""
+class PinnedBatch:
+    """
+    Byte ranges read into a single pinned host buffer.
+
+    Parameters
+    ----------
+    ranges
+        Byte ranges backing this batch, in the order requested from the
+        ``HybridScanReader``.
+    host
+        Pinned host view spanning every range in ``ranges``, or ``None``
+        when the batch has no reservation (empty ``ranges``).
+    futures
+        In-flight ``pread`` futures issued for ``ranges``.
+    buf
+        The buffer holding this batch's pinned memory reservation. Cleared
+        by ``PrefetchedByteRanges.release`` once its data has been copied
+        to device.
+    """
 
     ranges: list[Any]
     host: memoryview | None
@@ -452,18 +512,38 @@ class _PinnedBatch:
 
 @dataclasses.dataclass
 class PrefetchedByteRanges:
-    """Prefetched byte ranges and pinned host buffers for one SplitScan task."""
+    """
+    Prefetched byte ranges and pinned host buffers for one scan task's read.
+
+    Parameters
+    ----------
+    row_group_indices
+        Row groups this task will read, after stats/bloom-filter pruning.
+    pass_mode
+        The ``HybridScanPassMode`` this task was prefetched for.
+    plc_filter
+        The parquet filter expression pushed down for this task.
+    all_columns
+        Prefetched batch covering every requested column, under
+        ``HybridScanPassMode.SINGLE_PASS``.
+    filter
+        Prefetched batch covering filter columns, under
+        ``HybridScanPassMode.TWO_PASS``.
+    payload
+        Prefetched batch covering payload columns, under
+        ``HybridScanPassMode.TWO_PASS``.
+    """
 
     row_group_indices: list[int]
     pass_mode: HybridScanPassMode
     plc_filter: plc_expr.Expression
-    all_columns: _PinnedBatch | None = None
-    filter: _PinnedBatch | None = None
-    payload: _PinnedBatch | None = None
+    all_columns: PinnedBatch | None = None
+    filter: PinnedBatch | None = None
+    payload: PinnedBatch | None = None
 
     @classmethod
     def empty(cls, plc_filter: plc_expr.Expression) -> PrefetchedByteRanges:
-        """Return a fully-pruned split with no rows to read."""
+        """Return a fully-pruned task with no rows to read."""
         return cls(
             row_group_indices=[],
             pass_mode=HybridScanPassMode.SINGLE_PASS,
@@ -477,10 +557,23 @@ class PrefetchedByteRanges:
                 batch.buf = None
 
 
-def _copy_pinned_batch_to_device(
-    batch: _PinnedBatch, stream: Stream
+def copy_pinned_batch_to_device(
+    batch: PinnedBatch, stream: Stream
 ) -> list[plc.gpumemoryview]:
-    """Wait for in-flight reads then copy a pinned host batch to device."""
+    """
+    Wait for in-flight reads then copy a pinned host batch to device.
+
+    Parameters
+    ----------
+    batch
+        The prefetched batch to wait on and copy.
+    stream
+        CUDA stream to copy on.
+
+    Returns
+    -------
+    One device buffer view per range in ``batch.ranges``, in that order.
+    """
     if batch.host is None:
         return []
     total = sum(r.size for r in batch.ranges)
@@ -499,10 +592,25 @@ def _copy_pinned_batch_to_device(
     return chunks
 
 
-def _evaluate_with_prefetch(
+def evaluate_with_prefetch(
     scan: SplitScan, prefetched: PrefetchedByteRanges, *, context: IRExecutionContext
 ) -> DataFrame:
-    """Evaluate a SplitScan using already-prefetched byte ranges."""
+    """
+    Evaluate a scan task using already-prefetched byte ranges.
+
+    Parameters
+    ----------
+    scan
+        The scan task to evaluate.
+    prefetched
+        Byte ranges and pinned host buffers prefetched for ``scan``.
+    context
+        The execution context to evaluate under.
+
+    Returns
+    -------
+    The resulting DataFrame.
+    """
     assert scan.cached_parquet_info is not None
     return _read_with_hybrid_scan(
         scan.schema,
@@ -699,7 +807,7 @@ class SplitScan(IR):
                         paths,
                         with_columns,
                         plc_filter,
-                        _split_row_group_indices(
+                        split_row_group_indices(
                             total_row_groups, total_splits, split_index
                         ),
                         stream,

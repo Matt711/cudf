@@ -6,8 +6,10 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, cast
 
-import polars as pl
 import pytest
+
+import polars as pl
+
 from rapidsmpf.memory.pinned_memory_resource import (
     is_pinned_memory_resources_supported,
 )
@@ -46,8 +48,6 @@ from cudf_polars.testing.engine_utils import SMALL_MAX_ROWS_PER_PARTITION
 from cudf_polars.testing.io import make_partitioned_source
 from cudf_polars.utils.config import (
     ConfigOptions,
-    HybridScanPrefetchMemoryMode,
-    HybridScanPrefetchOrderingMode,
     MaxConcurrentIOTasks,
     ParquetOptions,
 )
@@ -556,14 +556,6 @@ def test_split_scan_hybrid(
         (pl.col("y").str.contains("cat"), ["x", "z"]),
     ],
 )
-@pytest.mark.parametrize(
-    "prefetch_memory_mode,prefetch_ordering_mode",
-    [
-        (HybridScanPrefetchMemoryMode.FAIL_FAST, HybridScanPrefetchOrderingMode.ORDERED),
-        (HybridScanPrefetchMemoryMode.FAIL_FAST, HybridScanPrefetchOrderingMode.RACE),
-        (HybridScanPrefetchMemoryMode.WAIT, HybridScanPrefetchOrderingMode.ORDERED),
-    ],
-)
 @pytest.mark.skipif(
     not is_pinned_memory_resources_supported(),
     reason="Pinned memory requires CUDA 12.6+ driver and runtime",
@@ -573,8 +565,6 @@ def test_split_scan_hybrid_prefetch(
     df: pl.DataFrame,
     predicate: pl.Expr,
     use_columns: list[str] | None,
-    prefetch_memory_mode: HybridScanPrefetchMemoryMode,
-    prefetch_ordering_mode: HybridScanPrefetchOrderingMode,
     streaming_engine_factory: Callable[..., StreamingEngine],
 ) -> None:
     """Prefetched splits must match the same query with prefetching disabled."""
@@ -586,8 +576,6 @@ def test_split_scan_hybrid_prefetch(
             parquet_options={
                 "use_hybrid_scan": True,
                 "prefetch_file_metadata": True,
-                "prefetch_memory_mode": prefetch_memory_mode,
-                "prefetch_ordering_mode": prefetch_ordering_mode,
             },
         ),
     )

@@ -16,15 +16,12 @@ from cudf_polars.dsl.ir import _prepare_parquet_predicate
 from cudf_polars.dsl.to_ast import to_parquet_filter
 from cudf_polars.dsl.tracing import CUDF_POLARS_NVTX_DOMAIN, nvtx_annotate_cudf_polars
 from cudf_polars.streaming.io import (
+    PinnedBatch,
     PrefetchedByteRanges,
-    _PinnedBatch,
-    _decide_pass_mode,
-    _split_row_group_indices,
+    decide_pass_mode,
+    split_row_group_indices,
 )
-from cudf_polars.utils.config import (
-    HybridScanPassMode,
-    HybridScanPrefetchMemoryMode,
-)
+from cudf_polars.utils.config import HybridScanPassMode
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 
 if TYPE_CHECKING:
@@ -38,22 +35,33 @@ if TYPE_CHECKING:
 
     from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.streaming.io import SplitScan
-    from cudf_polars.utils.config import ParquetOptions
 
 
 @nvtx_annotate_cudf_polars(message="issue_pread_calls")
-def _issue_pread_calls(
+def issue_pread_calls(
     handle: CuFile | RemoteFile, ranges: list[Any], host: memoryview
 ) -> list[IOFuture]:
     """
     Issue one ``pread`` call per run of consecutive, file-adjacent ranges.
 
-    ``ranges`` stays in the order the caller needs it back in (positional,
-    matching a ``HybridScanReader`` byte-range call), so only *runs* of
-    already-adjacent entries get merged, not the whole list resorted by file
-    offset. Column chunk ranges come back roughly file-ordered already, so
-    this still catches most of the coalescing benefit without touching the
-    order the caller depends on.
+    Parameters
+    ----------
+    handle
+        Open kvikio handle to read from.
+    ranges
+        Byte ranges to read, in the order the caller needs them back in
+        (positional, matching a ``HybridScanReader`` byte-range call). Only
+        *runs* of already-adjacent entries get merged, not the whole list
+        resorted by file offset. Column chunk ranges come back roughly
+        file-ordered already, so this still catches most of the coalescing
+        benefit without touching the order the caller depends on.
+    host
+        Pinned host buffer to read into, sized to fit every range in
+        ``ranges`` back to back.
+
+    Returns
+    -------
+    One ``pread`` future per coalesced run, in file order.
     """
     futures = []
     offset = 0
@@ -80,19 +88,26 @@ def _issue_pread_calls(
     return futures
 
 
-async def _reserve_pinned_batch(
+async def reserve_pinned_batch(
     context: Context,
-    parquet_options: ParquetOptions,
     handle: CuFile | RemoteFile,
     ranges: list[Any],
-) -> _PinnedBatch | None:
+) -> PinnedBatch | None:
     """
     Reserve pinned host memory and issue reads for one batch of byte ranges.
 
-    Returns ``None`` when ``ranges`` is empty, or when
-    ``HybridScanPrefetchMemoryMode.FAIL_FAST`` couldn't reserve memory. A
-    ``None`` batch is handled the same as a full prefetch miss by the
-    consumer, it just reads that batch synchronously later.
+    Parameters
+    ----------
+    context
+        The rapidsmpf context to reserve memory through.
+    handle
+        Open kvikio handle to read from.
+    ranges
+        Byte ranges to reserve for and read.
+
+    Returns
+    -------
+    The reserved, in-flight batch, or ``None`` when ``ranges`` is empty.
     """
     if not ranges:
         return None
@@ -106,46 +121,31 @@ async def _reserve_pinned_batch(
         message="reserve_pinned_batch", domain=CUDF_POLARS_NVTX_DOMAIN, payload=total
     )
     try:
-        if parquet_options.prefetch_memory_mode is HybridScanPrefetchMemoryMode.WAIT:
-            # TODO: WAIT has no equivalent to FAIL_FAST's demotion. A reservation
-            # here can queue behind other pinned memory contention (e.g. shuffle
-            # spill) with no way to proactively free up our own holdings.
-            wait_range = nvtx.start_range(
-                message="reserve_memory_wait",
-                domain=CUDF_POLARS_NVTX_DOMAIN,
-                payload=total,
+        # TODO: a reservation here can queue behind other pinned memory
+        # contention (e.g. shuffle spill) with no way to proactively free up
+        # our own holdings.
+        wait_range = nvtx.start_range(
+            message="reserve_memory_wait", domain=CUDF_POLARS_NVTX_DOMAIN, payload=total
+        )
+        try:
+            reservation = await reserve_memory(
+                context,
+                size=total,
+                net_memory_delta=total,
+                mem_type=MemoryType.PINNED_HOST,
             )
-            try:
-                reservation = await reserve_memory(
-                    context,
-                    size=total,
-                    net_memory_delta=total,
-                    mem_type=MemoryType.PINNED_HOST,
-                )
-            finally:
-                nvtx.end_range(wait_range)
-        else:
-            mem_types = (
-                [MemoryType.PINNED_HOST, MemoryType.HOST]
-                if parquet_options.prefetch_allow_host_fallback
-                else [MemoryType.PINNED_HOST]
-            )
-            try:
-                # TODO: consider demoting our own oldest not-yet-consumed pinned
-                # entries to pageable host here instead of just missing.
-                reservation = br.reserve_or_fail(total, mem_types)
-            except RuntimeError:
-                return None
+        finally:
+            nvtx.end_range(wait_range)
         buf = br.make_buffer(total, br.stream_pool.get_stream(), reservation)
         with buf.host_view() as host:
-            futures = _issue_pread_calls(handle, ranges, host)
+            futures = issue_pread_calls(handle, ranges, host)
     finally:
         nvtx.end_range(batch_range)
-    return _PinnedBatch(ranges=ranges, host=host, futures=futures, buf=buf)
+    return PinnedBatch(ranges=ranges, host=host, futures=futures, buf=buf)
 
 
 @nvtx_annotate_cudf_polars(message="prepare_prefetch")
-def _prepare_prefetch(
+def prepare_prefetch(
     scan: SplitScan,
 ) -> (
     tuple[
@@ -154,14 +154,20 @@ def _prepare_prefetch(
     | None
 ):
     """
-    Prune row groups for one SplitScan and compute its byte ranges.
+    Prune row groups for one scan task and compute its byte ranges.
 
-    Returns ``None`` when the predicate can't be expressed as a parquet
-    filter. Otherwise returns ``(plc_filter, row_group_indices, pass_mode,
-    primary_ranges, payload_ranges)``. ``payload_ranges`` is ``None`` under
-    ``SINGLE_PASS`` (``primary_ranges`` already covers every column), and a
-    second list under ``TWO_PASS`` (``primary_ranges`` is the filter
-    columns' ranges).
+    Parameters
+    ----------
+    scan
+        The scan task to prune and compute byte ranges for.
+
+    Returns
+    -------
+    ``None`` when the predicate can't be expressed as a parquet filter.
+    Otherwise ``(plc_filter, row_group_indices, pass_mode, primary_ranges,
+    payload_ranges)``. ``payload_ranges`` is ``None`` under ``SINGLE_PASS``
+    (``primary_ranges`` already covers every column), and a second list
+    under ``TWO_PASS`` (``primary_ranges`` is the filter columns' ranges).
     """
     cached_info = scan.cached_parquet_info
     assert cached_info is not None
@@ -178,7 +184,7 @@ def _prepare_prefetch(
     if plc_filter is None or residual is not None:
         return None
 
-    row_group_indices = _split_row_group_indices(
+    row_group_indices = split_row_group_indices(
         len(cached_info[0].file_metadata.row_group_num_rows),
         scan.total_splits,
         scan.split_index,
@@ -216,7 +222,7 @@ def _prepare_prefetch(
     if not row_group_indices:
         return plc_filter, [], HybridScanPassMode.SINGLE_PASS, [], None
 
-    pass_mode = _decide_pass_mode(
+    pass_mode = decide_pass_mode(
         parquet_options.pass_mode, row_group_indices, row_group_count_before_pruning
     )
     if pass_mode is HybridScanPassMode.SINGLE_PASS:
@@ -238,24 +244,42 @@ async def prefetch_scan_byte_ranges(
     own_turn: asyncio.Event,
 ) -> PrefetchedByteRanges | None:
     """
-    Prune row groups for one SplitScan and prefetch its byte ranges.
+    Prune row groups for one scan task and prefetch its byte ranges.
 
     Pruning and byte-range computation are offloaded to ``ir_context``'s
-    thread pool and run freely, out of order across splits. Claiming pinned
+    thread pool and run freely, out of order across tasks. Claiming pinned
     memory and issuing reads waits for ``wait_for`` first (the previous
-    split's own attempt, within the same producer), so a split due for
+    task's own attempt, within the same producer), so a task due for
     consumption soon can't lose its reservation to one that isn't, then
     signals ``own_turn`` before returning, whether or not a reservation
     succeeded.
 
-    Returns ``None`` when the predicate can't be expressed as a parquet
-    filter, the caller falls back to ``SplitScan.do_evaluate`` in that case.
+    Parameters
+    ----------
+    scan
+        The scan task to prefetch.
+    context
+        The rapidsmpf context to reserve memory through.
+    ir_context
+        The execution context to offload pruning and byte-range computation to.
+    wait_for
+        Event to wait on before claiming pinned memory and issuing reads, or
+        ``None`` for the first task in a producer's chain.
+    own_turn
+        Event this task sets once it's done claiming resources, whether or
+        not a reservation succeeded, so the next task in the chain can proceed.
+
+    Returns
+    -------
+    The prefetched byte ranges, or ``None`` when the predicate can't be
+    expressed as a parquet filter, the caller falls back to
+    ``SplitScan.do_evaluate`` in that case.
     """
     task_range = nvtx.start_range(
         message="prefetch_scan_byte_ranges", domain=CUDF_POLARS_NVTX_DOMAIN
     )
     try:
-        prepared = await ir_context.to_thread(_prepare_prefetch, scan)
+        prepared = await ir_context.to_thread(prepare_prefetch, scan)
         if wait_for is not None:
             wait_range = nvtx.start_range(
                 message="prefetch_wait_for_turn", domain=CUDF_POLARS_NVTX_DOMAIN
@@ -275,11 +299,10 @@ async def prefetch_scan_byte_ranges(
 
             assert scan.cached_parquet_info is not None
             handle = scan.cached_parquet_info[0].remote_handle()
-            parquet_options = scan.parquet_options
 
             if pass_mode is HybridScanPassMode.SINGLE_PASS:
-                all_columns = await _reserve_pinned_batch(
-                    context, parquet_options, handle, primary_ranges
+                all_columns = await reserve_pinned_batch(
+                    context, handle, primary_ranges
                 )
                 return PrefetchedByteRanges(
                     row_group_indices=row_group_indices,
@@ -288,11 +311,9 @@ async def prefetch_scan_byte_ranges(
                     all_columns=all_columns,
                 )
 
-            filter_batch = await _reserve_pinned_batch(
-                context, parquet_options, handle, primary_ranges
-            )
-            payload_batch = await _reserve_pinned_batch(
-                context, parquet_options, handle, payload_ranges or []
+            filter_batch = await reserve_pinned_batch(context, handle, primary_ranges)
+            payload_batch = await reserve_pinned_batch(
+                context, handle, payload_ranges or []
             )
             return PrefetchedByteRanges(
                 row_group_indices=row_group_indices,

@@ -60,8 +60,6 @@ __all__ = [
     "DaskContext",
     "DynamicPlanningOptions",
     "HybridScanPassMode",
-    "HybridScanPrefetchMemoryMode",
-    "HybridScanPrefetchOrderingMode",
     "InMemoryExecutor",
     "JoinFilterPushdownOptions",
     "MaxConcurrentIOTasks",
@@ -231,38 +229,6 @@ class HybridScanPassMode(enum.StrEnum):
     TWO_PASS = "two_pass"
 
 
-class HybridScanPrefetchMemoryMode(enum.StrEnum):
-    """
-    How a hybrid scan prefetch task reserves pinned host memory.
-
-    * ``HybridScanPrefetchMemoryMode.FAIL_FAST`` : Reserve without waiting.
-      A split whose reservation fails is skipped, and reads synchronously
-      when its task runs.
-    * ``HybridScanPrefetchMemoryMode.WAIT`` : Reserve through rapidsmpf's
-      waiting admission path, the same one used for the memory a split's
-      task itself needs.
-    """
-
-    FAIL_FAST = "fail_fast"
-    WAIT = "wait"
-
-
-class HybridScanPrefetchOrderingMode(enum.StrEnum):
-    """
-    How concurrent hybrid scan prefetch tasks claim shared, limited resources.
-
-    * ``HybridScanPrefetchOrderingMode.ORDERED`` : Within a producer, claim
-      pinned memory and issue reads in split order, so a split due for
-      consumption soon can't lose its reservation to one that isn't.
-    * ``HybridScanPrefetchOrderingMode.RACE`` : No ordering, whichever
-      split's prefetch task finishes its prep work first claims resources
-      first.
-    """
-
-    ORDERED = "ordered"
-    RACE = "race"
-
-
 class Cluster(enum.StrEnum):
     """
     The cluster configuration for the streaming executor.
@@ -415,17 +381,6 @@ class ParquetOptions:
         ``TWO_PASS`` if a predicate is expected to be selective at any level,
         row group or page, since the automatic choice only has visibility
         into row-group elimination.
-    prefetch_memory_mode
-        How a hybrid scan prefetch task reserves pinned host memory. See
-        :class:`HybridScanPrefetchMemoryMode`. Default is ``FAIL_FAST``.
-    prefetch_allow_host_fallback
-        Whether a prefetch task falls back to plain host memory when pinned
-        memory can't be reserved. Only meaningful under
-        ``HybridScanPrefetchMemoryMode.FAIL_FAST``. Default is False.
-    prefetch_ordering_mode
-        How concurrent hybrid scan prefetch tasks claim shared, limited
-        resources. See :class:`HybridScanPrefetchOrderingMode`. Default is
-        ``ORDERED``.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -481,27 +436,6 @@ class ParquetOptions:
             default=UNSPECIFIED,
         )
     )
-    prefetch_memory_mode: HybridScanPrefetchMemoryMode = dataclasses.field(
-        default_factory=_make_default_factory(
-            f"{_env_prefix}__PREFETCH_MEMORY_MODE",
-            HybridScanPrefetchMemoryMode.__call__,
-            default=HybridScanPrefetchMemoryMode.FAIL_FAST,
-        )
-    )
-    prefetch_allow_host_fallback: bool = dataclasses.field(
-        default_factory=_make_default_factory(
-            f"{_env_prefix}__PREFETCH_ALLOW_HOST_FALLBACK",
-            _bool_converter,
-            default=False,
-        )
-    )
-    prefetch_ordering_mode: HybridScanPrefetchOrderingMode = dataclasses.field(
-        default_factory=_make_default_factory(
-            f"{_env_prefix}__PREFETCH_ORDERING_MODE",
-            HybridScanPrefetchOrderingMode.__call__,
-            default=HybridScanPrefetchOrderingMode.ORDERED,
-        )
-    )
     # Internal benchmarking flag. When False, skips stats and bloom-filter pruning
     # before the first pass of a hybrid scan so you can measure two-pass read
     # overhead in isolation. No reason to set this to False in production.
@@ -545,18 +479,6 @@ class ParquetOptions:
             )
         if not isinstance(self.pass_mode, (HybridScanPassMode, Unspecified)):
             raise TypeError("pass_mode must be a HybridScanPassMode when specified")
-        if not isinstance(self.prefetch_memory_mode, HybridScanPrefetchMemoryMode):
-            raise TypeError(
-                "prefetch_memory_mode must be a HybridScanPrefetchMemoryMode"
-            )
-        if not isinstance(self.prefetch_allow_host_fallback, bool):
-            raise TypeError("prefetch_allow_host_fallback must be a bool")
-        if not isinstance(
-            self.prefetch_ordering_mode, HybridScanPrefetchOrderingMode
-        ):
-            raise TypeError(
-                "prefetch_ordering_mode must be a HybridScanPrefetchOrderingMode"
-            )
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
 
