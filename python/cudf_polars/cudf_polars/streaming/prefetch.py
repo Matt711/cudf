@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import nvtx
 
@@ -38,33 +38,47 @@ if TYPE_CHECKING:
     from cudf_polars.streaming.io import SplitScan
 
 
-@nvtx_annotate_cudf_polars(message="issue_pread_calls")
-def issue_pread_calls(
-    handle: CuFile | RemoteFile, ranges: list[Any], host: memoryview
-) -> list[IOFuture]:
+# TODO: kvikio is adding a remote batch API that coalesces and splits ranges
+# itself. Once that lands, coalesce_adjacent_ranges and issue_pread_calls
+# below should likely be replaced by calls into it instead of maintaining our
+# own coalescing logic.
+class CoalescedRange(NamedTuple):
+    """One run of consecutive, file-adjacent ranges, merged into a single span."""
+
+    host_start: int
+    """Start offset into the destination host buffer."""
+    host_end: int
+    """End offset into the destination host buffer."""
+    file_offset: int
+    """Start offset into the source file."""
+    file_size: int
+    """Number of bytes to read from the source file."""
+
+
+@nvtx_annotate_cudf_polars(message="coalesce_adjacent_ranges")
+def coalesce_adjacent_ranges(ranges: list[Any]) -> list[CoalescedRange]:
     """
-    Issue one ``pread`` call per run of consecutive, file-adjacent ranges.
+    Merge runs of consecutive, file-adjacent ranges into single spans.
+
+    Pure endpoint-adjustment logic, no I/O: computes where each merged span
+    starts and ends in both the destination host buffer and the source
+    file, for a caller to issue reads against.
 
     Parameters
     ----------
-    handle
-        Open kvikio handle to read from.
     ranges
-        Byte ranges to read, in the order the caller needs them back in
+        Byte ranges to coalesce, in the order the caller needs them back in
         (positional, matching a ``HybridScanReader`` byte-range call). Only
         *runs* of already-adjacent entries get merged, not the whole list
         resorted by file offset. Column chunk ranges come back roughly
         file-ordered already, so this still catches most of the coalescing
         benefit without touching the order the caller depends on.
-    host
-        Pinned host buffer to read into, sized to fit every range in
-        ``ranges`` back to back.
 
     Returns
     -------
-    One ``pread`` future per coalesced run, in file order.
+    One :class:`CoalescedRange` per coalesced run, in file order.
     """
-    futures = []
+    groups = []
     offset = 0
     i = 0
     n = len(ranges)
@@ -78,15 +92,45 @@ def issue_pread_calls(
             group_file_end += ranges[j].size
             offset += ranges[j].size
             j += 1
-        futures.append(
-            handle.pread(
-                host[group_start:offset],
-                size=group_file_end - group_file_start,
-                file_offset=group_file_start,
+        groups.append(
+            CoalescedRange(
+                group_start, offset, group_file_start, group_file_end - group_file_start
             )
         )
         i = j
-    return futures
+    return groups
+
+
+@nvtx_annotate_cudf_polars(message="issue_pread_calls")
+def issue_pread_calls(
+    handle: CuFile | RemoteFile, ranges: list[Any], host: memoryview
+) -> list[IOFuture]:
+    """
+    Issue one ``pread`` call per run of consecutive, file-adjacent ranges.
+
+    Parameters
+    ----------
+    handle
+        Open kvikio handle to read from.
+    ranges
+        Byte ranges to read; coalesced via :func:`coalesce_adjacent_ranges`
+        before issuing reads.
+    host
+        Pinned host buffer to read into, sized to fit every range in
+        ``ranges`` back to back.
+
+    Returns
+    -------
+    One ``pread`` future per coalesced run, in file order.
+    """
+    return [
+        handle.pread(
+            host[coalesced.host_start : coalesced.host_end],
+            size=coalesced.file_size,
+            file_offset=coalesced.file_offset,
+        )
+        for coalesced in coalesce_adjacent_ranges(ranges)
+    ]
 
 
 @nvtx_annotate_cudf_polars(message="issue_reads_into_pinned_buffer")
