@@ -442,12 +442,10 @@ def _setup_worker(
         max_workers=num_py_executors,
         thread_name_prefix="dask-executor",
     )
-    # TODO: experiment, aliased to py_executor rather than a real second pool,
-    # to test whether real concurrency between prefetch housekeeping and
-    # decode work (not the two-pool code structure itself) is what's causing
-    # materialize_all_columns slowdowns. Revert to a real ThreadPoolExecutor
-    # once that's settled.
-    prefetch_executor = py_executor
+    prefetch_executor = ThreadPoolExecutor(
+        max_workers=num_prefetch_executors,
+        thread_name_prefix="dask-prefetch-executor",
+    )
 
     if quent_context is not None:
         quent_logger: cudf_polars.quent._logging.QuentLogger | None = (

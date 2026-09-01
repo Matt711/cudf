@@ -286,12 +286,10 @@ class RankActor:
             max_workers=num_py_executors,
             thread_name_prefix="ray-executor",
         )
-        # TODO: experiment, aliased to py_executor rather than a real second
-        # pool, to test whether real concurrency between prefetch
-        # housekeeping and decode work (not the two-pool code structure
-        # itself) is what's causing materialize_all_columns slowdowns.
-        # Revert to a real ThreadPoolExecutor once that's settled.
-        self._prefetch_executor = self._py_executor
+        self._prefetch_executor = ThreadPoolExecutor(
+            max_workers=num_prefetch_executors,
+            thread_name_prefix="ray-prefetch-executor",
+        )
         self._comm: Communicator | None = None
         self._ctx: Context | None = None
         if quent_enabled:
