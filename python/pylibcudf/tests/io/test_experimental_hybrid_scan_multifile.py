@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import io
 
@@ -232,7 +232,7 @@ def test_hybrid_scan_multifile_filter_row_groups_with_stats(
     assert filtered[1] == list(range(num_row_groups_per_source))
 
 
-def test_hybrid_scan_multifile_secondary_filters_byte_ranges(
+def test_hybrid_scan_multifile_bloom_and_dictionary_byte_ranges(
     multifile_hybrid_scan_reader,
     multifile_parquet_options,
     num_rows_per_source,
@@ -254,14 +254,23 @@ def test_hybrid_scan_multifile_secondary_filters_byte_ranges(
         multifile_parquet_options
     )
 
-    bloom_ranges, dict_ranges = (
-        multifile_hybrid_scan_reader.secondary_filters_byte_ranges(
+    bloom_ranges, bloom_sources = (
+        multifile_hybrid_scan_reader.bloom_filters_byte_ranges(
+            all_row_groups, multifile_parquet_options
+        )
+    )
+    dict_ranges, dict_sources = (
+        multifile_hybrid_scan_reader.dictionary_pages_byte_ranges(
             all_row_groups, multifile_parquet_options
         )
     )
 
     assert isinstance(bloom_ranges, list)
+    assert isinstance(bloom_sources, list)
+    assert len(bloom_ranges) == len(bloom_sources)
     assert isinstance(dict_ranges, list)
+    assert isinstance(dict_sources, list)
+    assert len(dict_ranges) == len(dict_sources)
 
 
 def test_hybrid_scan_multifile_all_column_chunks_byte_ranges(

@@ -1,7 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from cython.operator cimport dereference
 from libc.stdint cimport uint8_t
+from libc.stddef cimport size_t
 from libcpp.memory cimport make_unique, unique_ptr
 from libcpp.pair cimport pair
 from libcpp.utility cimport move
@@ -100,7 +102,7 @@ cdef class HybridScanMultifile:
         cdef vector[c_cpp_FileMetaData] meta_vec
         cdef c_FileMetaData m
         for m in metadata:
-            meta_vec.push_back(m.c_obj)
+            meta_vec.push_back(dereference(m.c_obj))
         reader.c_obj = make_unique[cpp_hybrid_scan_multifile](
             host_span[const_FileMetaData](
                 <const_FileMetaData*>meta_vec.data(), meta_vec.size()
@@ -119,7 +121,13 @@ cdef class HybridScanMultifile:
         """
         cdef vector[c_cpp_FileMetaData] metas = \
             self.c_obj.get()[0].parquet_metadatas()
-        return [c_FileMetaData.from_cpp(m) for m in metas]
+        cdef unique_ptr[c_cpp_FileMetaData] meta_ptr
+        cdef size_t i
+        result = []
+        for i in range(metas.size()):
+            meta_ptr = make_unique[c_cpp_FileMetaData](metas[i])
+            result.append(c_FileMetaData.from_libcudf(move(meta_ptr)))
+        return result
 
     def page_index_byte_ranges(self):
         """Get the byte ranges of the page indexes for all sources.
@@ -262,12 +270,12 @@ cdef class HybridScanMultifile:
             )
         return [list(g) for g in filtered]
 
-    def secondary_filters_byte_ranges(
+    def bloom_filters_byte_ranges(
         self,
         list row_group_indices,
         ParquetReaderOptions options
     ):
-        """Get byte ranges of bloom filters and dictionary pages.
+        """Get byte ranges of bloom filters for row group pruning.
 
         Parameters
         ----------
@@ -278,25 +286,51 @@ cdef class HybridScanMultifile:
 
         Returns
         -------
-        tuple[list[ByteRangeInfo], list[ByteRangeInfo]]
-            Tuple of (bloom_filter_ranges, dictionary_page_ranges)
+        tuple[list[ByteRangeInfo], list[int]]
+            Flattened bloom filter byte ranges and their corresponding source indices
         """
         cdef vector[vector[size_type]] groups_vec = _to_per_source(row_group_indices)
-        cdef pair[vector[byte_range_info], vector[byte_range_info]] ranges = \
-            self.c_obj.get()[0].secondary_filters_byte_ranges(
+        cdef pair[vector[byte_range_info], vector[size_type]] result = \
+            self.c_obj.get()[0].bloom_filters_byte_ranges(
                 host_span[const_vector_size_type](
                     <const_vector_size_type*>groups_vec.data(), groups_vec.size()
                 ),
                 options.c_obj
             )
+        ranges = [ByteRangeInfo(r.offset(), r.size()) for r in result.first]
+        source_indices = list(result.second)
+        return (ranges, source_indices)
 
-        bloom_ranges = [
-            ByteRangeInfo(r.offset(), r.size()) for r in ranges.first
-        ]
-        dict_ranges = [
-            ByteRangeInfo(r.offset(), r.size()) for r in ranges.second
-        ]
-        return (bloom_ranges, dict_ranges)
+    def dictionary_pages_byte_ranges(
+        self,
+        list row_group_indices,
+        ParquetReaderOptions options
+    ):
+        """Get byte ranges of column chunk dictionary pages for row group pruning.
+
+        Parameters
+        ----------
+        row_group_indices : list[list[int]]
+            Input row group indices, one inner list per source
+        options : ParquetReaderOptions
+            Parquet reader options
+
+        Returns
+        -------
+        tuple[list[ByteRangeInfo], list[int]]
+            Flattened dictionary page byte ranges and their corresponding source indices
+        """
+        cdef vector[vector[size_type]] groups_vec = _to_per_source(row_group_indices)
+        cdef pair[vector[byte_range_info], vector[size_type]] result = \
+            self.c_obj.get()[0].dictionary_pages_byte_ranges(
+                host_span[const_vector_size_type](
+                    <const_vector_size_type*>groups_vec.data(), groups_vec.size()
+                ),
+                options.c_obj
+            )
+        ranges = [ByteRangeInfo(r.offset(), r.size()) for r in result.first]
+        source_indices = list(result.second)
+        return (ranges, source_indices)
 
     def build_all_true_row_mask(
         self,

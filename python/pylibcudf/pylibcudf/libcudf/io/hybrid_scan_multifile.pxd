@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from libc.stdint cimport uint8_t
@@ -71,8 +71,15 @@ cdef extern from "cudf/io/experimental/hybrid_scan_multifile.hpp" \
         ) except +libcudf_exception_handler
 
         pair[
-            vector[byte_range_info], vector[byte_range_info]
-        ] secondary_filters_byte_ranges(
+            vector[byte_range_info], vector[size_type]
+        ] bloom_filters_byte_ranges(
+            host_span[const_vector_size_type] row_group_indices,
+            const parquet_reader_options& options
+        ) except +libcudf_exception_handler
+
+        pair[
+            vector[byte_range_info], vector[size_type]
+        ] dictionary_pages_byte_ranges(
             host_span[const_vector_size_type] row_group_indices,
             const parquet_reader_options& options
         ) except +libcudf_exception_handler

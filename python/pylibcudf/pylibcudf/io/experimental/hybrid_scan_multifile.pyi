@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from rmm.pylibrmm.memory_resource import DeviceMemoryResource
@@ -45,11 +45,16 @@ class HybridScanMultifile:
         options: ParquetReaderOptions,
         stream: CudaStreamLike | None = None,
     ) -> list[list[int]]: ...
-    def secondary_filters_byte_ranges(
+    def bloom_filters_byte_ranges(
         self,
         row_group_indices: list[list[int]],
         options: ParquetReaderOptions,
-    ) -> tuple[list[ByteRangeInfo], list[ByteRangeInfo]]: ...
+    ) -> tuple[list[ByteRangeInfo], list[int]]: ...
+    def dictionary_pages_byte_ranges(
+        self,
+        row_group_indices: list[list[int]],
+        options: ParquetReaderOptions,
+    ) -> tuple[list[ByteRangeInfo], list[int]]: ...
     def build_all_true_row_mask(
         self,
         row_group_indices: list[list[int]],
