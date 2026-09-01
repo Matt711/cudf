@@ -182,6 +182,49 @@ def issue_reads_into_pinned_buffer(
     return view, host, futures
 
 
+@nvtx_annotate_cudf_polars(message="make_buffer_and_issue_reads")
+def make_buffer_and_issue_reads(
+    br: Any,
+    total: int,
+    stream: Any,
+    reservation: Any,
+    handle: CuFile | RemoteFile,
+    ranges: list[Any],
+) -> tuple[Buffer, BufferHostView, memoryview, list[IOFuture]]:
+    """
+    Allocate a pinned buffer and issue its reads, in one call on one thread.
+
+    Combines what were previously two separate ``to_prefetch_thread`` hops
+    (``br.make_buffer`` then :func:`issue_reads_into_pinned_buffer`) into a
+    single dispatch, so a split only has to round-trip through the event
+    loop once here instead of twice.
+
+    Parameters
+    ----------
+    br
+        The buffer resource to allocate the pinned buffer from.
+    total
+        Size, in bytes, of the pinned buffer to allocate.
+    stream
+        CUDA stream to allocate on.
+    reservation
+        Memory reservation covering ``total`` bytes, already claimed on the
+        event loop before this call was dispatched.
+    handle
+        Open kvikio handle to read from.
+    ranges
+        Byte ranges to read.
+
+    Returns
+    -------
+    The allocated buffer, the still-open view backing ``host``, the pinned
+    host view read into, and one ``pread`` future per coalesced run.
+    """
+    buf = br.make_buffer(total, stream, reservation)
+    view, host, futures = issue_reads_into_pinned_buffer(buf, handle, ranges)
+    return buf, view, host, futures
+
+
 async def reserve_pinned_batch(
     context: Context,
     ir_context: IRExecutionContext,
@@ -233,11 +276,14 @@ async def reserve_pinned_batch(
             )
         finally:
             nvtx.end_range(wait_range)
-        buf = await ir_context.to_prefetch_thread(
-            br.make_buffer, total, br.stream_pool.get_stream(), reservation
-        )
-        view, host, futures = await ir_context.to_prefetch_thread(
-            issue_reads_into_pinned_buffer, buf, handle, ranges
+        buf, view, host, futures = await ir_context.to_prefetch_thread(
+            make_buffer_and_issue_reads,
+            br,
+            total,
+            br.stream_pool.get_stream(),
+            reservation,
+            handle,
+            ranges,
         )
     finally:
         nvtx.end_range(batch_range)
