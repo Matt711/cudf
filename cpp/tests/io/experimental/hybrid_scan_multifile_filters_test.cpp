@@ -1,27 +1,33 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "hybrid_scan_common.hpp"
-#include "hybrid_scan_multifile_common.hpp"
+#include "tests/io/parquet_common.hpp"
 
 #include <cudf_test/base_fixture.hpp>
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
+#include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
-#include <cudf/io/text/byte_range_info.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <memory>
+#include <numeric>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -30,7 +36,7 @@ namespace {
  * @brief Copy fixed-width column data to a host vector
  */
 template <typename T>
-auto host_row_mask_data(cudf::column_view const& column, rmm::cuda_stream_view stream)
+auto host_row_mask_data(cudf::column_view const& column, cuda::stream_ref stream)
 {
   return cudf::detail::make_host_vector<T>(
     cudf::device_span<T const>(column.data<T>(), static_cast<size_t>(column.size())), stream);
@@ -65,7 +71,7 @@ std::vector<char> create_empty_parquet_with_stats()
  * @brief Build a scalar literal matching a filter column type
  */
 template <typename T>
-auto make_scalar(cudf::size_type value, rmm::cuda_stream_view stream)
+auto make_scalar(cudf::size_type value, cuda::stream_ref stream)
 {
   if constexpr (cudf::is_timestamp<T>()) {
     return cudf::timestamp_scalar<T>(T(typename T::duration(value)), true, stream);
@@ -221,6 +227,153 @@ TEST_F(HybridScanMultifileFiltersTest, EmptySource)
   ASSERT_EQ(page_index_byte_ranges.size(), num_sources);
   EXPECT_FALSE(page_index_byte_ranges.front().is_empty());
   EXPECT_TRUE(page_index_byte_ranges.back().is_empty());
+
+  auto const passes = reader->construct_row_group_passes(all_rgs, 1);
+  ASSERT_EQ(passes.size(), all_rgs.front().size());
+  for (auto const& pass : passes) {
+    ASSERT_EQ(pass.size(), num_sources);
+    ASSERT_EQ(pass.front().size(), 1);
+    EXPECT_TRUE(pass.back().empty());
+  }
+}
+
+TEST_F(HybridScanMultifileFiltersTest, RowGroupPasses)
+{
+  using T = uint32_t;
+
+  auto constexpr num_sources = 2;
+  std::vector<std::vector<char>> file_buffers;
+  file_buffers.reserve(num_sources);
+  std::transform(cuda::counting_iterator(0),
+                 cuda::counting_iterator(num_sources),
+                 std::back_inserter(file_buffers),
+                 [&](auto i) {
+                   srand(0xced + i);
+                   return std::get<1>(create_parquet_with_stats<T, 1>());
+                 });
+  auto inputs = multifile_inputs(build_source_info(file_buffers));
+
+  cudf::io::parquet_reader_options options = cudf::io::parquet_reader_options::builder().build();
+  auto const reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_multifile>(
+    inputs.footer_byte_spans, options);
+
+  auto const all_rgs = reader->all_row_groups(options);
+  ASSERT_EQ(all_rgs.size(), num_sources);
+  EXPECT_TRUE(std::all_of(all_rgs.begin(), all_rgs.end(), [](auto const& rgs) {
+    return rgs == (std::vector<cudf::size_type>{0, 1, 2, 3});
+  }));
+
+  // Invalid row group indices => throw error
+  {
+    auto invalid_rgs = all_rgs;
+    invalid_rgs.pop_back();
+    EXPECT_THROW(static_cast<void>(reader->construct_row_group_passes(invalid_rgs, 0)),
+                 std::invalid_argument);
+  }
+
+  // Empty row group indices => throw error
+  {
+    auto const empty_rgs = std::vector<std::vector<cudf::size_type>>(num_sources);
+    EXPECT_THROW(static_cast<void>(reader->construct_row_group_passes(empty_rgs, 0)),
+                 std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(reader->construct_row_group_passes(empty_rgs, 1)),
+                 std::invalid_argument);
+  }
+
+  // Zero pass read limit => single pass with all row groups
+  {
+    auto const passes = reader->construct_row_group_passes(all_rgs, 0);
+    ASSERT_EQ(passes.size(), 1);
+    ASSERT_EQ(passes.front().size(), num_sources);
+    EXPECT_EQ(passes.front(), all_rgs);
+  }
+
+  // Small pass read limit => each row group in its own pass
+  {
+    auto const passes = reader->construct_row_group_passes(all_rgs, 1);
+    ASSERT_EQ(passes.size(), num_sources * all_rgs.front().size());
+    for (auto const& pass : passes) {
+      ASSERT_EQ(pass.size(), num_sources);
+      auto const pass_num_row_groups =
+        std::accumulate(pass.begin(), pass.end(), std::size_t{0}, [](auto sum, auto const& rgs) {
+          return sum + rgs.size();
+        });
+      EXPECT_EQ(pass_num_row_groups, 1);
+    }
+  }
+
+  // Large pass read limit => multiple passes
+  {
+    auto const passes = reader->construct_row_group_passes(all_rgs, 10'000);
+    ASSERT_GT(passes.size(), 1);
+    auto const pass_num_row_groups = [](auto const& pass) {
+      return std::accumulate(
+        pass.begin(), pass.end(), std::size_t{0}, [](auto sum, auto const& rgs) {
+          return sum + rgs.size();
+        });
+    };
+    EXPECT_TRUE(std::any_of(passes.begin(), passes.end(), [&](auto const& pass) {
+      return pass_num_row_groups(pass) > 1;
+    }));
+
+    auto flattened = std::vector<std::pair<std::size_t, cudf::size_type>>{};
+    for (auto const& pass : passes) {
+      ASSERT_EQ(pass.size(), num_sources);
+      for (auto source_index = std::size_t{0}; source_index < pass.size(); ++source_index) {
+        std::transform(
+          pass[source_index].begin(),
+          pass[source_index].end(),
+          std::back_inserter(flattened),
+          [source_index](auto const rg_index) { return std::pair{source_index, rg_index}; });
+      }
+    }
+
+    auto expected = std::vector<std::pair<std::size_t, cudf::size_type>>{};
+    for (auto source_index = std::size_t{0}; source_index < all_rgs.size(); ++source_index) {
+      std::transform(
+        all_rgs[source_index].begin(),
+        all_rgs[source_index].end(),
+        std::back_inserter(expected),
+        [source_index](auto const rg_index) { return std::pair{source_index, rg_index}; });
+    }
+    EXPECT_EQ(flattened, expected);
+  }
+}
+
+TEST_F(HybridScanMultifileFiltersTest, RowGroupPassesSingleSourceParity)
+{
+  using T = cudf::duration_ms;
+
+  srand(0xced);
+
+  std::vector<std::vector<char>> file_buffers;
+  file_buffers.emplace_back(std::get<1>(create_parquet_with_stats<T, 1>()));
+
+  auto inputs = multifile_inputs(build_source_info(file_buffers));
+
+  cudf::io::parquet_reader_options options = cudf::io::parquet_reader_options::builder().build();
+  auto const multifile_reader =
+    std::make_unique<cudf::io::parquet::experimental::hybrid_scan_multifile>(
+      inputs.footer_byte_spans, options);
+  auto const single_file_reader =
+    std::make_unique<cudf::io::parquet::experimental::hybrid_scan_reader>(
+      inputs.footer_byte_spans.front(), options);
+
+  auto const all_rgs = multifile_reader->all_row_groups(options);
+  ASSERT_EQ(all_rgs.size(), 1);
+  auto constexpr pass_read_limit = std::size_t{10'000};
+  auto const multifile_passes =
+    multifile_reader->construct_row_group_passes(all_rgs, pass_read_limit);
+  auto const single_file_passes =
+    single_file_reader->construct_row_group_passes(all_rgs.front(), pass_read_limit);
+
+  auto projected_passes = std::vector<std::vector<cudf::size_type>>{};
+  projected_passes.reserve(multifile_passes.size());
+  for (auto const& pass : multifile_passes) {
+    ASSERT_EQ(pass.size(), 1);
+    projected_passes.push_back(pass.front());
+  }
+  EXPECT_EQ(projected_passes, single_file_passes);
 }
 
 TEST_F(HybridScanMultifileFiltersTest, ErrorFilterRowGroupsWithByteRanges)
@@ -327,6 +480,68 @@ TEST_F(HybridScanMultifileFiltersTest, FilterRowGroupsWithStats)
   EXPECT_TRUE(stats_filtered.back().empty());
 }
 
+TEST_F(HybridScanMultifileFiltersTest, FilterRowGroupsWithBloomFilters)
+{
+  using T                    = uint32_t;
+  auto constexpr num_sources = 32;
+  auto const stream          = cudf::get_default_stream();
+
+  // num_sources sources, each with the same schema
+  std::vector<std::vector<char>> file_buffers;
+  file_buffers.reserve(num_sources);
+  for (int i = 0; i < num_sources; ++i) {
+    srand(0xb100 + i);
+    file_buffers.emplace_back(std::get<1>(create_parquet_with_stats<T, 1>()));
+  }
+
+  auto inputs = multifile_inputs(build_source_info(file_buffers));
+
+  // An equality predicate makes col0 eligible for bloom filtering. cuDF's Parquet writer does not
+  // emit bloom filters, so the per-source bloom byte ranges come back empty (same as single-file).
+  {
+    auto literal_value = cudf::numeric_scalar<T>(T{42}, true, stream);
+    auto literal       = cudf::ast::literal(literal_value);
+    auto col_ref       = cudf::ast::column_name_reference("col0");
+    auto filter        = cudf::ast::operation(cudf::ast::ast_operator::EQUAL, col_ref, literal);
+
+    auto options      = cudf::io::parquet_reader_options::builder().filter(filter).build();
+    auto const reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_multifile>(
+      inputs.footer_byte_spans, options);
+
+    auto const input_row_group_indices = reader->all_row_groups(options);
+    ASSERT_EQ(input_row_group_indices.size(), num_sources);
+
+    auto const [bloom_byte_ranges, bloom_source_map] =
+      reader->bloom_filters_byte_ranges(input_row_group_indices, options);
+    // cuDF's Parquet writer does not emit bloom filters, so the ranges come back empty. The source
+    // map is parallel to the ranges and must always match them in length (here, both empty).
+    EXPECT_TRUE(bloom_byte_ranges.empty());
+    EXPECT_EQ(bloom_byte_ranges.size(), bloom_source_map.size());
+  }
+
+  // Without any bloom-eligible (equality) predicate, bloom filtering is a no-op: the reader returns
+  // the input row groups unchanged, one inner vector per source. Validates the multifile bloom
+  // filter API delegation and per-source output shape.
+  {
+    auto literal_value = cudf::numeric_scalar<T>(T{50}, true, stream);
+    auto literal       = cudf::ast::literal(literal_value);
+    auto col_ref       = cudf::ast::column_name_reference("col0");
+    auto filter        = cudf::ast::operation(cudf::ast::ast_operator::LESS, col_ref, literal);
+
+    auto options      = cudf::io::parquet_reader_options::builder().filter(filter).build();
+    auto const reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_multifile>(
+      inputs.footer_byte_spans, options);
+
+    auto const input_row_group_indices = reader->all_row_groups(options);
+    ASSERT_EQ(input_row_group_indices.size(), num_sources);
+
+    auto const empty_bloom_data = std::vector<cudf::device_span<uint8_t const>>{};
+    auto const bloom_filtered   = reader->filter_row_groups_with_bloom_filters(
+      empty_bloom_data, input_row_group_indices, options, stream);
+    EXPECT_EQ(bloom_filtered, input_row_group_indices);
+  }
+}
+
 TEST_F(HybridScanMultifileFiltersTest, BuildAllTrueRowMask)
 {
   using T                    = uint64_t;
@@ -356,9 +571,13 @@ TEST_F(HybridScanMultifileFiltersTest, BuildAllTrueRowMask)
     [&](cudf::host_span<std::vector<cudf::size_type> const> row_group_indices) {
       auto const row_mask = reader->build_all_true_row_mask(row_group_indices, stream, mr);
 
+      auto const expected_num_rows = reader->total_rows_in_row_groups(row_group_indices);
+
       EXPECT_EQ(row_mask->type().id(), cudf::type_id::BOOL8);
-      EXPECT_EQ(row_mask->size(), reader->total_rows_in_row_groups(row_group_indices));
+      EXPECT_EQ(row_mask->size(), expected_num_rows);
       EXPECT_EQ(row_mask->null_count(), 0);
+      auto const host_row_mask = host_row_mask_data<bool>(row_mask->view(), stream);
+      EXPECT_EQ(std::count(host_row_mask.begin(), host_row_mask.end(), true), expected_num_rows);
     };
 
   auto row_group_indices = std::vector<std::vector<cudf::size_type>>{{0, 2}, {1, 3}};
@@ -366,6 +585,28 @@ TEST_F(HybridScanMultifileFiltersTest, BuildAllTrueRowMask)
 
   row_group_indices = reader->all_row_groups(options);
   test_all_true_row_mask(row_group_indices);
+}
+
+TEST_F(HybridScanMultifileFiltersTest, SparsePayloadPagesWithoutOffsetIndexes)
+{
+  using T = uint32_t;
+
+  auto file_buffers = std::vector<std::vector<char>>{};
+  file_buffers.emplace_back(std::get<1>(create_parquet_with_stats<T, 1>()));
+  auto inputs = multifile_inputs(build_source_info(file_buffers));
+
+  auto const options = cudf::io::parquet_reader_options::builder().column_names({"col1"}).build();
+  auto reader =
+    cudf::io::parquet::experimental::hybrid_scan_multifile{inputs.footer_byte_spans, options};
+
+  auto const stream     = cudf::get_default_stream();
+  auto const mr         = cudf::get_current_device_resource_ref();
+  auto const row_groups = reader.all_row_groups(options);
+  auto const row_mask   = reader.build_all_true_row_mask(row_groups, stream, mr);
+
+  EXPECT_THROW(
+    std::ignore = reader.payload_pages_byte_ranges(row_groups, row_mask->view(), options, stream),
+    cudf::logic_error);
 }
 
 template <typename T>
@@ -503,4 +744,96 @@ TYPED_TEST(HybridScanMultifilePageIndexRowMaskTest, BuildRowMaskWithPageIndexSta
     auto constexpr expected_surviving_rows = 2 * num_sources * page_size_for_ordered_tests;
     test_filter_data_pages_with_stats(filter_expression, expected_surviving_rows);
   }
+}
+
+TEST_F(HybridScanMultifileFiltersTest, FilterRowGroupsWithDictionaryPages)
+{
+  using T                    = uint32_t;
+  auto constexpr num_sources = 2;
+  auto stream                = cudf::get_default_stream();
+  auto mr                    = cudf::get_current_device_resource_ref();
+
+  // 2 sources, each `dictionary_policy::ALWAYS` with a per-source constant `col2`
+  std::vector<std::vector<char>> file_buffers;
+  file_buffers.reserve(num_sources);
+  srand(0xd1c7);
+  file_buffers.emplace_back(std::get<1>(create_parquet_with_stats<T, 1>(100)));  // col2 == "0100"
+  srand(0xfeed);
+  file_buffers.emplace_back(std::get<1>(create_parquet_with_stats<T, 1>(200)));  // col2 == "0200"
+
+  auto inputs = multifile_inputs(build_source_info(file_buffers));
+
+  // Filter: `col2 == "0100"` (present only in source A's dictionary)
+  auto literal_value = cudf::string_scalar("0100", true, stream);
+  auto literal       = cudf::ast::literal(literal_value);
+  auto col_ref       = cudf::ast::column_name_reference("col2");
+  auto filter        = cudf::ast::operation(cudf::ast::ast_operator::EQUAL, col_ref, literal);
+
+  auto options      = cudf::io::parquet_reader_options::builder().filter(filter).build();
+  auto const reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_multifile>(
+    inputs.footer_byte_spans, options);
+
+  // Page index is needed to detect dictionary-only encoded pages
+  setup_page_indexes(*reader, inputs);
+
+  auto const dict_filtered =
+    filter_row_groups_with_dictionaries(inputs, *reader, options, stream, mr);
+
+  // Source A keeps all 4 row groups (col2 == "0100"); source B is fully pruned (only "0200")
+  ASSERT_EQ(dict_filtered.size(), num_sources);
+  EXPECT_EQ(dict_filtered.front(), (std::vector<cudf::size_type>{0, 1, 2, 3}));
+  EXPECT_TRUE(dict_filtered.back().empty());
+}
+
+TEST_F(HybridScanMultifileFiltersTest, MismatchedSchemaDictionaryPruningCollision)
+{
+  using T                    = cudf::duration_ms;
+  auto constexpr num_sources = 2;
+  auto stream                = cudf::get_default_stream();
+  auto mr                    = cudf::get_current_device_resource_ref();
+
+  // Source A: default column order/names, col2 == "0200" (pruned by the filter).
+  // Source B: same columns emitted as {col2, col0, col1}, col2 == "0100" (survives).
+  std::vector<std::vector<char>> file_buffers;
+  file_buffers.reserve(num_sources);
+  srand(0xd1c7);
+  file_buffers.emplace_back(std::get<1>(create_parquet_with_stats<T, 1>(200)));
+  srand(0xfeed);
+  file_buffers.emplace_back(std::get<1>(create_parquet_with_stats<T, 1>(
+    100, cudf::io::compression_type::AUTO, {"col2", "col0", "col1"}, {2, 0, 1})));
+
+  auto inputs = multifile_inputs(build_source_info(file_buffers));
+
+  // Filter: `col2 == "0100"`
+  auto literal_value = cudf::string_scalar("0100", true, stream);
+  auto literal       = cudf::ast::literal(literal_value);
+  auto col_ref       = cudf::ast::column_name_reference("col2");
+  auto filter        = cudf::ast::operation(cudf::ast::ast_operator::EQUAL, col_ref, literal);
+
+  auto options = cudf::io::parquet_reader_options::builder()
+                   .allow_mismatched_pq_schemas(true)
+                   .column_names({"col2"})
+                   .filter(filter)
+                   .build();
+
+  auto const reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_multifile>(
+    cudf::host_span<cudf::host_span<uint8_t const> const>{inputs.footer_byte_spans}, options);
+
+  // Ensure the reorder genuinely differs the per-source schemas
+  auto const metadatas = reader->parquet_metadatas();
+  ASSERT_EQ(metadatas.size(), num_sources);
+  EXPECT_EQ(metadatas.front().schema.at(1).name, "col0");
+  EXPECT_EQ(metadatas.back().schema.at(1).name, "col2");
+
+  // Page index is needed to detect dictionary-only encoded pages
+  setup_page_indexes(*reader, inputs);
+
+  auto const dict_filtered =
+    filter_row_groups_with_dictionaries(inputs, *reader, options, stream, mr);
+
+  // Source A is pruned (col2 == "0200"), source B survives (col2 == "0100").
+  ASSERT_EQ(dict_filtered.size(), num_sources);
+  EXPECT_TRUE(dict_filtered.front().empty()) << "Source A should be pruned (col2 == \"0200\")";
+  EXPECT_EQ(dict_filtered.back(), (std::vector<cudf::size_type>{0, 1, 2, 3}))
+    << "Source B should survive (col2 == \"0100\")";
 }

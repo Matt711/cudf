@@ -1,7 +1,8 @@
-# SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import codecs
+import csv
 import gzip
 import os
 import re
@@ -127,7 +128,7 @@ def test_csv_reader_numeric_data(numeric_types_as_str, tmp_path):
 
 
 @pytest.mark.skip(
-    reason="Disabled until https://github.com/rapidsai/cudf/pull/22094 is fixed"
+    reason="Disabled until https://github.com/NVIDIA/cudf/pull/22094 is fixed"
 )
 @pytest.mark.parametrize("parse_dates", [["date2"], [0], ["date1", 1, "bad"]])
 def test_csv_reader_datetime(parse_dates):
@@ -1861,7 +1862,7 @@ def test_csv_write_empty_dataframe(idx, index):
                 }
             ),
             marks=pytest.mark.xfail(
-                reason="https://github.com/rapidsai/cudf/issues/16533, np.nan/None coerced to NA since pandas 3"
+                reason="https://github.com/NVIDIA/cudf/issues/16533, np.nan/None coerced to NA since pandas 3"
             ),
         ),
         pd.DataFrame({"": [1, None, 3, 4]}),
@@ -2041,7 +2042,7 @@ def test_csv_sep_error():
 
 def test_to_csv_encoding_error():
     # TODO: Remove this test once following
-    # issue is fixed: https://github.com/rapidsai/cudf/issues/2957
+    # issue is fixed: https://github.com/NVIDIA/cudf/issues/2957
     df = cudf.DataFrame({"a": ["你好", "test"]})
     encoding = "utf-8-sig"
     error_message = (
@@ -2226,6 +2227,66 @@ def test_empty_file_pandas_compat_raises(tmp_path):
             cudf.read_csv(str(empty_file))
 
 
+@pytest.mark.parametrize(
+    "buffer,kwargs",
+    [
+        ("a,b\n", {}),
+        ("", {"names": ["a", "b"]}),
+    ],
+)
+def test_empty_csv_with_columns_pandas_compat(buffer, kwargs):
+    with cudf.option_context("mode.pandas_compatible", True):
+        got = cudf.read_csv(StringIO(buffer), **kwargs)
+
+    expect = pd.read_csv(StringIO(buffer), **kwargs)
+    # With no rows to infer from, pandas falls back to ``object`` for these
+    # columns while cudf types them as strings. cudf has no object dtype
+    # (``object`` maps to DEFAULT_STRING_DTYPE), so the dtypes can never
+    # match here; what this test is about is that the columns survive at all.
+    assert_eq(expect, got, check_dtype=False)
+
+
+@pytest.mark.parametrize(
+    "name,fmt",
+    [
+        ("archive.tar", "tar"),
+        ("archive.tgz", "tar"),
+        ("archive.tar.gz", "tar"),
+        ("archive.tar.bz2", "tar"),
+        ("archive.tar.xz", "tar"),
+        ("archive.tar.zst", "tar"),
+        ("data.xz", "xz"),
+        ("data.zst", "zstd"),
+    ],
+)
+def test_read_csv_unreadable_compression_raises(tmp_path, name, fmt):
+    # libcudf cannot decompress these, and left alone it parses the container's
+    # bytes as CSV instead of failing -- an empty tar comes back as a (0, 1)
+    # frame whose column name is a run of NULs. Raising keeps cudf.pandas
+    # falling back to pandas, which reads them correctly.
+    path = tmp_path / name
+    path.write_bytes(b"\0" * 10240)
+    with pytest.raises(NotImplementedError, match=fmt):
+        cudf.read_csv(str(path))
+
+
+def test_read_csv_explicit_unsupported_compression_raises(tmp_path):
+    path = tmp_path / "does_not_exist.csv"
+    with pytest.raises(NotImplementedError, match="tar"):
+        cudf.read_csv(str(path), compression="tar")
+
+
+def test_read_csv_empty_tar_matches_pandas(tmp_path):
+    # Regression guard: pandas raises for a zero-file archive, so cudf must not
+    # quietly return a frame built from the tar's padding.
+    path = tmp_path / "empty.tar"
+    path.write_bytes(b"\0" * 10240)
+    with pytest.raises(ValueError):
+        pd.read_csv(path)
+    with pytest.raises(NotImplementedError):
+        cudf.read_csv(str(path))
+
+
 def test_read_csv_gcs(monkeypatch):
     gcsfs = pytest.importorskip("gcsfs")
     pdf = pd.DataFrame(
@@ -2262,3 +2323,72 @@ def test_read_csv_gcs(monkeypatch):
     with fs.open(f"gcs://{fpath}") as f:
         got = cudf.read_csv(f)
     assert_eq(pdf, got)
+
+
+@pytest.mark.parametrize("quoting", [csv.QUOTE_MINIMAL, csv.QUOTE_NONE])
+def test_to_csv_quoting(quoting):
+    """Test that to_csv quoting parameter works like pandas."""
+    # Use simple data without special characters for pandas compatibility
+    # pandas QUOTE_NONE requires data without delimiters/newlines/quotes
+    # or an escapechar to be set
+    df = cudf.DataFrame(
+        {
+            "a": [1, 2, 3],
+            "b": ["hello", "world", "test"],
+            "c": [4.5, 6.7, 8.9],
+        }
+    )
+    pdf = df.to_pandas()
+
+    cudf_output = df.to_csv(index=False, quoting=quoting)
+    pandas_output = pdf.to_csv(index=False, quoting=quoting)
+
+    assert cudf_output == pandas_output
+
+
+def test_to_csv_quoting_minimal_with_special_chars():
+    """Test QUOTE_MINIMAL properly quotes fields with special characters."""
+    df = cudf.DataFrame(
+        {
+            "a": [1, 2, 3],
+            "b": ["hello", "world,with,commas", 'quote"test'],
+            "c": ["normal", "line\nbreak", "end"],
+        }
+    )
+    pdf = df.to_pandas()
+
+    cudf_output = df.to_csv(index=False, quoting=csv.QUOTE_MINIMAL)
+    pandas_output = pdf.to_csv(index=False, quoting=csv.QUOTE_MINIMAL)
+
+    assert cudf_output == pandas_output
+
+
+@pytest.mark.parametrize("quoting", [csv.QUOTE_ALL, csv.QUOTE_NONNUMERIC])
+def test_to_csv_quoting_unsupported(quoting):
+    """Test that unsupported quoting styles raise NotImplementedError."""
+    df = cudf.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    with pytest.raises(
+        NotImplementedError, match=r"quoting=.* is not supported"
+    ):
+        df.to_csv(quoting=quoting)
+
+
+@pytest.mark.parametrize("quoting", [csv.QUOTE_MINIMAL, csv.QUOTE_NONE])
+def test_to_csv_quoting_empty_dataframe(quoting):
+    """Test quoting parameter with empty DataFrame."""
+    df = cudf.DataFrame()
+    pdf = df.to_pandas()
+
+    if quoting == csv.QUOTE_NONE:
+        assert_exceptions_equal(
+            lfunc=pdf.to_csv,
+            rfunc=df.to_csv,
+            lfunc_args_and_kwargs=([], {"quoting": quoting}),
+            rfunc_args_and_kwargs=([], {"quoting": quoting}),
+        )
+        return
+
+    cudf_output = df.to_csv(quoting=quoting)
+    pandas_output = pdf.to_csv(quoting=quoting)
+
+    assert cudf_output == pandas_output
