@@ -60,6 +60,7 @@ __all__ = [
     "DaskContext",
     "DynamicPlanningOptions",
     "HybridScanPassMode",
+    "HybridScanPrefetchOrderingMode",
     "InMemoryExecutor",
     "JoinFilterPushdownOptions",
     "MaxConcurrentIOTasks",
@@ -229,6 +230,22 @@ class HybridScanPassMode(enum.StrEnum):
     TWO_PASS = "two_pass"
 
 
+class HybridScanPrefetchOrderingMode(enum.StrEnum):
+    """
+    How concurrent hybrid scan prefetch tasks claim shared, limited resources.
+
+    * ``HybridScanPrefetchOrderingMode.ORDERED`` : Within a producer, claim
+      pinned memory and issue reads in split order, so a split due for
+      consumption soon can't lose its reservation to one that isn't.
+    * ``HybridScanPrefetchOrderingMode.RACE`` : No ordering, whichever
+      split's prefetch task finishes its prep work first claims resources
+      first.
+    """
+
+    ORDERED = "ordered"
+    RACE = "race"
+
+
 class Cluster(enum.StrEnum):
     """
     The cluster configuration for the streaming executor.
@@ -381,6 +398,10 @@ class ParquetOptions:
         ``TWO_PASS`` if a predicate is expected to be selective at any level,
         row group or page, since the automatic choice only has visibility
         into row-group elimination.
+    prefetch_ordering_mode
+        How concurrent hybrid scan prefetch tasks claim shared, limited
+        resources. See :class:`HybridScanPrefetchOrderingMode`. Default is
+        ``ORDERED``.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -436,6 +457,13 @@ class ParquetOptions:
             default=UNSPECIFIED,
         )
     )
+    prefetch_ordering_mode: HybridScanPrefetchOrderingMode = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_ORDERING_MODE",
+            HybridScanPrefetchOrderingMode.__call__,
+            default=HybridScanPrefetchOrderingMode.ORDERED,
+        )
+    )
     # Internal benchmarking flag. When False, skips stats and bloom-filter pruning
     # before the first pass of a hybrid scan so you can measure two-pass read
     # overhead in isolation. No reason to set this to False in production.
@@ -479,6 +507,10 @@ class ParquetOptions:
             )
         if not isinstance(self.pass_mode, (HybridScanPassMode, Unspecified)):
             raise TypeError("pass_mode must be a HybridScanPassMode when specified")
+        if not isinstance(self.prefetch_ordering_mode, HybridScanPrefetchOrderingMode):
+            raise TypeError(
+                "prefetch_ordering_mode must be a HybridScanPrefetchOrderingMode"
+            )
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
 

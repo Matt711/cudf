@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import nvtx
@@ -31,7 +32,7 @@ if TYPE_CHECKING:
     from kvikio.remote_file import RemoteFile
 
     import pylibcudf.expressions as plc_expr
-    from rapidsmpf.memory.buffer import Buffer
+    from rapidsmpf.memory.buffer import Buffer, BufferHostView
     from rapidsmpf.streaming.core.context import Context
 
     from cudf_polars.dsl.ir import IRExecutionContext
@@ -136,7 +137,7 @@ def issue_pread_calls(
 @nvtx_annotate_cudf_polars(message="issue_reads_into_pinned_buffer")
 def issue_reads_into_pinned_buffer(
     buf: Buffer, handle: CuFile | RemoteFile, ranges: list[Any]
-) -> tuple[memoryview, list[IOFuture]]:
+) -> tuple[BufferHostView, memoryview, list[IOFuture]]:
     """
     Take a pinned host view of a buffer and issue reads into it.
 
@@ -147,6 +148,15 @@ def issue_reads_into_pinned_buffer(
     on kvikio's reactor from many concurrent prefetch tasks submitting
     around the same time, would otherwise stall the event loop and every
     other task on it.
+
+    Deliberately doesn't use ``with buf.host_view() as host:`` here: the
+    view's exclusive write lock is meant to stay held until the writes
+    it's guarding are actually done, but the ``pread`` futures issued
+    below are still in flight when this function returns, they're only
+    awaited much later (see ``copy_pinned_batch_to_device``). Exiting the
+    context manager here would release that lock before the writes it's
+    protecting have finished. The caller is responsible for exiting the
+    returned view once the returned futures actually complete.
 
     Parameters
     ----------
@@ -159,11 +169,17 @@ def issue_reads_into_pinned_buffer(
 
     Returns
     -------
-    The pinned host view read into, and one ``pread`` future per coalesced
-    run issued against it, in file order.
+    The still-open view, the pinned host view read into, and one ``pread``
+    future per coalesced run issued against it, in file order.
     """
-    with buf.host_view() as host:
-        return host, issue_pread_calls(handle, ranges, host)
+    view = buf.host_view()
+    host = view.__enter__()
+    try:
+        futures = issue_pread_calls(handle, ranges, host)
+    except BaseException:
+        view.__exit__(*sys.exc_info())
+        raise
+    return view, host, futures
 
 
 async def reserve_pinned_batch(
@@ -220,12 +236,12 @@ async def reserve_pinned_batch(
         buf = await ir_context.to_prefetch_thread(
             br.make_buffer, total, br.stream_pool.get_stream(), reservation
         )
-        host, futures = await ir_context.to_prefetch_thread(
+        view, host, futures = await ir_context.to_prefetch_thread(
             issue_reads_into_pinned_buffer, buf, handle, ranges
         )
     finally:
         nvtx.end_range(batch_range)
-    return PinnedBatch(ranges=ranges, host=host, futures=futures, buf=buf)
+    return PinnedBatch(ranges=ranges, host=host, futures=futures, buf=buf, view=view)
 
 
 @nvtx_annotate_cudf_polars(message="prepare_prefetch")

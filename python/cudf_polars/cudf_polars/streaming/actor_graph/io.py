@@ -46,6 +46,7 @@ from cudf_polars.streaming.io import (
 )
 from cudf_polars.streaming.prefetch import prefetch_scan_byte_ranges
 from cudf_polars.streaming.rank_aware_source import RankAwareSource
+from cudf_polars.utils.config import HybridScanPrefetchOrderingMode
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -650,13 +651,15 @@ def prefetch_eligible(
 def prefetch_ordering_events(
     num_scans: int,
     num_producers: int,
+    ordering_mode: HybridScanPrefetchOrderingMode,
 ) -> tuple[list[asyncio.Event | None], list[asyncio.Event]]:
     """
     Return, per task, the event it waits on before claiming resources.
 
-    Within a producer, each task waits for its predecessor's own attempt
-    before claiming pinned memory and issuing reads, so a task due for
-    consumption soon can't lose its reservation to one that isn't.
+    Under ``HybridScanPrefetchOrderingMode.ORDERED``, each task within a
+    producer waits for its predecessor's own attempt before claiming pinned
+    memory and issuing reads, so a task due for consumption soon can't lose
+    its reservation to one that isn't. Under ``RACE``, no task waits.
 
     Parameters
     ----------
@@ -664,21 +667,24 @@ def prefetch_ordering_events(
         Total number of tasks across all producers.
     num_producers
         Number of producers the tasks are round-robin assigned to.
+    ordering_mode
+        Whether tasks within a producer claim resources in order.
 
     Returns
     -------
     ``wait_for``, the event each task waits on before claiming resources
-    (``None`` for the first task in its producer's chain), and
-    ``own_turns``, the event each task sets once it's done claiming
-    resources.
+    (``None`` for the first task in its producer's chain, or always under
+    ``RACE``), and ``own_turns``, the event each task sets once it's done
+    claiming resources.
     """
     own_turns = [asyncio.Event() for _ in range(num_scans)]
     wait_for: list[asyncio.Event | None] = [None] * num_scans
-    for producer_id in range(num_producers):
-        predecessor: asyncio.Event | None = None
-        for task_idx in range(producer_id, num_scans, num_producers):
-            wait_for[task_idx] = predecessor
-            predecessor = own_turns[task_idx]
+    if ordering_mode is HybridScanPrefetchOrderingMode.ORDERED:
+        for producer_id in range(num_producers):
+            predecessor: asyncio.Event | None = None
+            for task_idx in range(producer_id, num_scans, num_producers):
+                wait_for[task_idx] = predecessor
+                predecessor = own_turns[task_idx]
     return wait_for, own_turns
 
 
@@ -737,7 +743,9 @@ async def scan_node(
                     else min(num_producers, len(scans))
                 )
                 wait_for, own_turns = prefetch_ordering_events(
-                    len(scans), effective_num_producers
+                    len(scans),
+                    effective_num_producers,
+                    scans[0].parquet_options.prefetch_ordering_mode,
                 )
                 prefetch_tasks = {
                     seq_num: asyncio.create_task(
