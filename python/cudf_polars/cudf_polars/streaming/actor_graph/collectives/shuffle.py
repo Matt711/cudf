@@ -21,7 +21,10 @@ from cudf_streaming.partition_utils import (
     unpack_and_concat as py_unpack_and_concat,
     unpack_and_concat_cost as py_unpack_and_concat_cost,
 )
-from cudf_streaming.table_chunk import TableChunk
+from cudf_streaming.table_chunk import (
+    TableChunk,
+    make_table_chunks_available_or_wait,
+)
 from rapidsmpf.communicator.single import new_communicator as single_comm
 from rapidsmpf.config import Options, get_environment_variables
 from rapidsmpf.memory.memory_reservation import opaque_memory_usage
@@ -542,9 +545,12 @@ async def _global_shuffle(
     async with shuffle.inserting() as inserter:
         while (msg := await ch_in.recv(context)) is not None:
             if not skip_insert:
-                chunk = TableChunk.from_message(
-                    msg, br=context.br()
-                ).make_available_and_spill(context.br(), allow_overbooking=True)
+                chunk, _ = await make_table_chunks_available_or_wait(
+                    context,
+                    TableChunk.from_message(msg, br=context.br()),
+                    reserve_extra=0,
+                    net_memory_delta=0,
+                )
                 if columns_to_hash is None:
                     await inserter.insert_hash_keys(chunk, keys_to_hash, input_schema)
                 else:

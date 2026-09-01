@@ -252,6 +252,10 @@ def _origin_stamps_for(ir: Over) -> OriginStamps:
     return OriginStamps(next(names), next(names), next(names))
 
 
+# _append_origin_stamps appends three int32 columns.
+_ORIGIN_STAMP_BYTES_PER_ROW = 3 * 4
+
+
 def _append_origin_stamps(
     chunk: TableChunk,
     chunk_index: int,
@@ -496,9 +500,19 @@ async def _distribute_by_group(
     chunk_index = 0
     async with forward_shuffle.inserting() as inserter:
         while (msg := await ch_in.recv(context)) is not None:
-            chunk = TableChunk.from_message(
-                msg, br=context.br()
-            ).make_available_and_spill(context.br(), allow_overbooking=True)
+            chunk = TableChunk.from_message(msg, br=context.br())
+            stamp_bytes = (
+                0 if skip_insert else _ORIGIN_STAMP_BYTES_PER_ROW * chunk.shape[0]
+            )
+            # The chunk's data moves into shuffler-owned packed buffers, so the
+            # stamp columns _append_origin_stamps allocates below are both the
+            # extra we need and the only lasting addition.
+            chunk, extra = await make_table_chunks_available_or_wait(
+                context,
+                chunk,
+                reserve_extra=stamp_bytes,
+                net_memory_delta=stamp_bytes,
+            )
             sequence_numbers.append(msg.sequence_number)
             if not skip_insert:
                 # TODO: For duplicated input only rank 0 inserts here, and
@@ -507,14 +521,15 @@ async def _distribute_by_group(
                 # 1..nranks-1 sit idle on emit. Slice the duplicated input
                 # across ranks (e.g. stripe by row index) and stamp each
                 # slice with its target origin rank to distribute emit work.
-                stamped = await ir_context.to_thread(
-                    _append_origin_stamps,
-                    chunk,
-                    chunk_index,
-                    comm.rank,
-                    ir_context.get_cuda_stream(),
-                    context.br(),
-                )
+                with opaque_memory_usage(extra):
+                    stamped = await ir_context.to_thread(
+                        _append_origin_stamps,
+                        chunk,
+                        chunk_index,
+                        comm.rank,
+                        ir_context.get_cuda_stream(),
+                        context.br(),
+                    )
                 await inserter.insert_hash(stamped, key_indices)
             chunk_index += 1
     return sequence_numbers
