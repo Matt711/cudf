@@ -650,7 +650,7 @@ def prefetch_eligible(
 
 def prefetch_ordering_events(
     num_scans: int,
-    num_producers: int,
+    num_prefetch_producers: int,
     ordering_mode: HybridScanPrefetchOrderingMode,
 ) -> tuple[list[asyncio.Event | None], list[asyncio.Event]]:
     """
@@ -665,8 +665,11 @@ def prefetch_ordering_events(
     ----------
     num_scans
         Total number of tasks across all producers.
-    num_producers
-        Number of producers the tasks are round-robin assigned to.
+    num_prefetch_producers
+        Number of chains the tasks are round-robin assigned to. This bounds
+        how many splits can concurrently be doing prefetch reservation work,
+        independent of how many producers drive the read/consume side of the
+        pipeline.
     ordering_mode
         Whether tasks within a producer claim resources in order.
 
@@ -680,9 +683,9 @@ def prefetch_ordering_events(
     own_turns = [asyncio.Event() for _ in range(num_scans)]
     wait_for: list[asyncio.Event | None] = [None] * num_scans
     if ordering_mode is HybridScanPrefetchOrderingMode.ORDERED:
-        for producer_id in range(num_producers):
+        for producer_id in range(num_prefetch_producers):
             predecessor: asyncio.Event | None = None
-            for task_idx in range(producer_id, num_scans, num_producers):
+            for task_idx in range(producer_id, num_scans, num_prefetch_producers):
                 wait_for[task_idx] = predecessor
                 predecessor = own_turns[task_idx]
     return wait_for, own_turns
@@ -696,6 +699,7 @@ async def scan_node(
     ch_out: Channel[TableChunk],
     *,
     num_producers: int,
+    num_prefetch_executors: int,
     estimated_chunk_bytes: int,
 ) -> None:
     """
@@ -713,6 +717,11 @@ async def scan_node(
         The output Channel[TableChunk].
     num_producers
         The number of producers to use for the scan node.
+    num_prefetch_executors
+        How many splits can concurrently be doing prefetch reservation work
+        (see :func:`prefetch_ordering_events`). Kept separate from
+        ``num_producers``, which instead bounds the read/consume side of the
+        pipeline, so the two can be tuned independently.
     estimated_chunk_bytes
         Estimated retained output size of each chunk in bytes. Used to estimate
         peak memory for admission before launching each read.
@@ -737,14 +746,14 @@ async def scan_node(
                 return
 
             if prefetch_eligible(ir, scans, context):
-                effective_num_producers = (
+                effective_num_prefetch_producers = (
                     1
-                    if (len(scans) == 1 or num_producers == 1)
-                    else min(num_producers, len(scans))
+                    if (len(scans) == 1 or num_prefetch_executors == 1)
+                    else min(num_prefetch_executors, len(scans))
                 )
                 wait_for, own_turns = prefetch_ordering_events(
                     len(scans),
-                    effective_num_producers,
+                    effective_num_prefetch_producers,
                     scans[0].parquet_options.prefetch_ordering_mode,
                 )
                 prefetch_tasks = {
@@ -851,6 +860,7 @@ def _(
             rec.state["ir_context"],
             ch_out,
             num_producers=num_producers,
+            num_prefetch_executors=executor.num_prefetch_executors,
             estimated_chunk_bytes=(
                 plan.estimated_chunk_bytes or executor.target_partition_size
             ),
