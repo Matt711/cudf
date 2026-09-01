@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self, overload
 
 import polars as pl
+
 import pylibcudf as plc
 from rmm import DeviceBuffer
 
@@ -48,8 +49,9 @@ from cudf_polars.utils.versions import POLARS_VERSION_LT_137
 if TYPE_CHECKING:
     from collections.abc import Hashable, MutableMapping, Sequence
 
-    import pylibcudf.expressions as plc_expr
     from kvikio.cufile import IOFuture
+
+    import pylibcudf.expressions as plc_expr
     from rapidsmpf.memory.buffer import Buffer
     from rmm.pylibrmm.stream import Stream
 
@@ -310,8 +312,10 @@ def _read_with_hybrid_scan(
                         row_group_indices, options
                     )
                     if bloom_ranges:
-                        bloom_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-                            source_info, bloom_ranges, stream=stream
+                        bloom_chunks = (
+                            plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                                source_info, bloom_ranges, stream=stream
+                            )
                         )
                         row_group_indices = reader.filter_row_groups_with_bloom_filters(
                             bloom_chunks, row_group_indices, options, stream=stream
@@ -405,7 +409,9 @@ def _read_with_hybrid_scan(
             else:
                 payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                     source_info,
-                    reader.payload_column_chunks_byte_ranges(row_group_indices, options),
+                    reader.payload_column_chunks_byte_ranges(
+                        row_group_indices, options
+                    ),
                     stream=stream,
                 )
             payload_tbl_w_meta = reader.materialize_payload_columns(
@@ -478,10 +484,12 @@ def _copy_pinned_batch_to_device(
     if batch.host is None:
         return []
     total = sum(r.size for r in batch.ranges)
-    for future in batch.futures:
-        future.get()
-    device_buffer = DeviceBuffer(size=total)
-    device_buffer.copy_from_host(batch.host[:total], stream=stream)
+    with nvtx_annotate_cudf_polars(message="wait_for_prefetch_reads", payload=total):
+        for future in batch.futures:
+            future.get()
+    with nvtx_annotate_cudf_polars(message="copy_pinned_to_device", payload=total):
+        device_buffer = DeviceBuffer(size=total)
+        device_buffer.copy_from_host(batch.host[:total], stream=stream)
     gpu_view = plc.gpumemoryview(device_buffer)
     offset = 0
     chunks = []
