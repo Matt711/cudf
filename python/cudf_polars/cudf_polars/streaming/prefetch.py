@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from kvikio.remote_file import RemoteFile
 
     import pylibcudf.expressions as plc_expr
+    from rapidsmpf.memory.buffer import Buffer
     from rapidsmpf.streaming.core.context import Context
 
     from cudf_polars.dsl.ir import IRExecutionContext
@@ -88,8 +89,42 @@ def issue_pread_calls(
     return futures
 
 
+@nvtx_annotate_cudf_polars(message="issue_reads_into_pinned_buffer")
+def issue_reads_into_pinned_buffer(
+    buf: Buffer, handle: CuFile | RemoteFile, ranges: list[Any]
+) -> tuple[memoryview, list[IOFuture]]:
+    """
+    Take a pinned host view of a buffer and issue reads into it.
+
+    A single unit of work so it can be offloaded to a thread together:
+    kvikio's ``pread`` submission releases the GIL, but that only lets other
+    *threads* make progress. It's still a synchronous call from the event
+    loop's perspective (no ``await``), so a slow submission, e.g. contention
+    on kvikio's reactor from many concurrent prefetch tasks submitting
+    around the same time, would otherwise stall the event loop and every
+    other task on it.
+
+    Parameters
+    ----------
+    buf
+        The pinned buffer to view and read into.
+    handle
+        Open kvikio handle to read from.
+    ranges
+        Byte ranges to read.
+
+    Returns
+    -------
+    The pinned host view read into, and one ``pread`` future per coalesced
+    run issued against it, in file order.
+    """
+    with buf.host_view() as host:
+        return host, issue_pread_calls(handle, ranges, host)
+
+
 async def reserve_pinned_batch(
     context: Context,
+    ir_context: IRExecutionContext,
     handle: CuFile | RemoteFile,
     ranges: list[Any],
 ) -> PinnedBatch | None:
@@ -100,6 +135,8 @@ async def reserve_pinned_batch(
     ----------
     context
         The rapidsmpf context to reserve memory through.
+    ir_context
+        The execution context to offload the buffer allocation and reads to.
     handle
         Open kvikio handle to read from.
     ranges
@@ -136,9 +173,12 @@ async def reserve_pinned_batch(
             )
         finally:
             nvtx.end_range(wait_range)
-        buf = br.make_buffer(total, br.stream_pool.get_stream(), reservation)
-        with buf.host_view() as host:
-            futures = issue_pread_calls(handle, ranges, host)
+        buf = await ir_context.to_thread(
+            br.make_buffer, total, br.stream_pool.get_stream(), reservation
+        )
+        host, futures = await ir_context.to_thread(
+            issue_reads_into_pinned_buffer, buf, handle, ranges
+        )
     finally:
         nvtx.end_range(batch_range)
     return PinnedBatch(ranges=ranges, host=host, futures=futures, buf=buf)
@@ -302,7 +342,7 @@ async def prefetch_scan_byte_ranges(
 
             if pass_mode is HybridScanPassMode.SINGLE_PASS:
                 all_columns = await reserve_pinned_batch(
-                    context, handle, primary_ranges
+                    context, ir_context, handle, primary_ranges
                 )
                 return PrefetchedByteRanges(
                     row_group_indices=row_group_indices,
@@ -311,9 +351,11 @@ async def prefetch_scan_byte_ranges(
                     all_columns=all_columns,
                 )
 
-            filter_batch = await reserve_pinned_batch(context, handle, primary_ranges)
+            filter_batch = await reserve_pinned_batch(
+                context, ir_context, handle, primary_ranges
+            )
             payload_batch = await reserve_pinned_batch(
-                context, handle, payload_ranges or []
+                context, ir_context, handle, payload_ranges or []
             )
             return PrefetchedByteRanges(
                 row_group_indices=row_group_indices,
