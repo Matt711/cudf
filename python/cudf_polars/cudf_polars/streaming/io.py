@@ -49,8 +49,6 @@ from cudf_polars.utils.versions import POLARS_VERSION_LT_137
 if TYPE_CHECKING:
     from collections.abc import Hashable, MutableMapping, Sequence
 
-    from kvikio.cufile import IOFuture
-
     import pylibcudf.expressions as plc_expr
     from rapidsmpf.memory.buffer import BufferHostView
     from rmm.pylibrmm.stream import Stream
@@ -542,7 +540,7 @@ class PinnedBatch:
 
     ranges: list[Any]
     host: memoryview | None
-    futures: list[IOFuture] = dataclasses.field(
+    futures: list[Any] = dataclasses.field(
         default_factory=list, compare=False, repr=False
     )
     buf: Any | None = dataclasses.field(default=None, compare=False, repr=False)

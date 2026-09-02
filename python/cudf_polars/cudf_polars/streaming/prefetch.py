@@ -8,6 +8,7 @@ import asyncio
 import concurrent.futures
 import ctypes
 import sys
+import threading
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 import nvtx
@@ -19,17 +20,21 @@ from rapidsmpf.streaming.core.memory_reserve_or_wait import reserve_memory
 from cudf_polars.dsl.ir import _prepare_parquet_predicate
 from cudf_polars.dsl.to_ast import to_parquet_filter
 from cudf_polars.dsl.tracing import CUDF_POLARS_NVTX_DOMAIN, nvtx_annotate_cudf_polars
+from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.io import (
     PinnedBatch,
     PrefetchedByteRanges,
+    SplitScan,
+    StreamingScan,
     decide_pass_mode,
+    hybrid_scan_eligible,
     split_row_group_indices,
 )
 from cudf_polars.utils.config import HybridScanPassMode
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from kvikio.cufile import CuFile, IOFuture
     from kvikio.remote_file import RemoteFile
@@ -41,8 +46,7 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.context import Context
     from rmm.pylibrmm.stream import Stream
 
-    from cudf_polars.dsl.ir import IRExecutionContext
-    from cudf_polars.streaming.io import SplitScan
+    from cudf_polars.dsl.ir import IR, IRExecutionContext
 
 
 # TODO: kvikio is adding a remote batch API that coalesces and splits ranges
@@ -385,6 +389,447 @@ def prepare_prefetch(
         row_group_indices, options
     )
     return plc_filter, row_group_indices, pass_mode, filter_ranges, payload_ranges
+
+
+def submit_prefetch_plans_for_ir(
+    root: IR,
+    py_executor: concurrent.futures.Executor,
+) -> dict[SplitScan, concurrent.futures.Future[Any]]:
+    """
+    Submit row-group pruning for every hybrid-scan-eligible split in a query.
+
+    Pruning (:func:`prepare_prefetch`) only needs a split's already-attached
+    ``cached_parquet_info`` -- no pinned memory, no actor graph. Called once,
+    before the actor graph starts, right after cached parquet metadata is
+    attached, so pruning for every eligible split across the whole query
+    graph runs concurrently with actor graph construction instead of
+    waiting for each scan node to start.
+
+    Parameters
+    ----------
+    root
+        The root of the IR graph to traverse.
+    py_executor
+        The thread pool to submit pruning work to.
+
+    Returns
+    -------
+    One future per eligible split, keyed by the split itself.
+    """
+    plans: dict[SplitScan, concurrent.futures.Future[Any]] = {}
+    for node in traversal([root]):
+        if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
+            for scan in node.scans:
+                if isinstance(scan, SplitScan) and _eligible_for_planning(scan):
+                    plans[scan] = py_executor.submit(prepare_prefetch, scan)
+    return plans
+
+
+def _eligible_for_planning(scan: SplitScan) -> bool:
+    if not hybrid_scan_eligible(
+        scan.parquet_options,
+        cached_parquet_info=scan.cached_parquet_info,
+        row_index=scan.base_scan.row_index,
+        include_file_paths=scan.base_scan.include_file_paths,
+        predicate=scan.base_scan.predicate,
+    ):
+        return False
+    assert scan.cached_parquet_info is not None
+    total_row_groups = len(scan.cached_parquet_info[0].file_metadata.row_group_num_rows)
+    # Matches `prefetch_eligible`'s guard: beyond this, the split isn't
+    # row-group-aligned and won't actually be prefetched, so pruning it
+    # here would be wasted work.
+    return scan.total_splits <= total_row_groups
+
+
+async def resolve_prefetch_plan(
+    scan: SplitScan, ir_context: IRExecutionContext
+) -> (
+    tuple[
+        plc_expr.Expression, list[int], HybridScanPassMode, list[Any], list[Any] | None
+    ]
+    | None
+):
+    """
+    Return one split's pruning result, submitted ahead of time for ``scan``.
+
+    Parameters
+    ----------
+    scan
+        The split to prune.
+    ir_context
+        The execution context holding the future submitted by
+        :func:`submit_prefetch_plans_for_ir` for ``scan``.
+
+    Returns
+    -------
+    Same as :func:`prepare_prefetch`.
+    """
+    return await asyncio.wrap_future(ir_context.pending_prefetch_plans[scan])
+
+
+class BatchedSplit(NamedTuple):
+    """One split's placement within a shared fetch batch."""
+
+    seq_num: int
+    """This split's index into its scan's ``scans``, matching :class:`PlannedSplit`."""
+    ranges: list[Any]
+    """This split's own byte ranges, unchanged from planning."""
+    host_offset: int
+    """Start offset of this split's data within the shared batch buffer."""
+
+
+class FetchBatch(NamedTuple):
+    """One group of splits' byte ranges to fetch together, sharing one buffer."""
+
+    splits: list[BatchedSplit]
+    """Every split sharing this batch's buffer, in the order packed."""
+    total_bytes: int
+    """Combined size of every split's ranges in this batch."""
+
+
+def pack_batches(
+    entries: Iterable[tuple[int, list[Any]]], batch_bytes: int
+) -> list[FetchBatch]:
+    """
+    Greedily group splits' byte ranges into byte-budget-bounded batches.
+
+    Preserves the order ``entries`` is given in: a batch never reorders
+    splits for coalescing efficiency, it only decides where one batch ends
+    and the next begins. A single split's own ranges are never split
+    across two batches -- if one split's ranges alone exceed
+    ``batch_bytes``, it becomes its own, over-budget batch; the budget
+    bounds how many splits get grouped together, not an absolute ceiling
+    on any single batch.
+
+    Parameters
+    ----------
+    entries
+        ``(seq_num, ranges)`` pairs, one per split, in packing order.
+        Splits with no ranges are skipped.
+    batch_bytes
+        Target maximum combined size of one batch, in bytes.
+
+    Returns
+    -------
+    One :class:`FetchBatch` per group, in packing order.
+    """
+    batches: list[FetchBatch] = []
+    current: list[BatchedSplit] = []
+    current_total = 0
+    for seq_num, ranges in entries:
+        size = sum(r.size for r in ranges)
+        if size == 0:
+            continue
+        if current and current_total + size > batch_bytes:
+            batches.append(FetchBatch(current, current_total))
+            current = []
+            current_total = 0
+        current.append(BatchedSplit(seq_num, ranges, current_total))
+        current_total += size
+    if current:
+        batches.append(FetchBatch(current, current_total))
+    return batches
+
+
+class _OnceFuture:
+    """
+    Wraps an ``IOFuture`` so ``.get()`` is safe to call more than once.
+
+    ``IOFuture.get()`` consumes the underlying ``std::future``'s state, so
+    calling it a second time raises. Every split sharing a batch gets the
+    same combined future list (see :func:`fetch_batch`), so more than one
+    caller can end up calling ``.get()`` on the same future -- this makes
+    only the first call do real work, caching the outcome (result or
+    exception) for the rest.
+    """
+
+    __slots__ = ("_done", "_exc", "_future", "_lock")
+
+    def __init__(self, future: IOFuture) -> None:
+        self._future = future
+        self._lock = threading.Lock()
+        self._done = False
+        self._exc: BaseException | None = None
+
+    def get(self) -> None:
+        """Wait for the wrapped future, raising its exception on every call if it failed."""
+        with self._lock:
+            if not self._done:
+                try:
+                    self._future.get()
+                except BaseException as e:
+                    self._exc = e
+                finally:
+                    self._done = True
+        if self._exc is not None:
+            raise self._exc
+
+
+def _make_batch_buffer_and_issue_reads(
+    br: Any,
+    total: int,
+    stream: Any,
+    reservation: Any,
+    batch: FetchBatch,
+    scans: Mapping[int, SplitScan],
+) -> tuple[Buffer, BufferHostView, memoryview, list[_OnceFuture]]:
+    """
+    Allocate one shared pinned buffer and issue every split's reads into it.
+
+    Each split's own ranges are coalesced and read independently (via
+    :func:`issue_pread_calls`), into that split's own slice of the shared
+    buffer at ``split.host_offset``; ranges aren't coalesced *across*
+    splits, even when two splits happen to be adjacent in the same file.
+    Futures are wrapped in :class:`_OnceFuture` since every split sharing
+    this batch gets the same combined future list (see :func:`fetch_batch`).
+
+    Parameters
+    ----------
+    br
+        The buffer resource to allocate the pinned buffer from.
+    total
+        Combined size, in bytes, of every split's ranges in ``batch``.
+    stream
+        CUDA stream to allocate on.
+    reservation
+        Memory reservation covering ``total`` bytes, already claimed on the
+        event loop before this call was dispatched.
+    batch
+        The batch to fetch.
+    scans
+        Maps each split's ``seq_num`` (as used in ``batch``) to the
+        ``SplitScan`` it belongs to, to look up its remote handle.
+
+    Returns
+    -------
+    The allocated buffer, the still-open view backing ``host``, the pinned
+    host view read into, and every split's ``pread`` futures combined.
+    """
+    buf = br.make_buffer(total, stream, reservation)
+    view = buf.host_view()
+    host = view.__enter__()
+    try:
+        futures: list[_OnceFuture] = []
+        for split in batch.splits:
+            handle = scans[split.seq_num].cached_parquet_info[0].remote_handle()  # type: ignore[index]
+            size = sum(r.size for r in split.ranges)
+            split_host = host[split.host_offset : split.host_offset + size]
+            futures.extend(
+                _OnceFuture(f)
+                for f in issue_pread_calls(handle, split.ranges, split_host)
+            )
+    except BaseException:
+        view.__exit__(*sys.exc_info())
+        raise
+    return buf, view, host, futures
+
+
+async def fetch_batch(
+    batch: FetchBatch,
+    scans: Mapping[int, SplitScan],
+    context: Context,
+    ir_context: IRExecutionContext,
+) -> dict[int, PinnedBatch]:
+    """
+    Reserve one shared pinned buffer for a batch and issue every split's reads.
+
+    All of ``batch``'s splits share one reservation, one pinned buffer, and
+    one exclusive write lock (:meth:`~rapidsmpf.memory.buffer.Buffer.host_view`).
+    That lock can only be safely released once every write into the shared
+    buffer has completed, not just the ones a particular split cares
+    about -- unlocking early would let something else (e.g. a spill path)
+    treat the buffer as safe to touch while another split's write is still
+    in flight. So every returned ``PinnedBatch`` carries the *combined*
+    futures for the whole batch, not just that split's own reads: whichever
+    split's consumer runs ``copy_pinned_batch_to_device`` first ends up
+    waiting for the whole batch's I/O, not just its own share of it.
+    Releasing the lock more than once is safe (it's a no-op once already
+    unlocked), so every split's consumer calling it independently is fine.
+
+    Parameters
+    ----------
+    batch
+        The batch to fetch, from :func:`pack_batches`.
+    scans
+        Maps each split's ``seq_num`` (as used in ``batch``) to the
+        ``SplitScan`` it belongs to, to look up its remote handle.
+    context
+        The rapidsmpf context to reserve memory through.
+    ir_context
+        The execution context to offload the buffer allocation and reads to.
+
+    Returns
+    -------
+    One :class:`PinnedBatch` per split in ``batch``, keyed by ``seq_num``,
+    sharing one buffer and one combined future list.
+    """
+    total = batch.total_bytes
+    br = context.br()
+    batch_range = nvtx.start_range(
+        message="reserve_pinned_batch", domain=CUDF_POLARS_NVTX_DOMAIN, payload=total
+    )
+    try:
+        wait_range = nvtx.start_range(
+            message="reserve_memory_wait", domain=CUDF_POLARS_NVTX_DOMAIN, payload=total
+        )
+        try:
+            reservation = await reserve_memory(
+                context,
+                size=total,
+                net_memory_delta=total,
+                mem_type=MemoryType.PINNED_HOST,
+            )
+        finally:
+            nvtx.end_range(wait_range)
+        buf, view, host, futures = await ir_context.to_prefetch_thread(
+            _make_batch_buffer_and_issue_reads,
+            br,
+            total,
+            br.stream_pool.get_stream(),
+            reservation,
+            batch,
+            scans,
+        )
+    finally:
+        nvtx.end_range(batch_range)
+    return {
+        split.seq_num: PinnedBatch(
+            ranges=split.ranges,
+            host=host[
+                split.host_offset : split.host_offset
+                + sum(r.size for r in split.ranges)
+            ],
+            futures=futures,
+            buf=buf,
+            view=view,
+        )
+        for split in batch.splits
+    }
+
+
+async def run_batch_prefetch_pipeline(
+    scans: Sequence[SplitScan],
+    context: Context,
+    ir_context: IRExecutionContext,
+    *,
+    batch_bytes: int,
+    max_concurrent_batches: int,
+) -> dict[int, asyncio.Future[PrefetchedByteRanges | None]]:
+    """
+    Plan, batch, and fetch every split in a scan under the batch pipeline.
+
+    Every split's plan is resolved concurrently (already submitted ahead of
+    time by :func:`submit_prefetch_plans_for_ir`), then split into two
+    independent todo lists -- primary (``SINGLE_PASS``'s only pass, or
+    ``TWO_PASS``'s filter columns) and payload (``TWO_PASS`` only) -- each
+    packed into batches (:func:`pack_batches`) and fetched
+    (:func:`fetch_batch`) on its own, never mixing a primary range and a
+    payload range in the same batch. A ``TWO_PASS`` split waits on both its
+    primary and payload batch before it's ready.
+
+    Parameters
+    ----------
+    scans
+        The splits to prefetch, in ``StreamingScan.scans`` order; a
+        split's index into ``scans`` is its key in the returned mapping.
+    context
+        The rapidsmpf context to reserve memory through.
+    ir_context
+        The execution context to offload work to and read submitted plans
+        from.
+    batch_bytes
+        Target maximum combined size of one batch, in bytes.
+    max_concurrent_batches
+        How many batches (primary and payload combined) can be
+        concurrently reserving and fetching at once.
+
+    Returns
+    -------
+    One task per split, keyed by its index into ``scans``, each resolving
+    to the same result :func:`prepare_prefetch` would have for that split.
+    """
+    # Deferred: `actor_graph`'s package init eagerly imports `actor_graph.io`,
+    # which imports from this module, so a module-level import here would be
+    # circular.
+    from cudf_polars.streaming.actor_graph.utils import gather_in_task_group
+
+    prepared = await gather_in_task_group(
+        *(resolve_prefetch_plan(scan, ir_context) for scan in scans)
+    )
+
+    results: dict[int, PrefetchedByteRanges | None] = {}
+    primary_entries: list[tuple[int, list[Any]]] = []
+    payload_entries: list[tuple[int, list[Any]]] = []
+    for seq_num, one in enumerate(prepared):
+        if one is None:
+            results[seq_num] = None
+            continue
+        plc_filter, row_group_indices, _, primary_ranges, payload_ranges = one
+        if not row_group_indices:
+            results[seq_num] = PrefetchedByteRanges.empty(plc_filter)
+            continue
+        primary_entries.append((seq_num, primary_ranges))
+        if payload_ranges is not None:
+            payload_entries.append((seq_num, payload_ranges))
+
+    primary_batches = pack_batches(primary_entries, batch_bytes)
+    payload_batches = pack_batches(payload_entries, batch_bytes)
+
+    scans_by_seq_num = dict(enumerate(scans))
+    semaphore = asyncio.Semaphore(max_concurrent_batches)
+
+    async def _fetch(fetch_batch_: FetchBatch) -> dict[int, PinnedBatch]:
+        async with semaphore:
+            return await fetch_batch(
+                fetch_batch_, scans_by_seq_num, context, ir_context
+            )
+
+    primary_task_by_seq_num: dict[int, asyncio.Task[dict[int, PinnedBatch]]] = {}
+    for one_batch in primary_batches:
+        task = asyncio.create_task(_fetch(one_batch))
+        for split in one_batch.splits:
+            primary_task_by_seq_num[split.seq_num] = task
+    payload_task_by_seq_num: dict[int, asyncio.Task[dict[int, PinnedBatch]]] = {}
+    for one_batch in payload_batches:
+        task = asyncio.create_task(_fetch(one_batch))
+        for split in one_batch.splits:
+            payload_task_by_seq_num[split.seq_num] = task
+
+    async def _resolve(
+        task_by_seq_num: dict[int, asyncio.Task[dict[int, PinnedBatch]]],
+        seq_num: int,
+    ) -> PinnedBatch | None:
+        task = task_by_seq_num.get(seq_num)
+        return None if task is None else (await task)[seq_num]
+
+    async def _finalize(seq_num: int) -> PrefetchedByteRanges | None:
+        if seq_num in results:
+            return results[seq_num]
+        one = prepared[seq_num]
+        assert one is not None
+        plc_filter, row_group_indices, pass_mode, _, _ = one
+        primary = await _resolve(primary_task_by_seq_num, seq_num)
+        if pass_mode is HybridScanPassMode.SINGLE_PASS:
+            return PrefetchedByteRanges(
+                row_group_indices=row_group_indices,
+                pass_mode=pass_mode,
+                plc_filter=plc_filter,
+                all_columns=primary,
+            )
+        payload = await _resolve(payload_task_by_seq_num, seq_num)
+        return PrefetchedByteRanges(
+            row_group_indices=row_group_indices,
+            pass_mode=pass_mode,
+            plc_filter=plc_filter,
+            filter=primary,
+            payload=payload,
+        )
+
+    return {
+        seq_num: asyncio.create_task(_finalize(seq_num))
+        for seq_num in range(len(scans))
+    }
 
 
 async def prefetch_scan_byte_ranges(

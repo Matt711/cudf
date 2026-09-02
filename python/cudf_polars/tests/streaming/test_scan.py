@@ -556,7 +556,7 @@ def test_split_scan_hybrid(
         (pl.col("y").str.contains("cat"), ["x", "z"]),
     ],
 )
-@pytest.mark.parametrize("prefetch_pipeline", ["modular", "queue"])
+@pytest.mark.parametrize("prefetch_pipeline", ["modular", "queue", "batch"])
 @pytest.mark.skipif(
     not is_pinned_memory_resources_supported(),
     reason="Pinned memory requires CUDA 12.6+ driver and runtime",

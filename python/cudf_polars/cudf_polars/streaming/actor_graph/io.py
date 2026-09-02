@@ -47,6 +47,7 @@ from cudf_polars.streaming.io import (
 from cudf_polars.streaming.prefetch import (
     HybridScanPrefetchExecutor,
     prefetch_scan_byte_ranges,
+    run_batch_prefetch_pipeline,
 )
 from cudf_polars.streaming.rank_aware_source import RankAwareSource
 from cudf_polars.utils.config import (
@@ -798,13 +799,22 @@ async def scan_node(
                 return
 
             if prefetch_eligible(ir, scans, context):
-                if scans[0].parquet_options.prefetch_pipeline is (
-                    HybridScanPrefetchPipeline.QUEUE
-                ):
+                pipeline = scans[0].parquet_options.prefetch_pipeline
+                if pipeline is HybridScanPrefetchPipeline.QUEUE:
                     prefetcher = HybridScanPrefetchExecutor.from_scans(
                         scans,  # type: ignore[arg-type]
                         scans[0].parquet_options.num_prefetch_queue_workers,
                         context,
+                    )
+                elif pipeline is HybridScanPrefetchPipeline.BATCH:
+                    prefetch_tasks = await run_batch_prefetch_pipeline(
+                        scans,  # type: ignore[arg-type]
+                        context,
+                        ir_context,
+                        batch_bytes=scans[0].parquet_options.prefetch_batch_bytes,
+                        max_concurrent_batches=scans[
+                            0
+                        ].parquet_options.max_concurrent_prefetch_batches,
                     )
                 else:
                     effective_num_prefetch_producers = (

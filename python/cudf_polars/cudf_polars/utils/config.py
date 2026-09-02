@@ -261,10 +261,16 @@ class HybridScanPrefetchPipeline(enum.StrEnum):
       FIFO queue; each worker prunes, reserves, and issues every read for
       one split synchronously before moving to the next. No ordering chain,
       no per-split coroutine scheduling on the shared event loop.
+    * ``HybridScanPrefetchPipeline.BATCH`` : Row-group pruning for every
+      eligible split across the whole query is submitted before the actor
+      graph starts. Reads are issued in shared, byte-budget-bounded
+      batches that can span multiple splits, rather than one reservation
+      per split.
     """
 
     MODULAR = "modular"
     QUEUE = "queue"
+    BATCH = "batch"
 
 
 class Cluster(enum.StrEnum):
@@ -430,6 +436,14 @@ class ParquetOptions:
     num_prefetch_queue_workers
         Number of worker threads in the prefetch pipeline's queue, when
         ``prefetch_pipeline=QUEUE``. Ignored under ``MODULAR``. Default is 2.
+    prefetch_batch_bytes
+        Target maximum combined size of one batch, when
+        ``prefetch_pipeline=BATCH``. Ignored under ``MODULAR``/``QUEUE``.
+        Default is 64 MiB.
+    max_concurrent_prefetch_batches
+        How many batches can concurrently be reserving pinned memory and
+        fetching at once, when ``prefetch_pipeline=BATCH``. Ignored under
+        ``MODULAR``/``QUEUE``. Default is 8.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -502,6 +516,16 @@ class ParquetOptions:
     num_prefetch_queue_workers: int = dataclasses.field(
         default_factory=_make_default_factory(
             f"{_env_prefix}__NUM_PREFETCH_QUEUE_WORKERS", int, default=2
+        )
+    )
+    prefetch_batch_bytes: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_BATCH_BYTES", int, default=64 * 1024 * 1024
+        )
+    )
+    max_concurrent_prefetch_batches: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__MAX_CONCURRENT_PREFETCH_BATCHES", int, default=8
         )
     )
     # Internal benchmarking flag. When False, skips stats and bloom-filter pruning
@@ -581,6 +605,14 @@ class ParquetOptions:
             raise TypeError("num_prefetch_queue_workers must be an int")
         if self.num_prefetch_queue_workers <= 0:
             raise ValueError("num_prefetch_queue_workers must be positive")
+        if not isinstance(self.prefetch_batch_bytes, int):
+            raise TypeError("prefetch_batch_bytes must be an int")
+        if self.prefetch_batch_bytes <= 0:
+            raise ValueError("prefetch_batch_bytes must be positive")
+        if not isinstance(self.max_concurrent_prefetch_batches, int):
+            raise TypeError("max_concurrent_prefetch_batches must be an int")
+        if self.max_concurrent_prefetch_batches <= 0:
+            raise ValueError("max_concurrent_prefetch_batches must be positive")
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
 

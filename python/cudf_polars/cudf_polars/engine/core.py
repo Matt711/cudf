@@ -41,9 +41,14 @@ from cudf_polars.streaming.actor_graph.tracing import log_query_plan
 from cudf_polars.streaming.actor_graph.utils import empty_table_chunk
 from cudf_polars.streaming.base import StatsCollector
 from cudf_polars.streaming.parallel import lower_ir_graph_with_node_map
+from cudf_polars.streaming.prefetch import submit_prefetch_plans_for_ir
 from cudf_polars.streaming.statistics import collect_statistics
 from cudf_polars.streaming.utils import _concat
-from cudf_polars.utils.config import Unspecified, get_total_device_memory
+from cudf_polars.utils.config import (
+    HybridScanPrefetchPipeline,
+    Unspecified,
+    get_total_device_memory,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, MutableMapping
@@ -931,6 +936,18 @@ def evaluate_on_rank(
             parse_hybrid_metadata=config_options.parquet_options.use_hybrid_scan,
         )
         attach_cached_parquet_metadata(ir, cached_parquet_info_map)
+
+    if (
+        config_options.parquet_options.use_hybrid_scan
+        and config_options.parquet_options.prefetch_pipeline
+        is HybridScanPrefetchPipeline.BATCH
+    ):
+        assert ir_context.py_executor is not None, (
+            "Execution context must have a thread pool for offload"
+        )
+        ir_context.pending_prefetch_plans.update(
+            submit_prefetch_plans_for_ir(ir, ir_context.py_executor)
+        )
 
     with ReserveOpIDs(ir, config_options) as collective_id_map:
         return execute_ir_on_rank(
