@@ -4,10 +4,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import sys
-import threading
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import nvtx
 
@@ -28,7 +26,7 @@ from cudf_polars.utils.config import HybridScanPassMode
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    import asyncio
 
     from kvikio.cufile import CuFile, IOFuture
     from kvikio.remote_file import RemoteFile
@@ -39,57 +37,6 @@ if TYPE_CHECKING:
 
     from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.streaming.io import SplitScan
-
-T = TypeVar("T")
-
-# EXPERIMENTAL: dedicated event loop that prefetch coroutines run on, kept
-# separate from the actor graph's own event loop. The graph's loop already
-# schedules every other actor (decode, joins, sinks, ...); a hybrid scan's
-# prefetch fan-out (dozens of concurrent coroutines, each with several
-# suspension points) competes with all of that for the same single thread's
-# attention. Running prefetch's own scheduling on its own thread isolates
-# that churn, without changing anything about the prefetch pipeline itself
-# (still the same `to_thread`/`to_prefetch_thread` hops underneath).
-_prefetch_loop: asyncio.AbstractEventLoop | None = None
-_prefetch_loop_lock = threading.Lock()
-
-
-def _get_prefetch_loop() -> asyncio.AbstractEventLoop:
-    """Return the dedicated prefetch event loop, starting it on first use."""
-    global _prefetch_loop  # noqa: PLW0603
-    with _prefetch_loop_lock:
-        if _prefetch_loop is None:
-            loop = asyncio.new_event_loop()
-            threading.Thread(
-                target=loop.run_forever,
-                name="cudf-polars-prefetch-loop",
-                daemon=True,
-            ).start()
-            _prefetch_loop = loop
-    return _prefetch_loop
-
-
-def run_on_prefetch_loop(coro: Coroutine[Any, Any, T]) -> asyncio.Future[T]:
-    """
-    Schedule a coroutine on the dedicated prefetch event loop.
-
-    Every ``await`` inside ``coro`` (including the ``to_thread``/
-    ``to_prefetch_thread`` executor hops, since those look up the
-    *currently running* loop at call time) ends up scheduled on the
-    dedicated prefetch loop rather than the caller's loop.
-
-    Parameters
-    ----------
-    coro
-        Coroutine to run on the dedicated prefetch loop.
-
-    Returns
-    -------
-    A future awaitable from the caller's own event loop.
-    """
-    return asyncio.wrap_future(
-        asyncio.run_coroutine_threadsafe(coro, _get_prefetch_loop())
-    )
 
 
 # TODO: kvikio is adding a remote batch API that coalesces and splits ranges

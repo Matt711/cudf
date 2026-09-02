@@ -44,10 +44,7 @@ from cudf_polars.streaming.io import (
     evaluate_with_prefetch,
     hybrid_scan_eligible,
 )
-from cudf_polars.streaming.prefetch import (
-    prefetch_scan_byte_ranges,
-    run_on_prefetch_loop,
-)
+from cudf_polars.streaming.prefetch import prefetch_scan_byte_ranges
 from cudf_polars.streaming.rank_aware_source import RankAwareSource
 from cudf_polars.utils.config import HybridScanPrefetchOrderingMode
 
@@ -760,7 +757,7 @@ async def scan_node(
                     scans[0].parquet_options.prefetch_ordering_mode,
                 )
                 prefetch_tasks = {
-                    seq_num: run_on_prefetch_loop(
+                    seq_num: asyncio.create_task(
                         prefetch_scan_byte_ranges(
                             scan,  # type: ignore[arg-type]
                             context,
