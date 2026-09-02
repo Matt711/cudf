@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import ctypes
 import sys
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
@@ -35,7 +36,10 @@ if TYPE_CHECKING:
 
     import pylibcudf.expressions as plc_expr
     from rapidsmpf.memory.buffer import Buffer, BufferHostView
+    from rapidsmpf.memory.memory_reservation import MemoryReservation
+    from rapidsmpf.memory.pinned_memory_resource import PinnedMemoryResource
     from rapidsmpf.streaming.core.context import Context
+    from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.streaming.io import SplitScan
@@ -479,6 +483,44 @@ async def prefetch_scan_byte_ranges(
         nvtx.end_range(task_range)
 
 
+class PinnedBuffer:
+    """
+    Pinned host buffer allocated directly from a ``PinnedMemoryResource``.
+
+    A raw ``ctypes``-backed allocation, bypassing ``BufferResource.make_buffer``
+    entirely: no ``BufferResource`` mutex, no ``host_view()`` lock, no
+    spill/eviction integration. Only used by the ``QUEUE`` prefetch
+    pipeline.
+
+    The reservation is released and the allocation freed whenever this
+    object is garbage-collected, rather than at a deterministic point.
+    """
+
+    __slots__ = ("array", "mr", "nbytes", "ptr", "reservation", "stream")
+
+    def __init__(
+        self,
+        mr: PinnedMemoryResource,
+        nbytes: int,
+        stream: Stream,
+        reservation: MemoryReservation,
+    ) -> None:
+        self.mr = mr
+        self.nbytes = nbytes
+        self.stream = stream
+        self.reservation = reservation
+        self.ptr = mr.allocate(nbytes, stream)
+        self.array = memoryview((ctypes.c_uint8 * nbytes).from_address(self.ptr))
+
+    def __del__(self) -> None:
+        """Release the reservation and free the allocation."""
+        # Guard against partial init.
+        if hasattr(self, "reservation"):
+            self.reservation.clear()
+        if hasattr(self, "ptr"):
+            self.mr.deallocate(self.ptr, self.nbytes, self.stream)
+
+
 def _reserve_pinned_batch_sync(
     context: Context,
     loop: asyncio.AbstractEventLoop,
@@ -488,11 +530,13 @@ def _reserve_pinned_batch_sync(
     """
     Reserve pinned host memory and issue reads for one batch, synchronously.
 
-    The queue pipeline's equivalent of :func:`reserve_pinned_batch`: runs
-    entirely on the calling (worker) thread, only reaching back into
-    ``loop`` for the one genuinely-async step (``reserve_memory``, which
-    does backpressure-aware admission control and has to run on an event
-    loop), via a blocking bridge rather than an ``await``.
+    The queue pipeline's equivalent of :func:`reserve_pinned_batch`:
+    allocates directly from the pinned memory resource via
+    :class:`PinnedBuffer` instead of going through ``BufferResource``, and
+    issues one ``pread`` per range with no coalescing. Runs entirely on the
+    calling (worker) thread, only reaching back into ``loop`` for the one
+    genuinely-async step (``reserve_memory``), via a blocking bridge
+    rather than an ``await``.
 
     Parameters
     ----------
@@ -513,6 +557,8 @@ def _reserve_pinned_batch_sync(
         return None
     total = sum(r.size for r in ranges)
     br = context.br()
+    pinned_mr = br.pinned_mr
+    assert pinned_mr is not None
     with nvtx_annotate_cudf_polars(message="reserve_pinned_batch", payload=total):
         with nvtx_annotate_cudf_polars(message="reserve_memory_wait", payload=total):
             reservation = asyncio.run_coroutine_threadsafe(
@@ -524,10 +570,25 @@ def _reserve_pinned_batch_sync(
                 ),
                 loop,
             ).result()
-        buf, view, host, futures = make_buffer_and_issue_reads(
-            br, total, br.stream_pool.get_stream(), reservation, handle, ranges
-        )
-    return PinnedBatch(ranges=ranges, host=host, futures=futures, buf=buf, view=view)
+        with nvtx_annotate_cudf_polars(
+            message="issue_reads_into_pinned_buffer", payload=total
+        ):
+            stream = br.stream_pool.get_stream()
+            buf = PinnedBuffer(pinned_mr, total, stream, reservation)
+            futures = []
+            offset = 0
+            for r in ranges:
+                futures.append(
+                    handle.pread(
+                        buf.array[offset : offset + r.size],
+                        size=r.size,
+                        file_offset=r.offset,
+                    )
+                )
+                offset += r.size
+    return PinnedBatch(
+        ranges=ranges, host=buf.array, futures=futures, buf=buf, view=None
+    )
 
 
 @nvtx_annotate_cudf_polars(message="prefetch_scan_byte_ranges")
@@ -593,9 +654,9 @@ def prefetch_scan_byte_ranges_sync(
     )
 
 
-class QueuePrefetchPipeline:
+class HybridScanPrefetchExecutor:
     """
-    PR23317-style prefetch pipeline: a small, fixed-size pool over a FIFO queue.
+    A small, fixed-size pool over a FIFO queue.
 
     Submits every split's full prune+reserve+read sequence
     (:func:`prefetch_scan_byte_ranges_sync`) to a plain
@@ -606,18 +667,44 @@ class QueuePrefetchPipeline:
 
     def __init__(
         self,
-        scans: Sequence[SplitScan],
-        context: Context,
-        num_workers: int,
+        futures: list[concurrent.futures.Future[PrefetchedByteRanges | None]],
+        executor: concurrent.futures.ThreadPoolExecutor,
     ) -> None:
-        self._executor = concurrent.futures.ThreadPoolExecutor(
+        self.futures = futures
+        self._executor = executor
+
+    @classmethod
+    def from_scans(
+        cls,
+        scans: Sequence[SplitScan],
+        num_workers: int,
+        context: Context,
+    ) -> Self:
+        """
+        Submit prefetch tasks for all scans.
+
+        Parameters
+        ----------
+        scans
+            Tasks to prefetch.
+        num_workers
+            Number of background worker threads.
+        context
+            The rapidsmpf context to reserve memory through.
+
+        Returns
+        -------
+        HybridScanPrefetchExecutor
+        """
+        loop = asyncio.get_running_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=num_workers, thread_name_prefix="cudf-polars-prefetch-queue"
         )
-        loop = asyncio.get_running_loop()
-        self._futures = [
-            self._executor.submit(prefetch_scan_byte_ranges_sync, scan, context, loop)
+        futures = [
+            executor.submit(prefetch_scan_byte_ranges_sync, scan, context, loop)
             for scan in scans
         ]
+        return cls(futures, executor)
 
     def __enter__(self) -> Self:
         """Enter the context manager."""
@@ -627,6 +714,6 @@ class QueuePrefetchPipeline:
         """Shut down the worker pool, cancelling any not-yet-started work."""
         self._executor.shutdown(cancel_futures=True, wait=False)
 
-    def result(self, seq_num: int) -> asyncio.Future[PrefetchedByteRanges | None]:
-        """Return an awaitable, on the caller's own event loop, for one split's result."""
-        return asyncio.wrap_future(self._futures[seq_num])
+    def result(self, task_idx: int) -> PrefetchedByteRanges | None:
+        """Block until the task's prefetch result is ready and return it."""
+        return self.futures[task_idx].result()

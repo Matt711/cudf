@@ -52,7 +52,7 @@ if TYPE_CHECKING:
     from kvikio.cufile import IOFuture
 
     import pylibcudf.expressions as plc_expr
-    from rapidsmpf.memory.buffer import Buffer, BufferHostView
+    from rapidsmpf.memory.buffer import BufferHostView
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.containers import DataType
@@ -532,11 +532,12 @@ class PinnedBatch:
         by ``PrefetchedByteRanges.release`` once its data has been copied
         to device.
     view
-        The still-open context manager backing ``host``. Its exclusive
-        write lock stays held until every future in ``futures`` completes
-        (see ``copy_pinned_batch_to_device``), since the writes ``futures``
+        The still-open context manager backing ``host``, or ``None`` when
+        there's no such lock to release. Its exclusive write lock stays
+        held until every future in ``futures`` completes (see
+        ``copy_pinned_batch_to_device``), since the writes ``futures``
         represents aren't actually done until then, even though ``host``
-        was already handed back. ``None`` alongside ``host is None``.
+        was already handed back.
     """
 
     ranges: list[Any]
@@ -544,7 +545,7 @@ class PinnedBatch:
     futures: list[IOFuture] = dataclasses.field(
         default_factory=list, compare=False, repr=False
     )
-    buf: Buffer | None = dataclasses.field(default=None, compare=False, repr=False)
+    buf: Any | None = dataclasses.field(default=None, compare=False, repr=False)
     view: BufferHostView | None = dataclasses.field(
         default=None, compare=False, repr=False
     )
@@ -627,8 +628,8 @@ def copy_pinned_batch_to_device(
     # `host_view()` requires: the lock protects against something else (e.g.
     # a future spill/eviction path) treating this buffer as safe to touch
     # while these writes are still in flight.
-    assert batch.view is not None
-    batch.view.__exit__(None, None, None)
+    if batch.view is not None:
+        batch.view.__exit__(None, None, None)
     with nvtx_annotate_cudf_polars(message="copy_pinned_to_device", payload=total):
         device_buffer = DeviceBuffer(size=total)
         device_buffer.copy_from_host(batch.host[:total], stream=stream)

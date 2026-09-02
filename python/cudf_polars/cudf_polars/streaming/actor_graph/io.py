@@ -45,7 +45,7 @@ from cudf_polars.streaming.io import (
     hybrid_scan_eligible,
 )
 from cudf_polars.streaming.prefetch import (
-    QueuePrefetchPipeline,
+    HybridScanPrefetchExecutor,
     prefetch_scan_byte_ranges,
 )
 from cudf_polars.streaming.rank_aware_source import RankAwareSource
@@ -522,6 +522,37 @@ def _(
     return nodes, channels
 
 
+def evaluate_with_prefetch_from_executor(
+    scan: SplitScan,
+    prefetcher: HybridScanPrefetchExecutor,
+    task_idx: int,
+    *,
+    context: IRExecutionContext,
+) -> DataFrame:
+    """
+    Evaluate a scan using a queued prefetch pipeline's result for it.
+
+    Parameters
+    ----------
+    scan
+        The scan task to evaluate.
+    prefetcher
+        The prefetch pipeline holding ``task_idx``'s result.
+    task_idx
+        This split's index into ``prefetcher``.
+    context
+        The execution context to evaluate under.
+
+    Returns
+    -------
+    The resulting DataFrame.
+    """
+    prefetched = prefetcher.result(task_idx)
+    if prefetched is None:
+        return scan.do_evaluate(*scan._non_child_args, context=context)
+    return evaluate_with_prefetch(scan, prefetched, context=context)
+
+
 async def read_chunk(
     context: Context,
     scan: IR,
@@ -532,6 +563,7 @@ async def read_chunk(
     tracer: ActorTracer | None = None,
     *,
     prefetch_task: asyncio.Future[PrefetchedByteRanges | None] | None = None,
+    prefetcher: HybridScanPrefetchExecutor | None = None,
 ) -> None:
     """
     Read a chunk from disk and send it to the output channel.
@@ -557,6 +589,10 @@ async def read_chunk(
         Optional hybrid scan prefetch task for this read. Awaited for its
         result before evaluating, ``None`` (a miss, or no task at all) falls
         back to ``scan.do_evaluate``.
+    prefetcher
+        Optional queued prefetch pipeline for this read, mutually exclusive
+        with ``prefetch_task``. Its result for ``seq_num`` is fetched and
+        evaluated together in a single dispatch.
     """
     reservation_bytes = (
         estimated_chunk_bytes
@@ -570,21 +606,30 @@ async def read_chunk(
         net_memory_delta=estimated_chunk_bytes,
     )
     admitted = time.monotonic_ns()
-    prefetched = await prefetch_task if prefetch_task is not None else None
     with opaque_memory_usage(reservation):
-        if prefetched is not None:
+        if prefetcher is not None:
             df = await ir_context.to_thread(
-                evaluate_with_prefetch,
+                evaluate_with_prefetch_from_executor,
                 scan,  # type: ignore[arg-type]
-                prefetched,
+                prefetcher,
+                seq_num,
                 context=ir_context,
             )
         else:
-            df = await ir_context.to_thread(
-                scan.do_evaluate,
-                *scan._non_child_args,
-                context=ir_context,
-            )
+            prefetched = await prefetch_task if prefetch_task is not None else None
+            if prefetched is not None:
+                df = await ir_context.to_thread(
+                    evaluate_with_prefetch,
+                    scan,  # type: ignore[arg-type]
+                    prefetched,
+                    context=ir_context,
+                )
+            else:
+                df = await ir_context.to_thread(
+                    scan.do_evaluate,
+                    *scan._non_child_args,
+                    context=ir_context,
+                )
         chunk = TableChunk.from_pylibcudf_table(
             df.table,
             df.stream,
@@ -734,7 +779,7 @@ async def scan_node(
     """
     scans: Sequence[SplitScan] | Sequence[FusedScan] = ir.scans
     prefetch_tasks: dict[int, asyncio.Future[PrefetchedByteRanges | None]] = {}
-    queue_pipeline: QueuePrefetchPipeline | None = None
+    prefetcher: HybridScanPrefetchExecutor | None = None
 
     try:
         async with shutdown_on_error(
@@ -756,15 +801,11 @@ async def scan_node(
                 if scans[0].parquet_options.prefetch_pipeline is (
                     HybridScanPrefetchPipeline.QUEUE
                 ):
-                    queue_pipeline = QueuePrefetchPipeline(
+                    prefetcher = HybridScanPrefetchExecutor.from_scans(
                         scans,  # type: ignore[arg-type]
-                        context,
                         scans[0].parquet_options.num_prefetch_queue_workers,
+                        context,
                     )
-                    prefetch_tasks = {
-                        seq_num: queue_pipeline.result(seq_num)
-                        for seq_num in range(len(scans))
-                    }
                 else:
                     effective_num_prefetch_producers = (
                         1
@@ -802,6 +843,7 @@ async def scan_node(
                         estimated_chunk_bytes,
                         tracer=tracer,
                         prefetch_task=prefetch_tasks.get(seq_num),
+                        prefetcher=prefetcher,
                     )
                 await ch_out.drain(context)
                 return
@@ -830,6 +872,7 @@ async def scan_node(
                         estimated_chunk_bytes,
                         tracer=tracer,
                         prefetch_task=prefetch_tasks.get(task_idx),
+                        prefetcher=prefetcher,
                     )
                 await ch_out.drain(context)
 
@@ -852,8 +895,8 @@ async def scan_node(
                 task.cancel()
         if prefetch_tasks:
             await asyncio.wait(prefetch_tasks.values())
-        if queue_pipeline is not None:
-            queue_pipeline.__exit__(None, None, None)
+        if prefetcher is not None:
+            prefetcher.__exit__(None, None, None)
 
 
 @generate_ir_sub_network.register(StreamingScan)
