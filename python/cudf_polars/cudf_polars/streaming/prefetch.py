@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import sys
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 import nvtx
 
@@ -26,7 +28,7 @@ from cudf_polars.utils.config import HybridScanPassMode
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 
 if TYPE_CHECKING:
-    import asyncio
+    from collections.abc import Sequence
 
     from kvikio.cufile import CuFile, IOFuture
     from kvikio.remote_file import RemoteFile
@@ -475,3 +477,156 @@ async def prefetch_scan_byte_ranges(
             own_turn.set()
     finally:
         nvtx.end_range(task_range)
+
+
+def _reserve_pinned_batch_sync(
+    context: Context,
+    loop: asyncio.AbstractEventLoop,
+    handle: CuFile | RemoteFile,
+    ranges: list[Any],
+) -> PinnedBatch | None:
+    """
+    Reserve pinned host memory and issue reads for one batch, synchronously.
+
+    The queue pipeline's equivalent of :func:`reserve_pinned_batch`: runs
+    entirely on the calling (worker) thread, only reaching back into
+    ``loop`` for the one genuinely-async step (``reserve_memory``, which
+    does backpressure-aware admission control and has to run on an event
+    loop), via a blocking bridge rather than an ``await``.
+
+    Parameters
+    ----------
+    context
+        The rapidsmpf context to reserve memory through.
+    loop
+        Event loop to run ``reserve_memory`` on.
+    handle
+        Open kvikio handle to read from.
+    ranges
+        Byte ranges to reserve for and read.
+
+    Returns
+    -------
+    The reserved, in-flight batch, or ``None`` when ``ranges`` is empty.
+    """
+    if not ranges:
+        return None
+    total = sum(r.size for r in ranges)
+    br = context.br()
+    with nvtx_annotate_cudf_polars(message="reserve_pinned_batch", payload=total):
+        with nvtx_annotate_cudf_polars(message="reserve_memory_wait", payload=total):
+            reservation = asyncio.run_coroutine_threadsafe(
+                reserve_memory(
+                    context,
+                    size=total,
+                    net_memory_delta=total,
+                    mem_type=MemoryType.PINNED_HOST,
+                ),
+                loop,
+            ).result()
+        buf, view, host, futures = make_buffer_and_issue_reads(
+            br, total, br.stream_pool.get_stream(), reservation, handle, ranges
+        )
+    return PinnedBatch(ranges=ranges, host=host, futures=futures, buf=buf, view=view)
+
+
+@nvtx_annotate_cudf_polars(message="prefetch_scan_byte_ranges")
+def prefetch_scan_byte_ranges_sync(
+    scan: SplitScan,
+    context: Context,
+    loop: asyncio.AbstractEventLoop,
+) -> PrefetchedByteRanges | None:
+    """
+    Prune row groups for one scan task and prefetch its byte ranges, synchronously.
+
+    The queue pipeline's per-split unit of work: everything
+    :func:`prefetch_scan_byte_ranges` does, but as one plain function
+    running entirely on a single worker thread with no ``asyncio.Task`` of
+    its own, and no ordering chain. A queue worker calls this once per
+    split, moving straight to the next split once this one's reads are
+    issued.
+
+    Parameters
+    ----------
+    scan
+        The scan task to prefetch.
+    context
+        The rapidsmpf context to reserve memory through.
+    loop
+        Event loop to run pinned memory reservation's admission control on.
+
+    Returns
+    -------
+    The prefetched byte ranges, or ``None`` when the predicate can't be
+    expressed as a parquet filter, the caller falls back to
+    ``SplitScan.do_evaluate`` in that case.
+    """
+    prepared = prepare_prefetch(scan)
+    if prepared is None:
+        return None
+    plc_filter, row_group_indices, pass_mode, primary_ranges, payload_ranges = prepared
+    if not row_group_indices:
+        return PrefetchedByteRanges.empty(plc_filter)
+
+    assert scan.cached_parquet_info is not None
+    handle = scan.cached_parquet_info[0].remote_handle()
+
+    if pass_mode is HybridScanPassMode.SINGLE_PASS:
+        all_columns = _reserve_pinned_batch_sync(context, loop, handle, primary_ranges)
+        return PrefetchedByteRanges(
+            row_group_indices=row_group_indices,
+            pass_mode=pass_mode,
+            plc_filter=plc_filter,
+            all_columns=all_columns,
+        )
+
+    filter_batch = _reserve_pinned_batch_sync(context, loop, handle, primary_ranges)
+    payload_batch = _reserve_pinned_batch_sync(
+        context, loop, handle, payload_ranges or []
+    )
+    return PrefetchedByteRanges(
+        row_group_indices=row_group_indices,
+        pass_mode=pass_mode,
+        plc_filter=plc_filter,
+        filter=filter_batch,
+        payload=payload_batch,
+    )
+
+
+class QueuePrefetchPipeline:
+    """
+    PR23317-style prefetch pipeline: a small, fixed-size pool over a FIFO queue.
+
+    Submits every split's full prune+reserve+read sequence
+    (:func:`prefetch_scan_byte_ranges_sync`) to a plain
+    ``ThreadPoolExecutor`` up front. Each worker thread processes one split
+    completely before pulling the next off the queue: no ordering chain, no
+    per-split ``asyncio.Task`` on the actor graph's event loop.
+    """
+
+    def __init__(
+        self,
+        scans: Sequence[SplitScan],
+        context: Context,
+        num_workers: int,
+    ) -> None:
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=num_workers, thread_name_prefix="cudf-polars-prefetch-queue"
+        )
+        loop = asyncio.get_running_loop()
+        self._futures = [
+            self._executor.submit(prefetch_scan_byte_ranges_sync, scan, context, loop)
+            for scan in scans
+        ]
+
+    def __enter__(self) -> Self:
+        """Enter the context manager."""
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        """Shut down the worker pool, cancelling any not-yet-started work."""
+        self._executor.shutdown(cancel_futures=True, wait=False)
+
+    def result(self, seq_num: int) -> asyncio.Future[PrefetchedByteRanges | None]:
+        """Return an awaitable, on the caller's own event loop, for one split's result."""
+        return asyncio.wrap_future(self._futures[seq_num])

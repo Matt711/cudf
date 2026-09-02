@@ -556,6 +556,7 @@ def test_split_scan_hybrid(
         (pl.col("y").str.contains("cat"), ["x", "z"]),
     ],
 )
+@pytest.mark.parametrize("prefetch_pipeline", ["modular", "queue"])
 @pytest.mark.skipif(
     not is_pinned_memory_resources_supported(),
     reason="Pinned memory requires CUDA 12.6+ driver and runtime",
@@ -565,6 +566,7 @@ def test_split_scan_hybrid_prefetch(
     df: pl.DataFrame,
     predicate: pl.Expr,
     use_columns: list[str] | None,
+    prefetch_pipeline: str,
     streaming_engine_factory: Callable[..., StreamingEngine],
 ) -> None:
     """Prefetched splits must match the same query with prefetching disabled."""
@@ -576,6 +578,7 @@ def test_split_scan_hybrid_prefetch(
             parquet_options={
                 "use_hybrid_scan": True,
                 "prefetch_file_metadata": True,
+                "prefetch_pipeline": prefetch_pipeline,
             },
         ),
     )

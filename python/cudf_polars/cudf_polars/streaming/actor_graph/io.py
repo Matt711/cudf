@@ -44,9 +44,15 @@ from cudf_polars.streaming.io import (
     evaluate_with_prefetch,
     hybrid_scan_eligible,
 )
-from cudf_polars.streaming.prefetch import prefetch_scan_byte_ranges
+from cudf_polars.streaming.prefetch import (
+    QueuePrefetchPipeline,
+    prefetch_scan_byte_ranges,
+)
 from cudf_polars.streaming.rank_aware_source import RankAwareSource
-from cudf_polars.utils.config import HybridScanPrefetchOrderingMode
+from cudf_polars.utils.config import (
+    HybridScanPrefetchOrderingMode,
+    HybridScanPrefetchPipeline,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -728,6 +734,7 @@ async def scan_node(
     """
     scans: Sequence[SplitScan] | Sequence[FusedScan] = ir.scans
     prefetch_tasks: dict[int, asyncio.Future[PrefetchedByteRanges | None]] = {}
+    queue_pipeline: QueuePrefetchPipeline | None = None
 
     try:
         async with shutdown_on_error(
@@ -746,28 +753,41 @@ async def scan_node(
                 return
 
             if prefetch_eligible(ir, scans, context):
-                effective_num_prefetch_producers = (
-                    1
-                    if (len(scans) == 1 or num_prefetch_executors == 1)
-                    else min(num_prefetch_executors, len(scans))
-                )
-                wait_for, own_turns = prefetch_ordering_events(
-                    len(scans),
-                    effective_num_prefetch_producers,
-                    scans[0].parquet_options.prefetch_ordering_mode,
-                )
-                prefetch_tasks = {
-                    seq_num: asyncio.create_task(
-                        prefetch_scan_byte_ranges(
-                            scan,  # type: ignore[arg-type]
-                            context,
-                            ir_context,
-                            wait_for=wait_for[seq_num],
-                            own_turn=own_turns[seq_num],
-                        )
+                if scans[0].parquet_options.prefetch_pipeline is (
+                    HybridScanPrefetchPipeline.QUEUE
+                ):
+                    queue_pipeline = QueuePrefetchPipeline(
+                        scans,  # type: ignore[arg-type]
+                        context,
+                        scans[0].parquet_options.num_prefetch_queue_workers,
                     )
-                    for seq_num, scan in enumerate(scans)
-                }
+                    prefetch_tasks = {
+                        seq_num: queue_pipeline.result(seq_num)
+                        for seq_num in range(len(scans))
+                    }
+                else:
+                    effective_num_prefetch_producers = (
+                        1
+                        if (len(scans) == 1 or num_prefetch_executors == 1)
+                        else min(num_prefetch_executors, len(scans))
+                    )
+                    wait_for, own_turns = prefetch_ordering_events(
+                        len(scans),
+                        effective_num_prefetch_producers,
+                        scans[0].parquet_options.prefetch_ordering_mode,
+                    )
+                    prefetch_tasks = {
+                        seq_num: asyncio.create_task(
+                            prefetch_scan_byte_ranges(
+                                scan,  # type: ignore[arg-type]
+                                context,
+                                ir_context,
+                                wait_for=wait_for[seq_num],
+                                own_turn=own_turns[seq_num],
+                            )
+                        )
+                        for seq_num, scan in enumerate(scans)
+                    }
 
             # If there is only one scan or one producer, we can
             # skip the lineariser and read the chunks directly
@@ -832,6 +852,8 @@ async def scan_node(
                 task.cancel()
         if prefetch_tasks:
             await asyncio.wait(prefetch_tasks.values())
+        if queue_pipeline is not None:
+            queue_pipeline.__exit__(None, None, None)
 
 
 @generate_ir_sub_network.register(StreamingScan)

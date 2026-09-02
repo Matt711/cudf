@@ -61,6 +61,7 @@ __all__ = [
     "DynamicPlanningOptions",
     "HybridScanPassMode",
     "HybridScanPrefetchOrderingMode",
+    "HybridScanPrefetchPipeline",
     "InMemoryExecutor",
     "JoinFilterPushdownOptions",
     "MaxConcurrentIOTasks",
@@ -246,6 +247,26 @@ class HybridScanPrefetchOrderingMode(enum.StrEnum):
     RACE = "race"
 
 
+class HybridScanPrefetchPipeline(enum.StrEnum):
+    """
+    Which prefetch pipeline implementation issues hybrid scan reads.
+
+    * ``HybridScanPrefetchPipeline.MODULAR`` : Each split's prune, reserve,
+      and read steps run as separate, independently-offloaded coroutine
+      steps on the shared actor-graph event loop. Concurrency and ordering
+      are controlled by ``num_prefetch_executors`` and
+      ``prefetch_ordering_mode``.
+    * ``HybridScanPrefetchPipeline.QUEUE`` : A small, fixed-size pool of
+      worker threads (``num_prefetch_queue_workers``) pulls splits off a
+      FIFO queue; each worker prunes, reserves, and issues every read for
+      one split synchronously before moving to the next. No ordering chain,
+      no per-split coroutine scheduling on the shared event loop.
+    """
+
+    MODULAR = "modular"
+    QUEUE = "queue"
+
+
 class Cluster(enum.StrEnum):
     """
     The cluster configuration for the streaming executor.
@@ -401,7 +422,14 @@ class ParquetOptions:
     prefetch_ordering_mode
         How concurrent hybrid scan prefetch tasks claim shared, limited
         resources. See :class:`HybridScanPrefetchOrderingMode`. Default is
-        ``ORDERED``.
+        ``ORDERED``. Ignored under ``prefetch_pipeline=QUEUE``, which has no
+        ordering chain.
+    prefetch_pipeline
+        Which prefetch pipeline implementation issues hybrid scan reads. See
+        :class:`HybridScanPrefetchPipeline`. Default is ``MODULAR``.
+    num_prefetch_queue_workers
+        Number of worker threads in the prefetch pipeline's queue, when
+        ``prefetch_pipeline=QUEUE``. Ignored under ``MODULAR``. Default is 2.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -464,6 +492,18 @@ class ParquetOptions:
             default=HybridScanPrefetchOrderingMode.ORDERED,
         )
     )
+    prefetch_pipeline: HybridScanPrefetchPipeline = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_PIPELINE",
+            HybridScanPrefetchPipeline.__call__,
+            default=HybridScanPrefetchPipeline.MODULAR,
+        )
+    )
+    num_prefetch_queue_workers: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__NUM_PREFETCH_QUEUE_WORKERS", int, default=2
+        )
+    )
     # Internal benchmarking flag. When False, skips stats and bloom-filter pruning
     # before the first pass of a hybrid scan so you can measure two-pass read
     # overhead in isolation. No reason to set this to False in production.
@@ -505,12 +545,42 @@ class ParquetOptions:
             raise ValueError(
                 "use_hybrid_scan requires prefetch_file_metadata to be enabled"
             )
+        # `ParquetOptions(**{"pass_mode": "single_pass", ...})`-style construction
+        # (e.g. from a plain ``parquet_options`` dict passed to ``GPUEngine``)
+        # bypasses the env-var string-to-enum converters above, so a plain
+        # string value needs coercing here too, not just validating.
+        if isinstance(self.pass_mode, str) and not isinstance(
+            self.pass_mode, HybridScanPassMode
+        ):
+            object.__setattr__(self, "pass_mode", HybridScanPassMode(self.pass_mode))
         if not isinstance(self.pass_mode, (HybridScanPassMode, Unspecified)):
             raise TypeError("pass_mode must be a HybridScanPassMode when specified")
+        if isinstance(self.prefetch_ordering_mode, str) and not isinstance(
+            self.prefetch_ordering_mode, HybridScanPrefetchOrderingMode
+        ):
+            object.__setattr__(
+                self,
+                "prefetch_ordering_mode",
+                HybridScanPrefetchOrderingMode(self.prefetch_ordering_mode),
+            )
         if not isinstance(self.prefetch_ordering_mode, HybridScanPrefetchOrderingMode):
             raise TypeError(
                 "prefetch_ordering_mode must be a HybridScanPrefetchOrderingMode"
             )
+        if isinstance(self.prefetch_pipeline, str) and not isinstance(
+            self.prefetch_pipeline, HybridScanPrefetchPipeline
+        ):
+            object.__setattr__(
+                self,
+                "prefetch_pipeline",
+                HybridScanPrefetchPipeline(self.prefetch_pipeline),
+            )
+        if not isinstance(self.prefetch_pipeline, HybridScanPrefetchPipeline):
+            raise TypeError("prefetch_pipeline must be a HybridScanPrefetchPipeline")
+        if not isinstance(self.num_prefetch_queue_workers, int):
+            raise TypeError("num_prefetch_queue_workers must be an int")
+        if self.num_prefetch_queue_workers <= 0:
+            raise ValueError("num_prefetch_queue_workers must be positive")
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
 
