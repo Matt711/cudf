@@ -825,6 +825,9 @@ async def scan_node(
                         budget_bytes=scans[
                             0
                         ].parquet_options.max_outstanding_prefetch_bytes,
+                        num_prefetch_producers=scans[
+                            0
+                        ].parquet_options.max_concurrent_prefetch_acquisitions,
                     )
                 else:
                     effective_num_prefetch_producers = (

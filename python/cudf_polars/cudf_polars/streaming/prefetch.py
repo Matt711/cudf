@@ -1092,6 +1092,7 @@ async def run_paced_prefetch_pipeline(
     ir_context: IRExecutionContext,
     *,
     budget_bytes: int,
+    num_prefetch_producers: int = 1,
 ) -> dict[int, asyncio.Future[PrefetchedByteRanges | None]]:
     """
     Prefetch every split in a scan independently, paced by a byte budget.
@@ -1109,6 +1110,14 @@ async def run_paced_prefetch_pipeline(
     budget_bytes
         Maximum combined size of every split's pinned reservation
         outstanding at once.
+    num_prefetch_producers
+        Number of independent FIFO chains splits are round-robin assigned
+        to when claiming a share of ``budget_bytes``. 1 (the default)
+        means a single strict global order across every split. Higher
+        values let that many splits attempt to claim budget concurrently
+        (one per chain), reducing head-of-line blocking between splits in
+        different chains, at the cost of a weaker ordering guarantee: two
+        splits in different chains can now claim out of relative order.
 
     Returns
     -------
@@ -1117,10 +1126,24 @@ async def run_paced_prefetch_pipeline(
     """
     loop = asyncio.get_running_loop()
     budget = ByteBudget(budget_bytes)
-    # Strict FIFO chain: split N can't attempt to claim its share of the
-    # budget until split N - 1 has finished attempting to claim its own.
-    own_turns = [asyncio.Event() for _ in range(len(scans))]
-    wait_for: list[asyncio.Event | None] = [None, *own_turns[:-1]]
+    # FIFO chains: within a chain, split N can't attempt to claim its
+    # share of the budget until split N's predecessor in that same chain
+    # has finished attempting to claim its own. Splits are round-robin
+    # assigned to `num_prefetch_producers` chains, so up to that many
+    # splits (one per chain) can be attempting to claim a share at once.
+    num_scans = len(scans)
+    effective_num_prefetch_producers = (
+        1
+        if (num_scans == 1 or num_prefetch_producers == 1)
+        else min(num_prefetch_producers, num_scans)
+    )
+    own_turns = [asyncio.Event() for _ in range(num_scans)]
+    wait_for: list[asyncio.Event | None] = [None] * num_scans
+    for producer_id in range(effective_num_prefetch_producers):
+        predecessor: asyncio.Event | None = None
+        for task_idx in range(producer_id, num_scans, effective_num_prefetch_producers):
+            wait_for[task_idx] = predecessor
+            predecessor = own_turns[task_idx]
     return {
         seq_num: asyncio.create_task(
             prefetch_scan_byte_ranges_paced(

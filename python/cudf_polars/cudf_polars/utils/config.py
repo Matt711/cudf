@@ -272,9 +272,13 @@ class HybridScanPrefetchPipeline(enum.StrEnum):
       reservation and buffer (no split ever waits on another's I/O).
       How much pinned memory can be claimed at once is bounded by
       ``max_outstanding_prefetch_bytes`` instead of a producer/thread
-      count, but *claiming* a share is still ordered strict FIFO across
-      splits, so a split due for consumption soon can't lose its share to
-      one that isn't.
+      count. *Claiming* a share is ordered FIFO within each of
+      ``max_concurrent_prefetch_acquisitions`` chains (splits are
+      round-robin assigned to chains), so a split due for consumption
+      soon can't lose its share to a later one in the *same* chain; more
+      chains reduce head-of-line blocking between splits assigned to
+      different chains, at the cost of a weaker cross-chain ordering
+      guarantee.
     """
 
     MODULAR = "modular"
@@ -458,6 +462,15 @@ class ParquetOptions:
         Maximum combined size of every split's pinned reservation
         outstanding at once, when ``prefetch_pipeline=PACED``. Ignored
         under ``MODULAR``/``QUEUE``/``BATCH``. Default is 64 MiB.
+    max_concurrent_prefetch_acquisitions
+        How many independent FIFO chains splits are round-robin assigned
+        to when claiming a share of ``max_outstanding_prefetch_bytes``,
+        when ``prefetch_pipeline=PACED``. Ignored under
+        ``MODULAR``/``QUEUE``/``BATCH``. 1 means a single strict global
+        order (the safest against starvation, but the most prone to
+        head-of-line blocking); higher values let more splits attempt to
+        claim budget concurrently, at the cost of a weaker ordering
+        guarantee across chains. Default is 1.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -549,6 +562,11 @@ class ParquetOptions:
             default=64 * 1024 * 1024,
         )
     )
+    max_concurrent_prefetch_acquisitions: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__MAX_CONCURRENT_PREFETCH_ACQUISITIONS", int, default=1
+        )
+    )
     # Internal benchmarking flag. When False, skips stats and bloom-filter pruning
     # before the first pass of a hybrid scan so you can measure two-pass read
     # overhead in isolation. No reason to set this to False in production.
@@ -638,6 +656,10 @@ class ParquetOptions:
             raise TypeError("max_outstanding_prefetch_bytes must be an int")
         if self.max_outstanding_prefetch_bytes <= 0:
             raise ValueError("max_outstanding_prefetch_bytes must be positive")
+        if not isinstance(self.max_concurrent_prefetch_acquisitions, int):
+            raise TypeError("max_concurrent_prefetch_acquisitions must be an int")
+        if self.max_concurrent_prefetch_acquisitions <= 0:
+            raise ValueError("max_concurrent_prefetch_acquisitions must be positive")
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
 
