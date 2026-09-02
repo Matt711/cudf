@@ -23,6 +23,7 @@ from cudf_polars.engine.hardware_binding import (
 from cudf_polars.utils.config import (
     UNSPECIFIED,
     DynamicPlanningOptions,
+    MaxConcurrentIOTasks,
     MemoryResourceConfig,
     Unspecified,
 )
@@ -256,7 +257,10 @@ class StreamingOptions:
     max_concurrent_io_tasks
         Maximum concurrent IO tasks for each scan node.
         Env: ``CUDF_POLARS__EXECUTOR__MAX_CONCURRENT_IO_TASKS``.
-        Default: ``2``.
+        Default: automatic, resolved separately for each scan based on its paths.
+        Python and config values may be an ``int``, a dict with ``local``
+        and/or ``remote`` keys, or omitted/``None`` for the default policy.
+        The environment variable accepts an int or a JSON dict.
         Category: executor.
     fallback_mode
         Fallback behavior (``"warn"``, ``"raise"``, ``"silent"``).
@@ -406,8 +410,10 @@ class StreamingOptions:
     kvikio_request_ceiling: int | Unspecified = _opt(
         "executor", "CUDF_POLARS__EXECUTOR__KVIKIO_REQUEST_CEILING", int
     )
-    max_concurrent_io_tasks: int | Unspecified = _opt(
-        "executor", "CUDF_POLARS__EXECUTOR__MAX_CONCURRENT_IO_TASKS", int
+    max_concurrent_io_tasks: int | dict[str, int] | Unspecified | None = _opt(
+        "executor",
+        "CUDF_POLARS__EXECUTOR__MAX_CONCURRENT_IO_TASKS",
+        MaxConcurrentIOTasks.parse_env,
     )
     fallback_mode: str | Unspecified = _opt(
         "executor", "CUDF_POLARS__EXECUTOR__FALLBACK_MODE"
@@ -791,7 +797,7 @@ class StreamingOptions:
             help=textwrap.dedent("""\
                 Maximum concurrent IO tasks for each scan node.
                 Env: CUDF_POLARS__EXECUTOR__MAX_CONCURRENT_IO_TASKS.
-                Built-in default: 2."""),
+                Omit to use the path-dependent default."""),
         )
         g.add_argument(
             "--raise-on-fail",
