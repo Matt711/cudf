@@ -44,7 +44,10 @@ from cudf_polars.streaming.io import (
     evaluate_with_prefetch,
     hybrid_scan_eligible,
 )
-from cudf_polars.streaming.prefetch import prefetch_scan_byte_ranges
+from cudf_polars.streaming.prefetch import (
+    prefetch_scan_byte_ranges,
+    run_on_prefetch_loop,
+)
 from cudf_polars.streaming.rank_aware_source import RankAwareSource
 from cudf_polars.utils.config import HybridScanPrefetchOrderingMode
 
@@ -525,7 +528,7 @@ async def read_chunk(
     estimated_chunk_bytes: int,
     tracer: ActorTracer | None = None,
     *,
-    prefetch_task: asyncio.Task[PrefetchedByteRanges | None] | None = None,
+    prefetch_task: asyncio.Future[PrefetchedByteRanges | None] | None = None,
 ) -> None:
     """
     Read a chunk from disk and send it to the output channel.
@@ -727,7 +730,7 @@ async def scan_node(
         peak memory for admission before launching each read.
     """
     scans: Sequence[SplitScan] | Sequence[FusedScan] = ir.scans
-    prefetch_tasks: dict[int, asyncio.Task[PrefetchedByteRanges | None]] = {}
+    prefetch_tasks: dict[int, asyncio.Future[PrefetchedByteRanges | None]] = {}
 
     try:
         async with shutdown_on_error(
@@ -757,7 +760,7 @@ async def scan_node(
                     scans[0].parquet_options.prefetch_ordering_mode,
                 )
                 prefetch_tasks = {
-                    seq_num: asyncio.create_task(
+                    seq_num: run_on_prefetch_loop(
                         prefetch_scan_byte_ranges(
                             scan,  # type: ignore[arg-type]
                             context,
