@@ -1089,8 +1089,33 @@ def test_kvikio_nthreads_cudf_polars_env_takes_precedence(
         assert config.executor.kvikio_nthreads == 64
 
 
+@pytest.fixture
+def kvikio_defaults_guard():
+    """Snapshot and restore kvikio.defaults around a test.
+
+    ``configure_kvikio`` mutates process-global kvikio defaults via
+    ``kvikio.defaults.set``. Without restoring them, a test that calls
+    ``configure_kvikio`` can leak settings into later tests.
+    """
+    import kvikio.defaults
+
+    keys = [
+        "num_threads",
+        "task_size",
+        "bounce_buffer_size",
+        "remote_io_backend",
+        "remote_io_num_reactors",
+        "remote_io_reactor_dispatch",
+        "remote_io_max_concurrent_requests",
+    ]
+    original = {key: kvikio.defaults.get(key) for key in keys}
+    yield
+    kvikio.defaults.set(original)
+
+
 def test_configure_kvikio_sets_backend_and_threads(
     monkeypatch: pytest.MonkeyPatch,
+    kvikio_defaults_guard: None,
 ) -> None:
     import kvikio
     import kvikio.defaults
@@ -1106,6 +1131,7 @@ def test_configure_kvikio_sets_backend_and_threads(
 
 def test_configure_kvikio_multi_poll_defaults(
     monkeypatch: pytest.MonkeyPatch,
+    kvikio_defaults_guard: None,
 ) -> None:
     import kvikio
     import kvikio.defaults
@@ -1125,6 +1151,7 @@ def test_configure_kvikio_multi_poll_defaults(
 
 def test_configure_kvikio_easy_threadpool_task_size_default(
     monkeypatch: pytest.MonkeyPatch,
+    kvikio_defaults_guard: None,
 ) -> None:
     import kvikio
     import kvikio.defaults
