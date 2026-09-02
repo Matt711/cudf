@@ -1013,13 +1013,18 @@ def test_num_py_executors_from_env(
 
 
 def test_kvikio_nthreads_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Default backend is MULTI_POLL, whose remote I/O does not use this pool,
-    # so resolution defers to kvikio's own built-in default (None).
     with monkeypatch.context() as m:
         m.delenv("CUDF_POLARS__EXECUTOR__KVIKIO_NTHREADS", raising=False)
         m.delenv("KVIKIO_NTHREADS", raising=False)
         config = ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
         assert config.executor.kvikio_nthreads is None
+
+    with monkeypatch.context() as m:
+        m.delenv("CUDF_POLARS__EXECUTOR__KVIKIO_NTHREADS", raising=False)
+        m.delenv("KVIKIO_NTHREADS", raising=False)
+        m.setenv("KVIKIO_REMOTE_IO_BACKEND", "EASY_THREADPOOL")
+        config = ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
+        assert config.executor.kvikio_nthreads == 256
 
 
 def test_kvikio_nthreads_default_easy_threadpool(
