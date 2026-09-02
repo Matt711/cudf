@@ -972,19 +972,33 @@ async def prefetch_scan_byte_ranges_paced(
     ir_context: IRExecutionContext,
     budget: ByteBudget,
     loop: asyncio.AbstractEventLoop,
+    *,
+    wait_for: asyncio.Event | None,
+    own_turn: asyncio.Event,
 ) -> PrefetchedByteRanges | None:
     """
-    Prune, byte-pace, and prefetch one split -- no ordering chain, no shared buffer.
+    Prune, byte-pace, and prefetch one split -- no shared buffer.
 
     Reserves and reads this split's own byte ranges independently (own
     reservation, own buffer, own lock), the same as
     :func:`prefetch_scan_byte_ranges`, so no split ever waits on another's
-    I/O. Concurrency is bounded by ``budget`` instead of a fixed
+    *I/O*. Concurrency is bounded by ``budget`` instead of a fixed
     producer/thread count: a split only starts reserving pinned memory
     once enough of the byte budget is free, and returns its share only
     once the buffer it was holding is actually released (see
     ``PrefetchedByteRanges.on_release``), not merely once its reads are
     issued.
+
+    Claiming a share of ``budget`` still waits for ``wait_for`` first (a
+    strict FIFO chain across every split in the scan): without an
+    ordering guarantee here, a split due for consumption *later* could
+    win a race for limited budget over one due *sooner*, and since a
+    split's share is only returned once it's actually consumed, that
+    starves the split the consumer is waiting on -- a deadlock, not just
+    a slowdown, if the budget is small enough that only the "wrong"
+    splits fit at once. Only the *acquire* step is ordered; once a split
+    has its share, its own reservation and reads proceed independently of
+    every other split, same as before.
 
     Parameters
     ----------
@@ -1000,6 +1014,13 @@ async def prefetch_scan_byte_ranges_paced(
         The byte budget admission for this split's reservation is gated on.
     loop
         Event loop ``budget`` runs on, for :meth:`ByteBudget.release_threadsafe`.
+    wait_for
+        Event to wait on before attempting to claim a share of ``budget``,
+        or ``None`` for the first split.
+    own_turn
+        Event this task sets once it's done claiming its share of
+        ``budget`` (whether or not claiming it succeeded), so the next
+        split can attempt to claim its own.
 
     Returns
     -------
@@ -1009,9 +1030,15 @@ async def prefetch_scan_byte_ranges_paced(
     """
     prepared = await resolve_prefetch_plan(scan, ir_context)
     if prepared is None:
+        if wait_for is not None:
+            await wait_for.wait()
+        own_turn.set()
         return None
     plc_filter, row_group_indices, pass_mode, primary_ranges, payload_ranges = prepared
     if not row_group_indices:
+        if wait_for is not None:
+            await wait_for.wait()
+        own_turn.set()
         return PrefetchedByteRanges.empty(plc_filter)
 
     assert scan.cached_parquet_info is not None
@@ -1021,7 +1048,12 @@ async def prefetch_scan_byte_ranges_paced(
     if payload_ranges is not None:
         total_bytes += sum(r.size for r in payload_ranges)
 
-    await budget.acquire(total_bytes)
+    if wait_for is not None:
+        await wait_for.wait()
+    try:
+        await budget.acquire(total_bytes)
+    finally:
+        own_turn.set()
     try:
         if pass_mode is HybridScanPassMode.SINGLE_PASS:
             all_columns = await reserve_pinned_batch(
@@ -1085,9 +1117,21 @@ async def run_paced_prefetch_pipeline(
     """
     loop = asyncio.get_running_loop()
     budget = ByteBudget(budget_bytes)
+    # Strict FIFO chain: split N can't attempt to claim its share of the
+    # budget until split N - 1 has finished attempting to claim its own.
+    own_turns = [asyncio.Event() for _ in range(len(scans))]
+    wait_for: list[asyncio.Event | None] = [None, *own_turns[:-1]]
     return {
         seq_num: asyncio.create_task(
-            prefetch_scan_byte_ranges_paced(scan, context, ir_context, budget, loop)
+            prefetch_scan_byte_ranges_paced(
+                scan,
+                context,
+                ir_context,
+                budget,
+                loop,
+                wait_for=wait_for[seq_num],
+                own_turn=own_turns[seq_num],
+            )
         )
         for seq_num, scan in enumerate(scans)
     }

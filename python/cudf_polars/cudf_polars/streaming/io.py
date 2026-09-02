@@ -349,165 +349,183 @@ def _read_with_hybrid_scan(
     with nvtx_annotate_cudf_polars(
         message="HybridScan", payload=(split_index + 1, total_splits)
     ):
-        source_info = plc.io.SourceInfo(
-            [plc.io.types.FilepathSource(cached_info.path, cached_info.size)]
-        )
-        options = cached_info.default_reader_options()
-        if with_columns is not None:
-            options.set_column_names(with_columns)
-        options.set_filter(plc_filter)
-
-        with nvtx_annotate_cudf_polars(message="hybrid_scan_reader_construct"):
-            reader = cached_info.hybrid_scan_reader(options)
-
-        if prefetched is not None:
-            row_group_indices = prefetched.row_group_indices
-            effective_pass_mode = prefetched.pass_mode
-        else:
-            row_group_count_before_pruning = len(row_group_indices)
-            if stats_pruning:
-                with nvtx_annotate_cudf_polars(message="filter_row_groups_with_stats"):
-                    row_group_indices = reader.filter_row_groups_with_stats(
-                        row_group_indices, options, stream=stream
-                    )
-
-                if row_group_indices:
-                    with nvtx_annotate_cudf_polars(message="bloom_filter_pruning"):
-                        bloom_ranges = reader.bloom_filters_byte_ranges(
-                            row_group_indices, options
-                        )
-                        if bloom_ranges:
-                            bloom_chunks = (
-                                plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-                                    source_info, bloom_ranges, stream=stream
-                                )
-                            )
-                            row_group_indices = (
-                                reader.filter_row_groups_with_bloom_filters(
-                                    bloom_chunks,
-                                    row_group_indices,
-                                    options,
-                                    stream=stream,
-                                )
-                            )
-
-            # TODO: Consider implementing page-index stats pruning. For SplitScans, we
-            # can reuse the same page index for all splits of the same file, so the
-            # overhead of reading the page index can be amortized. For FusedScans, we
-            # would need to read the page index for all files, which may be too
-            # expensive.
-            effective_pass_mode = decide_pass_mode(
-                pass_mode, row_group_indices, row_group_count_before_pruning
+        try:
+            source_info = plc.io.SourceInfo(
+                [plc.io.types.FilepathSource(cached_info.path, cached_info.size)]
             )
+            options = cached_info.default_reader_options()
+            if with_columns is not None:
+                options.set_column_names(with_columns)
+            options.set_filter(plc_filter)
 
-        if not row_group_indices:
-            col_names = with_columns if with_columns is not None else list(schema)
-            return DataFrame(
-                [
-                    Column(
-                        plc.column_factories.make_empty_column(
-                            schema[name].plc_type, stream=stream
-                        ),
-                        dtype=schema[name],
-                        name=name,
-                    )
-                    for name in col_names
-                ],
-                stream=stream,
-            )
+            with nvtx_annotate_cudf_polars(message="hybrid_scan_reader_construct"):
+                reader = cached_info.hybrid_scan_reader(options)
 
-        if effective_pass_mode is HybridScanPassMode.SINGLE_PASS:
-            if prefetched is not None and prefetched.all_columns is not None:
-                all_chunks = copy_pinned_batch_to_device(prefetched.all_columns, stream)
-            else:
-                all_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-                    source_info,
-                    reader.all_column_chunks_byte_ranges(row_group_indices, options),
-                    stream=stream,
-                )
-            with nvtx_annotate_cudf_polars(message="materialize_all_columns"):
-                tbl_w_meta = reader.materialize_all_columns(
-                    row_group_indices, all_chunks, options, stream=stream
-                )
-            names = tbl_w_meta.column_names(include_children=False)
-            result = DataFrame.from_table(
-                tbl_w_meta.tbl,
-                names,
-                [schema[n] for n in names],
-                stream=stream,
-            ).select(list(schema.keys()))
             if prefetched is not None:
-                with nvtx_annotate_cudf_polars(message="stream_synchronize"):
-                    stream.synchronize()
-                prefetched.release()
-            return result
-
-        with nvtx_annotate_cudf_polars(message="build_all_true_row_mask"):
-            row_mask = reader.build_all_true_row_mask(row_group_indices, stream=stream)
-
-        if prefetched is not None and prefetched.filter is not None:
-            filter_chunks = copy_pinned_batch_to_device(prefetched.filter, stream)
-        else:
-            filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-                source_info,
-                reader.filter_column_chunks_byte_ranges(row_group_indices, options),
-                stream=stream,
-            )
-        with nvtx_annotate_cudf_polars(message="materialize_filter_columns"):
-            filter_tbl_w_meta = reader.materialize_filter_columns(
-                row_group_indices,
-                filter_chunks,
-                row_mask,
-                plc.io.experimental.UseDataPageMask.YES,
-                options,
-                stream=stream,
-            )
-
-        filter_names = filter_tbl_w_meta.column_names(include_children=False)
-        filter_df = DataFrame.from_table(
-            filter_tbl_w_meta.tbl,
-            filter_names,
-            [schema[n] for n in filter_names],
-            stream=stream,
-        )
-
-        requested_columns = with_columns if with_columns is not None else list(schema)
-        columns = filter_df.columns
-        if set(requested_columns) - set(filter_names):
-            if prefetched is not None and prefetched.payload is not None:
-                payload_chunks = copy_pinned_batch_to_device(prefetched.payload, stream)
+                row_group_indices = prefetched.row_group_indices
+                effective_pass_mode = prefetched.pass_mode
             else:
-                payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-                    source_info,
-                    reader.payload_column_chunks_byte_ranges(
-                        row_group_indices, options
-                    ),
+                row_group_count_before_pruning = len(row_group_indices)
+                if stats_pruning:
+                    with nvtx_annotate_cudf_polars(
+                        message="filter_row_groups_with_stats"
+                    ):
+                        row_group_indices = reader.filter_row_groups_with_stats(
+                            row_group_indices, options, stream=stream
+                        )
+
+                    if row_group_indices:
+                        with nvtx_annotate_cudf_polars(message="bloom_filter_pruning"):
+                            bloom_ranges = reader.bloom_filters_byte_ranges(
+                                row_group_indices, options
+                            )
+                            if bloom_ranges:
+                                bloom_chunks = (
+                                    plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                                        source_info, bloom_ranges, stream=stream
+                                    )
+                                )
+                                row_group_indices = (
+                                    reader.filter_row_groups_with_bloom_filters(
+                                        bloom_chunks,
+                                        row_group_indices,
+                                        options,
+                                        stream=stream,
+                                    )
+                                )
+
+                # TODO: Consider implementing page-index stats pruning. For SplitScans, we
+                # can reuse the same page index for all splits of the same file, so the
+                # overhead of reading the page index can be amortized. For FusedScans, we
+                # would need to read the page index for all files, which may be too
+                # expensive.
+                effective_pass_mode = decide_pass_mode(
+                    pass_mode, row_group_indices, row_group_count_before_pruning
+                )
+
+            if not row_group_indices:
+                col_names = with_columns if with_columns is not None else list(schema)
+                return DataFrame(
+                    [
+                        Column(
+                            plc.column_factories.make_empty_column(
+                                schema[name].plc_type, stream=stream
+                            ),
+                            dtype=schema[name],
+                            name=name,
+                        )
+                        for name in col_names
+                    ],
                     stream=stream,
                 )
-            with nvtx_annotate_cudf_polars(message="materialize_payload_columns"):
-                payload_tbl_w_meta = reader.materialize_payload_columns(
+
+            if effective_pass_mode is HybridScanPassMode.SINGLE_PASS:
+                if prefetched is not None and prefetched.all_columns is not None:
+                    all_chunks = copy_pinned_batch_to_device(
+                        prefetched.all_columns, stream
+                    )
+                else:
+                    all_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                        source_info,
+                        reader.all_column_chunks_byte_ranges(
+                            row_group_indices, options
+                        ),
+                        stream=stream,
+                    )
+                with nvtx_annotate_cudf_polars(message="materialize_all_columns"):
+                    tbl_w_meta = reader.materialize_all_columns(
+                        row_group_indices, all_chunks, options, stream=stream
+                    )
+                names = tbl_w_meta.column_names(include_children=False)
+                result = DataFrame.from_table(
+                    tbl_w_meta.tbl,
+                    names,
+                    [schema[n] for n in names],
+                    stream=stream,
+                ).select(list(schema.keys()))
+                if prefetched is not None:
+                    with nvtx_annotate_cudf_polars(message="stream_synchronize"):
+                        stream.synchronize()
+                    prefetched.release()
+                return result
+
+            with nvtx_annotate_cudf_polars(message="build_all_true_row_mask"):
+                row_mask = reader.build_all_true_row_mask(
+                    row_group_indices, stream=stream
+                )
+
+            if prefetched is not None and prefetched.filter is not None:
+                filter_chunks = copy_pinned_batch_to_device(prefetched.filter, stream)
+            else:
+                filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                    source_info,
+                    reader.filter_column_chunks_byte_ranges(row_group_indices, options),
+                    stream=stream,
+                )
+            with nvtx_annotate_cudf_polars(message="materialize_filter_columns"):
+                filter_tbl_w_meta = reader.materialize_filter_columns(
                     row_group_indices,
-                    payload_chunks,
+                    filter_chunks,
                     row_mask,
                     plc.io.experimental.UseDataPageMask.YES,
                     options,
                     stream=stream,
                 )
-            payload_names = payload_tbl_w_meta.column_names(include_children=False)
-            payload_df = DataFrame.from_table(
-                payload_tbl_w_meta.tbl,
-                payload_names,
-                [schema[n] for n in payload_names],
+
+            filter_names = filter_tbl_w_meta.column_names(include_children=False)
+            filter_df = DataFrame.from_table(
+                filter_tbl_w_meta.tbl,
+                filter_names,
+                [schema[n] for n in filter_names],
                 stream=stream,
             )
-            columns = [*columns, *payload_df.columns]
 
-        result = DataFrame(columns, stream=stream).select(list(schema.keys()))
-        if prefetched is not None:
-            with nvtx_annotate_cudf_polars(message="stream_synchronize"):
-                stream.synchronize()
-            prefetched.release()
-        return result
+            requested_columns = (
+                with_columns if with_columns is not None else list(schema)
+            )
+            columns = filter_df.columns
+            if set(requested_columns) - set(filter_names):
+                if prefetched is not None and prefetched.payload is not None:
+                    payload_chunks = copy_pinned_batch_to_device(
+                        prefetched.payload, stream
+                    )
+                else:
+                    payload_chunks = (
+                        plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                            source_info,
+                            reader.payload_column_chunks_byte_ranges(
+                                row_group_indices, options
+                            ),
+                            stream=stream,
+                        )
+                    )
+                with nvtx_annotate_cudf_polars(message="materialize_payload_columns"):
+                    payload_tbl_w_meta = reader.materialize_payload_columns(
+                        row_group_indices,
+                        payload_chunks,
+                        row_mask,
+                        plc.io.experimental.UseDataPageMask.YES,
+                        options,
+                        stream=stream,
+                    )
+                payload_names = payload_tbl_w_meta.column_names(include_children=False)
+                payload_df = DataFrame.from_table(
+                    payload_tbl_w_meta.tbl,
+                    payload_names,
+                    [schema[n] for n in payload_names],
+                    stream=stream,
+                )
+                columns = [*columns, *payload_df.columns]
+
+            result = DataFrame(columns, stream=stream).select(list(schema.keys()))
+            if prefetched is not None:
+                with nvtx_annotate_cudf_polars(message="stream_synchronize"):
+                    stream.synchronize()
+                prefetched.release()
+            return result
+        finally:
+            if prefetched is not None:
+                prefetched.release()
 
 
 @dataclasses.dataclass
@@ -587,6 +605,7 @@ class PrefetchedByteRanges:
     on_release: Callable[[], None] | None = dataclasses.field(
         default=None, compare=False, repr=False
     )
+    _released: bool = dataclasses.field(default=False, compare=False, repr=False)
 
     @classmethod
     def empty(cls, plc_filter: plc_expr.Expression) -> PrefetchedByteRanges:
@@ -598,7 +617,17 @@ class PrefetchedByteRanges:
         )
 
     def release(self) -> None:
-        """Release pinned host memory reservations after the H2D copy completes."""
+        """
+        Release pinned host memory reservations after the H2D copy completes.
+
+        Idempotent: safe to call more than once (e.g. once explicitly on
+        the happy path and once more from a ``finally`` guarding against
+        an exception or an early return skipping the explicit call) --
+        ``on_release`` only fires on the first call.
+        """
+        if self._released:
+            return
+        self._released = True
         for batch in (self.all_columns, self.filter, self.payload):
             if batch is not None:
                 batch.buf = None

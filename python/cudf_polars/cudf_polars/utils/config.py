@@ -270,9 +270,11 @@ class HybridScanPrefetchPipeline(enum.StrEnum):
       every eligible split is submitted before the actor graph starts.
       Unlike ``BATCH``, each split still gets its own independent
       reservation and buffer (no split ever waits on another's I/O).
-      Concurrency is bounded by ``max_outstanding_prefetch_bytes`` instead
-      of a producer/thread count: a split only starts reserving pinned
-      memory once enough of the byte budget is free.
+      How much pinned memory can be claimed at once is bounded by
+      ``max_outstanding_prefetch_bytes`` instead of a producer/thread
+      count, but *claiming* a share is still ordered strict FIFO across
+      splits, so a split due for consumption soon can't lose its share to
+      one that isn't.
     """
 
     MODULAR = "modular"
