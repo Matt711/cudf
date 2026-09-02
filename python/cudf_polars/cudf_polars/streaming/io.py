@@ -47,7 +47,7 @@ from cudf_polars.utils.cuda_stream import get_cuda_stream
 from cudf_polars.utils.versions import POLARS_VERSION_LT_137
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable, MutableMapping, Sequence
+    from collections.abc import Callable, Hashable, MutableMapping, Sequence
 
     import pylibcudf.expressions as plc_expr
     from rapidsmpf.memory.buffer import BufferHostView
@@ -571,6 +571,11 @@ class PrefetchedByteRanges:
     payload
         Prefetched batch covering payload columns, under
         ``HybridScanPassMode.TWO_PASS``.
+    on_release
+        Optional callback invoked at the end of :meth:`release`. Used by
+        the ``PACED`` pipeline to return this task's share of its byte
+        budget once the pinned memory it was holding is actually freed,
+        not before. ``None`` for every other pipeline.
     """
 
     row_group_indices: list[int]
@@ -579,6 +584,9 @@ class PrefetchedByteRanges:
     all_columns: PinnedBatch | None = None
     filter: PinnedBatch | None = None
     payload: PinnedBatch | None = None
+    on_release: Callable[[], None] | None = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
 
     @classmethod
     def empty(cls, plc_filter: plc_expr.Expression) -> PrefetchedByteRanges:
@@ -594,6 +602,8 @@ class PrefetchedByteRanges:
         for batch in (self.all_columns, self.filter, self.payload):
             if batch is not None:
                 batch.buf = None
+        if self.on_release is not None:
+            self.on_release()
 
 
 def copy_pinned_batch_to_device(

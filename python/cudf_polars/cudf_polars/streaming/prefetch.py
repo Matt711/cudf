@@ -928,6 +928,171 @@ async def prefetch_scan_byte_ranges(
         nvtx.end_range(task_range)
 
 
+class ByteBudget:
+    """
+    Async, byte-weighted admission gate.
+
+    Bounds how many bytes' worth of work can be concurrently admitted,
+    rather than how many callers -- a plain ``asyncio.Semaphore`` only
+    counts callers, it doesn't weigh them. A single request larger than
+    the whole budget is still admitted once nothing else is outstanding,
+    rather than deadlocking; the budget bounds how much gets admitted
+    together, not an absolute ceiling on any one request.
+    """
+
+    def __init__(self, budget: int) -> None:
+        self._budget = budget
+        self._outstanding = 0
+        self._condition = asyncio.Condition()
+
+    async def acquire(self, nbytes: int) -> None:
+        """Wait until ``nbytes`` fits under the budget, then claim it."""
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: (
+                    self._outstanding == 0 or self._outstanding + nbytes <= self._budget
+                )
+            )
+            self._outstanding += nbytes
+
+    async def release(self, nbytes: int) -> None:
+        """Return ``nbytes`` to the budget, from the loop this budget runs on."""
+        async with self._condition:
+            self._outstanding -= nbytes
+            self._condition.notify_all()
+
+    def release_threadsafe(self, nbytes: int, loop: asyncio.AbstractEventLoop) -> None:
+        """Return ``nbytes`` to the budget, safe to call from any thread."""
+        asyncio.run_coroutine_threadsafe(self.release(nbytes), loop).result()
+
+
+async def prefetch_scan_byte_ranges_paced(
+    scan: SplitScan,
+    context: Context,
+    ir_context: IRExecutionContext,
+    budget: ByteBudget,
+    loop: asyncio.AbstractEventLoop,
+) -> PrefetchedByteRanges | None:
+    """
+    Prune, byte-pace, and prefetch one split -- no ordering chain, no shared buffer.
+
+    Reserves and reads this split's own byte ranges independently (own
+    reservation, own buffer, own lock), the same as
+    :func:`prefetch_scan_byte_ranges`, so no split ever waits on another's
+    I/O. Concurrency is bounded by ``budget`` instead of a fixed
+    producer/thread count: a split only starts reserving pinned memory
+    once enough of the byte budget is free, and returns its share only
+    once the buffer it was holding is actually released (see
+    ``PrefetchedByteRanges.on_release``), not merely once its reads are
+    issued.
+
+    Parameters
+    ----------
+    scan
+        The scan task to prefetch.
+    context
+        The rapidsmpf context to reserve memory through.
+    ir_context
+        The execution context to offload pruning and reservation to, and
+        to read this split's plan from (already submitted ahead of time
+        by :func:`submit_prefetch_plans_for_ir`).
+    budget
+        The byte budget admission for this split's reservation is gated on.
+    loop
+        Event loop ``budget`` runs on, for :meth:`ByteBudget.release_threadsafe`.
+
+    Returns
+    -------
+    The prefetched byte ranges, or ``None`` when the predicate can't be
+    expressed as a parquet filter, the caller falls back to
+    ``SplitScan.do_evaluate`` in that case.
+    """
+    prepared = await resolve_prefetch_plan(scan, ir_context)
+    if prepared is None:
+        return None
+    plc_filter, row_group_indices, pass_mode, primary_ranges, payload_ranges = prepared
+    if not row_group_indices:
+        return PrefetchedByteRanges.empty(plc_filter)
+
+    assert scan.cached_parquet_info is not None
+    handle = scan.cached_parquet_info[0].remote_handle()
+
+    total_bytes = sum(r.size for r in primary_ranges)
+    if payload_ranges is not None:
+        total_bytes += sum(r.size for r in payload_ranges)
+
+    await budget.acquire(total_bytes)
+    try:
+        if pass_mode is HybridScanPassMode.SINGLE_PASS:
+            all_columns = await reserve_pinned_batch(
+                context, ir_context, handle, primary_ranges
+            )
+            prefetched = PrefetchedByteRanges(
+                row_group_indices=row_group_indices,
+                pass_mode=pass_mode,
+                plc_filter=plc_filter,
+                all_columns=all_columns,
+            )
+        else:
+            filter_batch = await reserve_pinned_batch(
+                context, ir_context, handle, primary_ranges
+            )
+            payload_batch = await reserve_pinned_batch(
+                context, ir_context, handle, payload_ranges or []
+            )
+            prefetched = PrefetchedByteRanges(
+                row_group_indices=row_group_indices,
+                pass_mode=pass_mode,
+                plc_filter=plc_filter,
+                filter=filter_batch,
+                payload=payload_batch,
+            )
+    except BaseException:
+        await budget.release(total_bytes)
+        raise
+    prefetched.on_release = lambda: budget.release_threadsafe(total_bytes, loop)
+    return prefetched
+
+
+async def run_paced_prefetch_pipeline(
+    scans: Sequence[SplitScan],
+    context: Context,
+    ir_context: IRExecutionContext,
+    *,
+    budget_bytes: int,
+) -> dict[int, asyncio.Future[PrefetchedByteRanges | None]]:
+    """
+    Prefetch every split in a scan independently, paced by a byte budget.
+
+    Parameters
+    ----------
+    scans
+        The splits to prefetch, in ``StreamingScan.scans`` order; a
+        split's index into ``scans`` is its key in the returned mapping.
+    context
+        The rapidsmpf context to reserve memory through.
+    ir_context
+        The execution context to offload work to and read submitted plans
+        from.
+    budget_bytes
+        Maximum combined size of every split's pinned reservation
+        outstanding at once.
+
+    Returns
+    -------
+    One task per split, keyed by its index into ``scans``, each resolving
+    to the same result :func:`prepare_prefetch` would have for that split.
+    """
+    loop = asyncio.get_running_loop()
+    budget = ByteBudget(budget_bytes)
+    return {
+        seq_num: asyncio.create_task(
+            prefetch_scan_byte_ranges_paced(scan, context, ir_context, budget, loop)
+        )
+        for seq_num, scan in enumerate(scans)
+    }
+
+
 class PinnedBuffer:
     """
     Pinned host buffer allocated directly from a ``PinnedMemoryResource``.

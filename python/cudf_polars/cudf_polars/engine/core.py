@@ -937,10 +937,9 @@ def evaluate_on_rank(
         )
         attach_cached_parquet_metadata(ir, cached_parquet_info_map)
 
-    if (
-        config_options.parquet_options.use_hybrid_scan
-        and config_options.parquet_options.prefetch_pipeline
-        is HybridScanPrefetchPipeline.BATCH
+    if config_options.parquet_options.use_hybrid_scan and (
+        config_options.parquet_options.prefetch_pipeline
+        in (HybridScanPrefetchPipeline.BATCH, HybridScanPrefetchPipeline.PACED)
     ):
         assert ir_context.py_executor is not None, (
             "Execution context must have a thread pool for offload"

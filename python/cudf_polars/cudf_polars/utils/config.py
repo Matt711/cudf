@@ -266,11 +266,19 @@ class HybridScanPrefetchPipeline(enum.StrEnum):
       graph starts. Reads are issued in shared, byte-budget-bounded
       batches that can span multiple splits, rather than one reservation
       per split.
+    * ``HybridScanPrefetchPipeline.PACED`` : Like ``BATCH``, pruning for
+      every eligible split is submitted before the actor graph starts.
+      Unlike ``BATCH``, each split still gets its own independent
+      reservation and buffer (no split ever waits on another's I/O).
+      Concurrency is bounded by ``max_outstanding_prefetch_bytes`` instead
+      of a producer/thread count: a split only starts reserving pinned
+      memory once enough of the byte budget is free.
     """
 
     MODULAR = "modular"
     QUEUE = "queue"
     BATCH = "batch"
+    PACED = "paced"
 
 
 class Cluster(enum.StrEnum):
@@ -444,6 +452,10 @@ class ParquetOptions:
         How many batches can concurrently be reserving pinned memory and
         fetching at once, when ``prefetch_pipeline=BATCH``. Ignored under
         ``MODULAR``/``QUEUE``. Default is 8.
+    max_outstanding_prefetch_bytes
+        Maximum combined size of every split's pinned reservation
+        outstanding at once, when ``prefetch_pipeline=PACED``. Ignored
+        under ``MODULAR``/``QUEUE``/``BATCH``. Default is 64 MiB.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -526,6 +538,13 @@ class ParquetOptions:
     max_concurrent_prefetch_batches: int = dataclasses.field(
         default_factory=_make_default_factory(
             f"{_env_prefix}__MAX_CONCURRENT_PREFETCH_BATCHES", int, default=8
+        )
+    )
+    max_outstanding_prefetch_bytes: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__MAX_OUTSTANDING_PREFETCH_BYTES",
+            int,
+            default=64 * 1024 * 1024,
         )
     )
     # Internal benchmarking flag. When False, skips stats and bloom-filter pruning
@@ -613,6 +632,10 @@ class ParquetOptions:
             raise TypeError("max_concurrent_prefetch_batches must be an int")
         if self.max_concurrent_prefetch_batches <= 0:
             raise ValueError("max_concurrent_prefetch_batches must be positive")
+        if not isinstance(self.max_outstanding_prefetch_bytes, int):
+            raise TypeError("max_outstanding_prefetch_bytes must be an int")
+        if self.max_outstanding_prefetch_bytes <= 0:
+            raise ValueError("max_outstanding_prefetch_bytes must be positive")
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
 
