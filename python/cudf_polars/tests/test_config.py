@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from typing import cast
 
@@ -30,6 +31,8 @@ from cudf_polars.testing.asserts import (
     assert_ir_translation_raises,
 )
 from cudf_polars.utils.config import (
+    KVIKIO_CONFIGURABLE_PROPERTIES,
+    KVIKIO_REACTOR_POOL_PROPERTIES,
     Cluster,
     ConfigOptions,
     DynamicPlanningOptions,
@@ -1093,19 +1096,32 @@ def kvikio_defaults_guard():
 
     ``configure_kvikio`` mutates process-global kvikio defaults via
     ``kvikio.defaults.set``. Without restoring them, a test that calls
-    ``configure_kvikio`` can leak settings into later tests. The set of
-    valid property names is taken from kvikio's own
-    ``ConfigContextManager``, so this fixture stays in sync with whatever
-    properties kvikio supports rather than hardcoding a copy of the list.
+    ``configure_kvikio`` can leak settings into later tests. The properties
+    to snapshot come from ``KVIKIO_CONFIGURABLE_PROPERTIES``, the list
+    ``configure_kvikio`` itself draws from, so this fixture stays in sync
+    with configure_kvikio without duplicating its property names.
+
+    ``KVIKIO_REACTOR_POOL_PROPERTIES`` are restored separately and best-effort:
+    kvikio permanently fixes them once the MULTI_POLL reactor pool has
+    started (e.g. via another test's real remote I/O), and raises if asked to
+    set them afterward even to their current value, so there is nothing to
+    revert in that case.
     """
-    property_getters = kvikio.defaults.ConfigContextManager({})._property_getters
-    keys = [
-        "num_threads" if name == "thread_pool_nthreads" else name
-        for name in property_getters
-    ]
-    original = {key: kvikio.defaults.get(key) for key in keys}
+    original = {key: kvikio.defaults.get(key) for key in KVIKIO_CONFIGURABLE_PROPERTIES}
     yield
-    kvikio.defaults.set(original)
+    kvikio.defaults.set(
+        {
+            key: value
+            for key, value in original.items()
+            if key not in KVIKIO_REACTOR_POOL_PROPERTIES
+        }
+    )
+    # If another test already started the MULTI_POLL reactor pool, kvikio pins
+    # these properties for good and this reset is a no-op that raises.
+    with contextlib.suppress(RuntimeError):
+        kvikio.defaults.set(
+            {key: original[key] for key in KVIKIO_REACTOR_POOL_PROPERTIES}
+        )
 
 
 def test_configure_kvikio_sets_backend_and_threads(

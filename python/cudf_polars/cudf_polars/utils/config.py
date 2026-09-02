@@ -444,6 +444,34 @@ def resolve_kvikio_executor_options(executor_options: dict[str, Any]) -> dict[st
     return executor_options
 
 
+# kvikio.defaults property names that configure_kvikio may pass to
+# kvikio.defaults.set (checked at the end of configure_kvikio). Also used by
+# callers (e.g. tests that need to snapshot/restore kvikio's process-global
+# defaults) so they don't have to duplicate this list by hand.
+KVIKIO_CONFIGURABLE_PROPERTIES = (
+    "remote_io_backend",
+    "task_size",
+    "bounce_buffer_size",
+    "remote_io_num_reactors",
+    "remote_io_reactor_dispatch",
+    "remote_io_max_concurrent_requests",
+    "num_threads",
+)
+
+# Subset of KVIKIO_CONFIGURABLE_PROPERTIES that governs kvikio's MULTI_POLL
+# reactor pool. kvikio fixes these for the rest of the process once that pool
+# has started (i.e. after the first MULTI_POLL remote I/O), and
+# kvikio.defaults.set() raises for them from that point on, even to reassign
+# the value they already hold.
+KVIKIO_REACTOR_POOL_PROPERTIES = frozenset(
+    {
+        "remote_io_num_reactors",
+        "remote_io_reactor_dispatch",
+        "remote_io_max_concurrent_requests",
+    }
+)
+
+
 def configure_kvikio(
     nthreads: int | None,
     *,
@@ -491,6 +519,7 @@ def configure_kvikio(
             nthreads = resolve_kvikio_nthreads({}, remote_io_backend=remote_io_backend)
             assert nthreads is not None  # EASY_THREADPOOL always resolves to an int
         settings["num_threads"] = nthreads
+    assert set(settings) <= set(KVIKIO_CONFIGURABLE_PROPERTIES)
     kvikio.defaults.set(settings)
 
 
