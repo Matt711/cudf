@@ -690,6 +690,7 @@ def prefetch_eligible(
             predicate=base_scan.predicate,
         )
         and first.parquet_options.prefetch_file_metadata
+        and first.parquet_options.prefetch_byte_ranges
     ):
         return False
     assert first.cached_parquet_info is not None

@@ -578,6 +578,7 @@ def test_split_scan_hybrid_prefetch(
             parquet_options={
                 "use_hybrid_scan": True,
                 "prefetch_file_metadata": True,
+                "prefetch_byte_ranges": True,
                 "prefetch_pipeline": prefetch_pipeline,
             },
         ),

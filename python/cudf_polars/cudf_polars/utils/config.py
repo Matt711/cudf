@@ -431,6 +431,14 @@ class ParquetOptions:
         Whether to use the two-pass ``HybridScanReader`` for ``SplitScan``
         tasks when a predicate can be pushed down to a parquet filter.
         Default is False.
+    prefetch_byte_ranges
+        Whether hybrid scan splits prefetch their byte ranges ahead of when a
+        producer needs them, via ``prefetch_pipeline``. Not implied by
+        ``use_hybrid_scan`` or by pinned memory being configured -- both are
+        still required, but this must also be explicitly enabled. When
+        False, hybrid scan reads still work, just without prefetch: each
+        split fetches its own byte ranges synchronously when a producer asks
+        for it. Default is False.
     pass_mode
         How a hybrid scan read fetches and materializes its columns.
         See :class:`HybridScanPassMode`. Ignored when ``use_hybrid_scan`` is
@@ -515,6 +523,13 @@ class ParquetOptions:
     use_hybrid_scan: bool = dataclasses.field(
         default_factory=_make_default_factory(
             f"{_env_prefix}__USE_HYBRID_SCAN",
+            _bool_converter,
+            default=False,
+        )
+    )
+    prefetch_byte_ranges: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_BYTE_RANGES",
             _bool_converter,
             default=False,
         )
@@ -608,6 +623,8 @@ class ParquetOptions:
             raise ValueError(
                 "use_hybrid_scan requires prefetch_file_metadata to be enabled"
             )
+        if not isinstance(self.prefetch_byte_ranges, bool):
+            raise TypeError("prefetch_byte_ranges must be a bool")
         # `ParquetOptions(**{"pass_mode": "single_pass", ...})`-style construction
         # (e.g. from a plain ``parquet_options`` dict passed to ``GPUEngine``)
         # bypasses the env-var string-to-enum converters above, so a plain
