@@ -233,6 +233,7 @@ def _read_with_hybrid_scan(
     split_index: int = 0,
     total_splits: int = 1,
     stats_pruning: bool = True,
+    interleave_remote_io: bool = True,
 ) -> DataFrame:
     """Two-pass parquet read via HybridScanReader for a row-group-aligned split."""
     assert len(paths) == 1, (
@@ -246,7 +247,8 @@ def _read_with_hybrid_scan(
         )
         io_submission_policy = (
             plc.io.parquet_io_utils.IOSubmissionPolicy.INTERLEAVE
-            if plc.io.SourceInfo._is_remote_uri(cached_info.path)
+            if interleave_remote_io
+            and plc.io.SourceInfo._is_remote_uri(cached_info.path)
             else plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE
         )
         options = cached_info.default_reader_options()
@@ -542,6 +544,9 @@ class SplitScan(IR):
                         split_index=split_index,
                         total_splits=total_splits,
                         stats_pruning=parquet_options._hybrid_scan_stats_pruning,
+                        interleave_remote_io=(
+                            parquet_options.hybrid_scan_interleave_remote_io
+                        ),
                     )
         else:
             # There are not enough row-groups to align
