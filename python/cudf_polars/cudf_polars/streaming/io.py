@@ -244,6 +244,11 @@ def _read_with_hybrid_scan(
         source_info = plc.io.SourceInfo(
             [plc.io.types.FilepathSource(cached_info.path, cached_info.size)]
         )
+        io_submission_policy = (
+            plc.io.parquet_io_utils.IOSubmissionPolicy.INTERLEAVE
+            if plc.io.SourceInfo._is_remote_uri(cached_info.path)
+            else plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE
+        )
         options = cached_info.default_reader_options()
         if with_columns is not None:
             options.set_column_names(with_columns)
@@ -264,7 +269,7 @@ def _read_with_hybrid_scan(
                     bloom_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                         source_info,
                         bloom_ranges,
-                        plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                        io_submission_policy,
                         stream=stream,
                     )
                     row_group_indices = reader.filter_row_groups_with_bloom_filters(
@@ -296,7 +301,7 @@ def _read_with_hybrid_scan(
         filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
             source_info,
             reader.filter_column_chunks_byte_ranges(row_group_indices, options),
-            plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+            io_submission_policy,
             stream=stream,
         )
         filter_tbl_w_meta = reader.materialize_filter_columns(
@@ -322,7 +327,7 @@ def _read_with_hybrid_scan(
             payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                 source_info,
                 reader.payload_column_chunks_byte_ranges(row_group_indices, options),
-                plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                io_submission_policy,
                 stream=stream,
             )
             payload_tbl_w_meta = reader.materialize_payload_columns(
