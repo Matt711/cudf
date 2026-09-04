@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from cudf_polars.engine.ray import RankActor
     from cudf_polars.quent._context import QuentContext
     from cudf_polars.quent._logging import QuentLogger
+    from cudf_polars.streaming.prefetch_cache import PrefetchCache
 
 
 __all__ = [
@@ -308,6 +309,39 @@ def _quent_context_converter(v: str) -> QuentContext | None:
             return None
 
 
+class HybridScanPassMode(enum.StrEnum):
+    """
+    How a hybrid scan read fetches and materializes its columns.
+
+    * ``HybridScanPassMode.SINGLE_PASS`` : Fetch and materialize all columns
+      in one pass, via ``HybridScanReader.materialize_all_columns``.
+    * ``HybridScanPassMode.TWO_PASS`` : Fetch and materialize filter columns,
+      then payload columns, via ``materialize_filter_columns`` and
+      ``materialize_payload_columns``.
+    """
+
+    SINGLE_PASS = "single_pass"
+    TWO_PASS = "two_pass"
+
+
+class PrefetchCacheScope(enum.StrEnum):
+    """
+    Lifetime of the prefetch cache's background workers.
+
+    * ``PrefetchCacheScope.ENGINE`` : Started once, at engine construction,
+      and shared across every query for the engine's lifetime. Chunks
+      cached by one query stay cached for a later query.
+    * ``PrefetchCacheScope.QUERY`` : Started and stopped around each
+      individual query. Still prefetches ahead of a split's own read within
+      that query, but nothing carries over to the next one, since stopping
+      clears the cached chunks. Useful for isolating the effect of
+      within-query prefetch from cross-query reuse.
+    """
+
+    ENGINE = "engine"
+    QUERY = "query"
+
+
 @dataclasses.dataclass(frozen=True)
 class ParquetOptions:
     """
@@ -357,6 +391,53 @@ class ParquetOptions:
         Whether to use the two-pass ``HybridScanReader`` for ``SplitScan``
         tasks when a predicate can be pushed down to a parquet filter.
         Default is False.
+    pass_mode
+        How a hybrid scan read fetches and materializes its columns.
+        See :class:`HybridScanPassMode`. Ignored when ``use_hybrid_scan`` is
+        False. When unspecified, chosen per split: ``TWO_PASS`` if stats/bloom
+        pruning eliminates any row groups, otherwise ``SINGLE_PASS``.
+    prefetch_cache_enabled
+        Whether to cache prefetched byte ranges in pinned host memory.
+        Ignored when ``use_hybrid_scan`` is False.
+    prefetch_cache_scope
+        Lifetime of the prefetch cache's background workers. See
+        :class:`PrefetchCacheScope`. Ignored when ``prefetch_cache_enabled``
+        is False.
+    prefetch_cache_chunk_bytes
+        Size, in bytes, of the chunk-aligned byte ranges the cache tracks.
+    prefetch_cache_pool_capacity_bytes
+        Capacity, in bytes, of the pinned host memory pool backing the
+        cache.
+    prefetch_cache_inflight_chunk_budget
+        Maximum number of chunks that may be reserved or in flight at once.
+    prefetch_cache_eviction_threshold_fraction
+        Fraction of ``prefetch_cache_pool_capacity_bytes`` above which
+        eviction runs.
+    prefetch_cache_min_budget_fraction
+        Fraction of ``prefetch_cache_pool_capacity_bytes`` reserved
+        upfront for prefetching, never evicted below.
+    prefetch_cache_num_prepare_workers
+        Number of workers reserving pinned memory for registered ranges.
+        Raising this above 1 does not currently preserve submission order
+        across workers; see the ``TODO`` in ``PrefetchCache._prepare_loop``.
+    prefetch_cache_num_fetch_workers
+        Number of workers issuing reads for reserved ranges.
+    prefetch_byte_ranges
+        Whether to eagerly register a split's byte ranges with the prefetch
+        cache ahead of that split's own read, so its own read can benefit
+        rather than only a later one. Ignored when ``prefetch_cache_enabled``
+        is False. Off by default: registering ranges this early still costs
+        the pruning work needed to compute them, so this isn't free just
+        because ``fadvise`` itself is.
+    prefetch_pruning_thread_pool
+        Whether the row-group pruning and byte-range computation behind
+        ``prefetch_byte_ranges`` runs on its own thread pool instead of
+        sharing the executor used for reads. On by default; set to False to
+        compare against sharing the read executor instead. Ignored when
+        ``prefetch_byte_ranges`` is False.
+    prefetch_pruning_num_workers
+        Number of workers in that dedicated pool. Ignored unless
+        ``prefetch_pruning_thread_pool`` is True.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -405,6 +486,13 @@ class ParquetOptions:
             default=False,
         )
     )
+    pass_mode: HybridScanPassMode | Unspecified = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PASS_MODE",
+            HybridScanPassMode.__call__,
+            default=UNSPECIFIED,
+        )
+    )
     # Internal benchmarking flag. When False, skips stats and bloom-filter pruning
     # before the first pass of a hybrid scan so you can measure two-pass read
     # overhead in isolation. No reason to set this to False in production.
@@ -422,6 +510,80 @@ class ParquetOptions:
             f"{_env_prefix}__USE_JIT_FILTER",
             _bool_converter,
             default=False,
+        )
+    )
+    prefetch_cache_enabled: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_CACHE_ENABLED",
+            _bool_converter,
+            default=False,
+        )
+    )
+    prefetch_cache_scope: PrefetchCacheScope = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_CACHE_SCOPE",
+            PrefetchCacheScope.__call__,
+            default=PrefetchCacheScope.ENGINE,
+        )
+    )
+    prefetch_cache_chunk_bytes: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_CACHE_CHUNK_BYTES", int, default=1 << 20
+        )
+    )
+    prefetch_cache_pool_capacity_bytes: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_CACHE_POOL_CAPACITY_BYTES",
+            int,
+            default=1 << 30,
+        )
+    )
+    prefetch_cache_inflight_chunk_budget: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_CACHE_INFLIGHT_CHUNK_BUDGET", int, default=2048
+        )
+    )
+    prefetch_cache_eviction_threshold_fraction: float = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_CACHE_EVICTION_THRESHOLD_FRACTION",
+            float,
+            default=0.6,
+        )
+    )
+    prefetch_cache_min_budget_fraction: float = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_CACHE_MIN_BUDGET_FRACTION",
+            float,
+            default=0.05,
+        )
+    )
+    prefetch_cache_num_prepare_workers: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_CACHE_NUM_PREPARE_WORKERS", int, default=1
+        )
+    )
+    prefetch_cache_num_fetch_workers: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_CACHE_NUM_FETCH_WORKERS", int, default=1
+        )
+    )
+    prefetch_byte_ranges: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_BYTE_RANGES",
+            _bool_converter,
+            default=False,
+        )
+    )
+    prefetch_pruning_thread_pool: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_PRUNING_THREAD_POOL",
+            _bool_converter,
+            default=True,
+        )
+    )
+    prefetch_pruning_num_workers: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_PRUNING_NUM_WORKERS", int, default=8
         )
     )
 
@@ -446,8 +608,59 @@ class ParquetOptions:
             raise ValueError(
                 "use_hybrid_scan requires prefetch_file_metadata to be enabled"
             )
+        # `ParquetOptions(**{"pass_mode": "single_pass", ...})`-style construction
+        # (e.g. from a plain ``parquet_options`` dict passed to ``GPUEngine``)
+        # bypasses the env-var string-to-enum converters above, so a plain
+        # string value needs coercing here too, not just validating.
+        if isinstance(self.pass_mode, str) and not isinstance(
+            self.pass_mode, HybridScanPassMode
+        ):
+            object.__setattr__(self, "pass_mode", HybridScanPassMode(self.pass_mode))
+        if not isinstance(self.pass_mode, (HybridScanPassMode, Unspecified)):
+            raise TypeError("pass_mode must be a HybridScanPassMode when specified")
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
+        if not isinstance(self.prefetch_cache_enabled, bool):
+            raise TypeError("prefetch_cache_enabled must be a bool")
+        if isinstance(self.prefetch_cache_scope, str) and not isinstance(
+            self.prefetch_cache_scope, PrefetchCacheScope
+        ):
+            object.__setattr__(
+                self,
+                "prefetch_cache_scope",
+                PrefetchCacheScope(self.prefetch_cache_scope),
+            )
+        if not isinstance(self.prefetch_cache_scope, PrefetchCacheScope):
+            raise TypeError("prefetch_cache_scope must be a PrefetchCacheScope")
+        if not isinstance(self.prefetch_byte_ranges, bool):
+            raise TypeError("prefetch_byte_ranges must be a bool")
+        if self.prefetch_byte_ranges and not self.prefetch_cache_enabled:
+            raise ValueError(
+                "prefetch_byte_ranges requires prefetch_cache_enabled to be enabled"
+            )
+        if not isinstance(self.prefetch_pruning_thread_pool, bool):
+            raise TypeError("prefetch_pruning_thread_pool must be a bool")
+        for name in (
+            "prefetch_cache_chunk_bytes",
+            "prefetch_cache_pool_capacity_bytes",
+            "prefetch_cache_inflight_chunk_budget",
+            "prefetch_cache_num_prepare_workers",
+            "prefetch_cache_num_fetch_workers",
+            "prefetch_pruning_num_workers",
+        ):
+            if not isinstance(getattr(self, name), int):
+                raise TypeError(f"{name} must be an int")
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        for name in (
+            "prefetch_cache_eviction_threshold_fraction",
+            "prefetch_cache_min_budget_fraction",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, float):
+                raise TypeError(f"{name} must be a float")
+            if not 0.0 < value <= 1.0:
+                raise ValueError(f"{name} must be in (0.0, 1.0]")
 
 
 def default_target_partition_size(min_device_size: int | None) -> int:
@@ -701,6 +914,9 @@ class SPMDContext:
         The active RapidsMPF context.
     py_executor
         Thread-pool executor used to drive the actor network on each rank.
+    prefetch_cache
+        Engine-scoped cache of prefetched parquet byte ranges, or ``None``
+        if disabled. See :class:`~cudf_polars.streaming.prefetch_cache.PrefetchCache`.
     """
 
     comm: Communicator
@@ -709,6 +925,7 @@ class SPMDContext:
     engine_id: uuid.UUID
     worker_id: uuid.UUID
     quent_logger: QuentLogger | None
+    prefetch_cache: PrefetchCache | None = None
 
 
 @dataclasses.dataclass(frozen=True)

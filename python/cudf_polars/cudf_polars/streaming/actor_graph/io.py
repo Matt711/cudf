@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import io
 import math
@@ -39,8 +40,10 @@ from cudf_polars.streaming.actor_graph.utils import (
     send_metadata,
 )
 from cudf_polars.streaming.io import (
+    SplitScan,
     StreamingScan,
     StreamingSink,
+    _prepare_and_fadvise_split,
     _prepare_sink_directory,
     _sink_to_file,
 )
@@ -60,7 +63,7 @@ if TYPE_CHECKING:
         IOPartitionPlan,
         PartitionInfo,
     )
-    from cudf_polars.streaming.io import FusedScan, SplitScan
+    from cudf_polars.streaming.io import FusedScan
     from cudf_polars.utils.config import MaxConcurrentIOTasks
 
 
@@ -615,73 +618,113 @@ async def scan_node(
     """
     scans: Sequence[SplitScan] | Sequence[FusedScan] = ir.scans
 
-    async with shutdown_on_error(
-        context, ch_out, trace_ir=ir, ir_context=ir_context
-    ) as tracer:
-        # Send basic metadata
-        await send_metadata(
-            ch_out,
-            context,
-            ChannelMetadata(local_count=len(scans)),
-        )
-
-        # If there is nothing to scan, drain the channel and return
-        if len(scans) == 0:
-            await ch_out.drain(context)
-            return
-
-        # If there is only one scan or one producer, we can
-        # skip the lineariser and read the chunks directly
-        if len(scans) == 1 or num_producers == 1:
-            for seq_num, scan in enumerate(scans):
-                await read_chunk(
-                    context,
-                    scan,
-                    seq_num,
-                    ch_out,
-                    ir_context,
-                    estimated_chunk_bytes,
-                    tracer=tracer,
-                )
-            await ch_out.drain(context)
-            return
-
-        # Use Lineariser to ensure ordered delivery
-        num_producers = min(num_producers, len(scans))
-        lineariser = Lineariser(context, ch_out, num_producers)
-
-        # Assign tasks to producers using round-robin
-        producer_tasks: list[list[tuple[int, SplitScan | FusedScan]]] = [
-            [] for _ in range(num_producers)
-        ]
-        for task_idx, scan in enumerate(scans):
-            producer_id = task_idx % num_producers
-            # mypy resolves __iter__ on union-of-sequences to the common base (IR)
-            producer_tasks[producer_id].append((task_idx, scan))  # type: ignore[arg-type]
-
-        async def _producer(producer_id: int, ch_out: Channel) -> None:
-            for task_idx, scan in producer_tasks[producer_id]:
-                await read_chunk(
-                    context,
-                    scan,
-                    task_idx,
-                    ch_out,
-                    ir_context,
-                    estimated_chunk_bytes,
-                    tracer=tracer,
-                )
-            await ch_out.drain(context)
-
-        async with (
-            shutdown_on_error(context, *lineariser.input_channels, trace_ir=ir),
-        ):
-            await gather_in_task_group(
-                lineariser.drain(),
-                *(
-                    _producer(i, ch_in)
-                    for i, ch_in in enumerate(lineariser.input_channels)
-                ),
+    # Eagerly register every split's byte ranges with the prefetch cache,
+    # ahead of that split's own read_chunk, so prepare_loop/fetch_loop have
+    # a head start. fadvise itself never blocks, so these tasks only need
+    # to run the (thread-pool-offloaded) pruning work; nothing here is
+    # awaited before consumption, `_read_with_hybrid_scan` picks up
+    # whatever's ready (or not) through the cache when it actually reads.
+    prefetch_cache = ir_context.prefetch_cache
+    prefetch_tasks: list[asyncio.Future[None]] = []
+    if (
+        prefetch_cache is not None
+        and scans
+        and isinstance(scans[0], SplitScan)
+        and scans[0].parquet_options.prefetch_cache_enabled
+        and scans[0].parquet_options.prefetch_byte_ranges
+    ):
+        # Pruning can run on its own thread pool instead of the one shared
+        # with actual reads, see `ParquetOptions.prefetch_pruning_thread_pool`.
+        # `run_in_executor` submits immediately and returns a Future that's
+        # already schedulable/cancellable on its own, no `create_task` needed.
+        pruning_executor = prefetch_cache.pruning_executor or ir_context.py_executor
+        loop = asyncio.get_running_loop()
+        prefetch_tasks = [
+            loop.run_in_executor(
+                pruning_executor, _prepare_and_fadvise_split, scan, prefetch_cache
             )
+            for scan in cast("Sequence[SplitScan]", scans)
+        ]
+
+    try:
+        async with shutdown_on_error(
+            context, ch_out, trace_ir=ir, ir_context=ir_context
+        ) as tracer:
+            # Send basic metadata
+            await send_metadata(
+                ch_out,
+                context,
+                ChannelMetadata(local_count=len(scans)),
+            )
+
+            # If there is nothing to scan, drain the channel and return
+            if len(scans) == 0:
+                await ch_out.drain(context)
+                return
+
+            # If there is only one scan or one producer, we can
+            # skip the lineariser and read the chunks directly
+            if len(scans) == 1 or num_producers == 1:
+                for seq_num, scan in enumerate(scans):
+                    await read_chunk(
+                        context,
+                        scan,
+                        seq_num,
+                        ch_out,
+                        ir_context,
+                        estimated_chunk_bytes,
+                        tracer=tracer,
+                    )
+                await ch_out.drain(context)
+                return
+
+            # Use Lineariser to ensure ordered delivery
+            num_producers = min(num_producers, len(scans))
+            lineariser = Lineariser(context, ch_out, num_producers)
+
+            # Assign tasks to producers using round-robin
+            producer_tasks: list[list[tuple[int, SplitScan | FusedScan]]] = [
+                [] for _ in range(num_producers)
+            ]
+            for task_idx, scan in enumerate(scans):
+                producer_id = task_idx % num_producers
+                # mypy resolves __iter__ on union-of-sequences to the common base (IR)
+                producer_tasks[producer_id].append((task_idx, scan))  # type: ignore[arg-type]
+
+            async def _producer(producer_id: int, ch_out: Channel) -> None:
+                for task_idx, scan in producer_tasks[producer_id]:
+                    await read_chunk(
+                        context,
+                        scan,
+                        task_idx,
+                        ch_out,
+                        ir_context,
+                        estimated_chunk_bytes,
+                        tracer=tracer,
+                    )
+                await ch_out.drain(context)
+
+            async with (
+                shutdown_on_error(context, *lineariser.input_channels, trace_ir=ir),
+            ):
+                await gather_in_task_group(
+                    lineariser.drain(),
+                    *(
+                        _producer(i, ch_in)
+                        for i, ch_in in enumerate(lineariser.input_channels)
+                    ),
+                )
+    finally:
+        # Any split whose ranges were being pruned/registered but never
+        # consumed (an error, or an early return above) needs its task
+        # cleaned up explicitly, rather than left for whenever nothing
+        # references it anymore.
+        for task in prefetch_tasks:
+            if not task.done():
+                task.cancel()
+        for task in prefetch_tasks:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await task
 
 
 @generate_ir_sub_network.register(StreamingScan)

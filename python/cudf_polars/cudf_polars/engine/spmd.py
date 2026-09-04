@@ -59,9 +59,12 @@ from cudf_polars.quent._context import LocalQuentContext
 from cudf_polars.quent._types import Worker
 from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
 from cudf_polars.streaming.actor_graph.utils import set_memory_resource
+from cudf_polars.streaming.prefetch_cache import PrefetchCache, PrefetchCacheConfig
 from cudf_polars.unstable import unstable
 from cudf_polars.utils.config import (
     MemoryResourceConfig,
+    ParquetOptions,
+    PrefetchCacheScope,
     SPMDContext,
     StreamingExecutor,
     configure_kvikio,
@@ -497,6 +500,23 @@ class SPMDEngine(StreamingEngine):
             exit_stack.enter_context(set_memory_resource(self._mr))
             exit_stack.callback(self._cleanup_ctx)
 
+            # The prefetch cache's worker count/chunk size are engine-lifetime
+            # properties, so they're read from the environment here rather
+            # than from a per-query `parquet_options`. Whether a given query
+            # actually uses it is still decided per-query.
+            self._prefetch_cache = PrefetchCache(
+                PrefetchCacheConfig.from_parquet_options(ParquetOptions())
+            )
+            # `PrefetchCacheScope.QUERY` starts/stops this cache around each
+            # individual query instead (see `evaluate_on_rank`), so nothing
+            # carries over between queries; only `ENGINE` scope starts it here.
+            if (
+                ParquetOptions().prefetch_cache_enabled
+                and ParquetOptions().prefetch_cache_scope is PrefetchCacheScope.ENGINE
+            ):
+                self._prefetch_cache.start(self._ctx)
+            exit_stack.callback(self._prefetch_cache.stop)
+
             if quent_context is not None:
                 executor_options["quent_context"] = quent_context
                 assert self._quent_logger is not None
@@ -536,6 +556,7 @@ class SPMDEngine(StreamingEngine):
                         quent_logger=self._quent_logger,
                         context=self._ctx,
                         py_executor=self._py_executor,
+                        prefetch_cache=self._prefetch_cache,
                     ),
                 },
                 engine_options={
@@ -650,6 +671,10 @@ class SPMDEngine(StreamingEngine):
             barrier(self._comm)
         # Free persisted partitions before the Context is torn down.
         self._drop_persisted()
+        # The prefetch cache's cached reservations/buffers belong to the
+        # about-to-be-replaced Context, so it's stopped (and its cache
+        # data dropped) before shutdown, and restarted against the new one.
+        self._prefetch_cache.stop()
         # Same-thread shutdown, _reset runs on the thread that built the
         # Context (the test driver's main thread). The per-engine RMM
         # resource is kept alive across resets, see :meth:`_cleanup_ctx`.
@@ -672,6 +697,12 @@ class SPMDEngine(StreamingEngine):
         # callback still restores the pre-engine MR at engine shutdown.
         self._mr = self._ctx.br().device_mr_adaptor()
         rmm.mr.set_current_device_resource(self._mr)
+
+        if (
+            ParquetOptions().prefetch_cache_enabled
+            and ParquetOptions().prefetch_cache_scope is PrefetchCacheScope.ENGINE
+        ):
+            self._prefetch_cache.start(self._ctx)
 
         if quent_context is not None:
             quent_context = synchronize_quent_context(
@@ -701,6 +732,7 @@ class SPMDEngine(StreamingEngine):
                     engine_id=engine_id,
                     worker_id=self._quent_worker.id,
                     quent_logger=self._quent_logger,
+                    prefetch_cache=self._prefetch_cache,
                 ),
             },
             engine_options={

@@ -43,7 +43,11 @@ from cudf_polars.streaming.base import StatsCollector
 from cudf_polars.streaming.parallel import lower_ir_graph_with_node_map
 from cudf_polars.streaming.statistics import collect_statistics
 from cudf_polars.streaming.utils import _concat
-from cudf_polars.utils.config import Unspecified, get_total_device_memory
+from cudf_polars.utils.config import (
+    PrefetchCacheScope,
+    Unspecified,
+    get_total_device_memory,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, MutableMapping
@@ -916,8 +920,13 @@ def evaluate_on_rank(
             node_map=node_map,
             logical_op_by_id=logical_op_by_id,
         )
+    spmd_context = config_options.executor.spmd_context
+    prefetch_cache = spmd_context.prefetch_cache if spmd_context is not None else None
     ir_context = IRExecutionContext(
-        py_executor, get_cuda_stream=ctx.br().stream_pool.get_stream, query_id=query_id
+        py_executor,
+        get_cuda_stream=ctx.br().stream_pool.get_stream,
+        query_id=query_id,
+        prefetch_cache=prefetch_cache,
     )
 
     prefetch_file_metadata = config_options.parquet_options.prefetch_file_metadata
@@ -931,17 +940,34 @@ def evaluate_on_rank(
         )
         attach_cached_parquet_metadata(ir, cached_parquet_info_map)
 
-    with ReserveOpIDs(ir, config_options) as collective_id_map:
-        return execute_ir_on_rank(
-            ctx,
-            comm,
-            ir,
-            ir_context,
-            partition_info,
-            config_options,
-            stats,
-            collective_id_map,
-        )
+    # `PrefetchCacheScope.QUERY` starts and stops the cache around each
+    # query rather than once at engine startup (see `SPMDEngine.__init__`),
+    # so cached chunks don't carry over to the next query.
+    query_scoped_cache = (
+        prefetch_cache
+        if prefetch_cache is not None
+        and config_options.parquet_options.prefetch_cache_enabled
+        and config_options.parquet_options.prefetch_cache_scope
+        is PrefetchCacheScope.QUERY
+        else None
+    )
+    if query_scoped_cache is not None:
+        query_scoped_cache.start(ctx)
+    try:
+        with ReserveOpIDs(ir, config_options) as collective_id_map:
+            return execute_ir_on_rank(
+                ctx,
+                comm,
+                ir,
+                ir_context,
+                partition_info,
+                config_options,
+                stats,
+                collective_id_map,
+            )
+    finally:
+        if query_scoped_cache is not None:
+            query_scoped_cache.stop()
 
 
 def is_duplicated_output(metadata: list[ChannelMetadata] | None) -> bool:

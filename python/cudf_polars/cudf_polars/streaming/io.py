@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Literal, Self, overload
 import polars as pl
 
 import pylibcudf as plc
+from rmm import DeviceBuffer
 
 from cudf_polars.containers import Column, DataFrame
 from cudf_polars.dsl.ir import (
@@ -36,7 +37,12 @@ from cudf_polars.streaming.base import (
     SerializedDataSourceInfo,
 )
 from cudf_polars.streaming.dispatch import lower_ir_node
-from cudf_polars.utils.config import Cluster
+from cudf_polars.utils.config import (
+    UNSPECIFIED,
+    Cluster,
+    HybridScanPassMode,
+    Unspecified,
+)
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 from cudf_polars.utils.versions import POLARS_VERSION_LT_137
 
@@ -55,6 +61,7 @@ if TYPE_CHECKING:
         StatsCollector,
     )
     from cudf_polars.streaming.dispatch import LowerIRTransformer
+    from cudf_polars.streaming.prefetch_cache import PrefetchCache
     from cudf_polars.typing import Schema
     from cudf_polars.utils.config import (
         ConfigOptions,
@@ -221,6 +228,266 @@ def hybrid_scan_eligible(
     )
 
 
+def _split_row_group_indices(
+    total_row_groups: int, total_splits: int, split_index: int
+) -> list[int]:
+    """Return the row group indices assigned to one row-group-aligned SplitScan."""
+    rg_stride = total_row_groups // total_splits
+    skip_rgs = rg_stride * split_index
+    end_rg = (
+        total_row_groups if split_index == total_splits - 1 else skip_rgs + rg_stride
+    )
+    return list(range(skip_rgs, end_rg))
+
+
+def decide_pass_mode(
+    pass_mode: HybridScanPassMode | Unspecified,
+    row_group_indices: list[int],
+    row_group_count_before_pruning: int,
+) -> HybridScanPassMode:
+    """
+    Decide HybridScanPassMode, the same way for a synchronous read or a prefetch.
+
+    Parameters
+    ----------
+    pass_mode
+        User-requested pass mode, or ``UNSPECIFIED`` to choose automatically.
+    row_group_indices
+        Row groups surviving stats/bloom-filter pruning.
+    row_group_count_before_pruning
+        Row group count for this task before pruning.
+
+    Returns
+    -------
+    ``pass_mode`` unchanged when explicitly requested. Otherwise
+    ``HybridScanPassMode.TWO_PASS`` if pruning eliminated any row groups,
+    ``HybridScanPassMode.SINGLE_PASS`` if not.
+    """
+    if isinstance(pass_mode, Unspecified):
+        return (
+            HybridScanPassMode.TWO_PASS
+            if len(row_group_indices) < row_group_count_before_pruning
+            else HybridScanPassMode.SINGLE_PASS
+        )
+    return pass_mode
+
+
+@dataclasses.dataclass(slots=True)
+class PrefetchedRanges:
+    """A pinned host buffer covering one or more byte ranges, not yet on device."""
+
+    ranges: list[plc.io.text.ByteRangeInfo]
+    host: memoryview
+
+
+@dataclasses.dataclass(slots=True)
+class PrefetchedColumns:
+    """Byte ranges already fetched ahead of time for one hybrid scan split."""
+
+    row_group_indices: list[int]
+    pass_mode: HybridScanPassMode
+    all_columns: PrefetchedRanges | None = None
+    filter: PrefetchedRanges | None = None
+    payload: PrefetchedRanges | None = None
+
+
+def _copy_prefetched_to_device(
+    prefetched: PrefetchedRanges, stream: Stream
+) -> list[plc.gpumemoryview]:
+    """Copy a pinned host buffer to device, sliced back into its byte ranges."""
+    total = sum(r.size for r in prefetched.ranges)
+    device_buffer = DeviceBuffer(size=total)
+    device_buffer.copy_from_host(prefetched.host[:total], stream=stream)
+    gpu_view = plc.gpumemoryview(device_buffer)
+    offset = 0
+    chunks = []
+    for r in prefetched.ranges:
+        chunks.append(gpu_view.byte_slice(slice(offset, offset + r.size)))
+        offset += r.size
+    return chunks
+
+
+def _fadvise_ranges(
+    cache: PrefetchCache,
+    path: str,
+    ranges: list[plc.io.text.ByteRangeInfo],
+) -> None:
+    """Register every chunk-aligned piece covering ``ranges`` with ``cache``."""
+    chunk_bytes = cache.chunk_bytes
+    seen: set[int] = set()
+    for r in ranges:
+        aligned = (r.offset // chunk_bytes) * chunk_bytes
+        end = r.offset + r.size
+        while aligned < end:
+            if aligned not in seen:
+                seen.add(aligned)
+                cache.fadvise(path, aligned, chunk_bytes)
+            aligned += chunk_bytes
+
+
+def _read_range_from_cache(
+    cache: PrefetchCache, path: str, offset: int, size: int
+) -> bytes | None:
+    """Read ``[offset, offset + size)`` from cached chunks, or None on any miss."""
+    chunk_bytes = cache.chunk_bytes
+    result = bytearray(size)
+    pos = 0
+    cur = offset
+    end = offset + size
+    while cur < end:
+        aligned = (cur // chunk_bytes) * chunk_bytes
+        data = cache.get(path, aligned)
+        if data is None:
+            return None
+        local_start = cur - aligned
+        take = min(len(data) - local_start, end - cur)
+        if take <= 0:
+            return None
+        result[pos : pos + take] = data[local_start : local_start + take]
+        pos += take
+        cur += take
+    return bytes(result)
+
+
+def _prefetched_from_cache(
+    cache: PrefetchCache,
+    path: str,
+    ranges: list[plc.io.text.ByteRangeInfo],
+) -> PrefetchedRanges | None:
+    """
+    Serve ``ranges`` entirely from ``cache``, or fall back if any piece is missing.
+
+    Registers ``ranges`` with the cache either way, so a later read (this
+    query or a future one) can benefit even when this call misses.
+    """
+    parts = [_read_range_from_cache(cache, path, r.offset, r.size) for r in ranges]
+    _fadvise_ranges(cache, path, ranges)
+    if any(part is None for part in parts):
+        return None
+    non_none_parts = [part for part in parts if part is not None]
+    return PrefetchedRanges(ranges=ranges, host=memoryview(b"".join(non_none_parts)))
+
+
+def _fetch_byte_ranges(
+    source_info: plc.io.SourceInfo,
+    path: str,
+    ranges: list[plc.io.text.ByteRangeInfo],
+    prefetch_cache: PrefetchCache | None,
+    stream: Stream,
+) -> list[plc.gpumemoryview]:
+    """Fetch ``ranges`` to device, serving from ``prefetch_cache`` when possible."""
+    from_cache = (
+        _prefetched_from_cache(prefetch_cache, path, ranges)
+        if prefetch_cache is not None
+        else None
+    )
+    if from_cache is not None:
+        return _copy_prefetched_to_device(from_cache, stream)
+    return plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+        source_info,
+        ranges,
+        plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+        stream=stream,
+    )
+
+
+def _prepare_and_fadvise_split(scan: SplitScan, cache: PrefetchCache) -> None:
+    """
+    Prune a split's row groups and register its byte ranges with ``cache``.
+
+    Mirrors the pruning done inside :func:`_read_with_hybrid_scan`, but ends
+    in ``fadvise`` calls instead of a read, so a split's ranges are
+    registered before its own ``read_chunk`` actor runs rather than only on
+    a miss during that read.
+    """
+    cached_info = scan.cached_parquet_info
+    base_scan = scan.base_scan
+    predicate = base_scan.predicate
+    if not hybrid_scan_eligible(
+        scan.parquet_options,
+        cached_parquet_info=cached_info,
+        row_index=base_scan.row_index,
+        include_file_paths=base_scan.include_file_paths,
+        predicate=predicate,
+    ):
+        return
+    assert cached_info is not None
+    assert predicate is not None
+    stream = get_cuda_stream()
+    plc_filter, residual = to_parquet_filter(
+        _prepare_parquet_predicate(
+            predicate.value, scan.paths, scan.schema, base_scan.with_columns
+        ),
+        stream=stream,
+    )
+    if plc_filter is None or residual is not None:
+        return
+
+    total_row_groups = len(cached_info[0].file_metadata.row_group_num_rows)
+    if scan.total_splits > total_row_groups:
+        return
+    row_group_indices = _split_row_group_indices(
+        total_row_groups, scan.total_splits, scan.split_index
+    )
+    row_group_count_before_pruning = len(row_group_indices)
+
+    options = cached_info[0].default_reader_options()
+    if base_scan.with_columns is not None:
+        options.set_column_names(base_scan.with_columns)
+    options.set_filter(plc_filter)
+    reader = cached_info[0].hybrid_scan_reader(options)
+
+    if scan.parquet_options._hybrid_scan_stats_pruning:
+        row_group_indices = reader.filter_row_groups_with_stats(
+            row_group_indices, options, stream=stream
+        )
+        if row_group_indices:
+            bloom_ranges = reader.bloom_filters_byte_ranges(row_group_indices, options)
+            if bloom_ranges:
+                source_info = plc.io.SourceInfo(
+                    [
+                        plc.io.types.FilepathSource(
+                            cached_info[0].path, cached_info[0].size
+                        )
+                    ]
+                )
+                bloom_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                    source_info,
+                    bloom_ranges,
+                    plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                    stream=stream,
+                )
+                row_group_indices = reader.filter_row_groups_with_bloom_filters(
+                    bloom_chunks, row_group_indices, options, stream=stream
+                )
+    if not row_group_indices:
+        return
+
+    pass_mode = decide_pass_mode(
+        scan.parquet_options.pass_mode,
+        row_group_indices,
+        row_group_count_before_pruning,
+    )
+    path = cached_info[0].path
+    if pass_mode is HybridScanPassMode.SINGLE_PASS:
+        _fadvise_ranges(
+            cache,
+            path,
+            reader.all_column_chunks_byte_ranges(row_group_indices, options),
+        )
+    else:
+        _fadvise_ranges(
+            cache,
+            path,
+            reader.filter_column_chunks_byte_ranges(row_group_indices, options),
+        )
+        _fadvise_ranges(
+            cache,
+            path,
+            reader.payload_column_chunks_byte_ranges(row_group_indices, options),
+        )
+
+
 def _read_with_hybrid_scan(
     schema: Schema,
     paths: list[str],
@@ -233,8 +500,11 @@ def _read_with_hybrid_scan(
     split_index: int = 0,
     total_splits: int = 1,
     stats_pruning: bool = True,
+    pass_mode: HybridScanPassMode | Unspecified = UNSPECIFIED,
+    prefetched: PrefetchedColumns | None = None,
+    prefetch_cache: PrefetchCache | None = None,
 ) -> DataFrame:
-    """Two-pass parquet read via HybridScanReader for a row-group-aligned split."""
+    """Single- or two-pass parquet read via HybridScanReader for a row-group-aligned split."""
     assert len(paths) == 1, (
         "hybrid scan only supported for SplitScan; one physical file"
     )
@@ -251,25 +521,41 @@ def _read_with_hybrid_scan(
 
         reader = cached_info.hybrid_scan_reader(options)
 
-        if stats_pruning:
-            row_group_indices = reader.filter_row_groups_with_stats(
-                row_group_indices, options, stream=stream
-            )
-
-            if row_group_indices:
-                bloom_ranges = reader.bloom_filters_byte_ranges(
-                    row_group_indices, options
+        if prefetched is not None:
+            row_group_indices = prefetched.row_group_indices
+            effective_pass_mode = prefetched.pass_mode
+        else:
+            row_group_count_before_pruning = len(row_group_indices)
+            if stats_pruning:
+                row_group_indices = reader.filter_row_groups_with_stats(
+                    row_group_indices, options, stream=stream
                 )
-                if bloom_ranges:
-                    bloom_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-                        source_info,
-                        bloom_ranges,
-                        plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
-                        stream=stream,
+
+                if row_group_indices:
+                    bloom_ranges = reader.bloom_filters_byte_ranges(
+                        row_group_indices, options
                     )
-                    row_group_indices = reader.filter_row_groups_with_bloom_filters(
-                        bloom_chunks, row_group_indices, options, stream=stream
-                    )
+                    if bloom_ranges:
+                        bloom_chunks = (
+                            plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                                source_info,
+                                bloom_ranges,
+                                plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                                stream=stream,
+                            )
+                        )
+                        row_group_indices = reader.filter_row_groups_with_bloom_filters(
+                            bloom_chunks, row_group_indices, options, stream=stream
+                        )
+
+            # TODO: Consider implementing page-index stats pruning. For SplitScans, we
+            # can reuse the same page index for all splits of the same file, so the
+            # overhead of reading the page index can be amortized. For FusedScans, we
+            # would need to read the page index for all files, which may be too
+            # expensive.
+            effective_pass_mode = decide_pass_mode(
+                pass_mode, row_group_indices, row_group_count_before_pruning
+            )
 
         if not row_group_indices:
             col_names = with_columns if with_columns is not None else list(schema)
@@ -287,18 +573,40 @@ def _read_with_hybrid_scan(
                 stream=stream,
             )
 
-        # TODO: Consider implementing page-index stats pruning. For SplitScans, we can
-        # reuse the same page index for all splits of the same file, so the overhead of
-        # reading the page index can be amortized. For FusedScans, we would need to read
-        # the page index for all files, which may be too expensive.
+        if effective_pass_mode is HybridScanPassMode.SINGLE_PASS:
+            if prefetched is not None and prefetched.all_columns is not None:
+                all_chunks = _copy_prefetched_to_device(prefetched.all_columns, stream)
+            else:
+                all_chunks = _fetch_byte_ranges(
+                    source_info,
+                    cached_info.path,
+                    reader.all_column_chunks_byte_ranges(row_group_indices, options),
+                    prefetch_cache,
+                    stream,
+                )
+            tbl_w_meta = reader.materialize_all_columns(
+                row_group_indices, all_chunks, options, stream=stream
+            )
+            names = tbl_w_meta.column_names(include_children=False)
+            return DataFrame.from_table(
+                tbl_w_meta.tbl,
+                names,
+                [schema[n] for n in names],
+                stream=stream,
+            ).select(list(schema.keys()))
+
         row_mask = reader.build_all_true_row_mask(row_group_indices, stream=stream)
 
-        filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-            source_info,
-            reader.filter_column_chunks_byte_ranges(row_group_indices, options),
-            plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
-            stream=stream,
-        )
+        if prefetched is not None and prefetched.filter is not None:
+            filter_chunks = _copy_prefetched_to_device(prefetched.filter, stream)
+        else:
+            filter_chunks = _fetch_byte_ranges(
+                source_info,
+                cached_info.path,
+                reader.filter_column_chunks_byte_ranges(row_group_indices, options),
+                prefetch_cache,
+                stream,
+            )
         filter_tbl_w_meta = reader.materialize_filter_columns(
             row_group_indices,
             filter_chunks,
@@ -319,12 +627,18 @@ def _read_with_hybrid_scan(
         requested_columns = with_columns if with_columns is not None else list(schema)
         columns = filter_df.columns
         if set(requested_columns) - set(filter_names):
-            payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-                source_info,
-                reader.payload_column_chunks_byte_ranges(row_group_indices, options),
-                plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
-                stream=stream,
-            )
+            if prefetched is not None and prefetched.payload is not None:
+                payload_chunks = _copy_prefetched_to_device(prefetched.payload, stream)
+            else:
+                payload_chunks = _fetch_byte_ranges(
+                    source_info,
+                    cached_info.path,
+                    reader.payload_column_chunks_byte_ranges(
+                        row_group_indices, options
+                    ),
+                    prefetch_cache,
+                    stream,
+                )
             payload_tbl_w_meta = reader.materialize_payload_columns(
                 row_group_indices,
                 payload_chunks,
@@ -537,6 +851,12 @@ class SplitScan(IR):
                         split_index=split_index,
                         total_splits=total_splits,
                         stats_pruning=parquet_options._hybrid_scan_stats_pruning,
+                        pass_mode=parquet_options.pass_mode,
+                        prefetch_cache=(
+                            context.prefetch_cache
+                            if parquet_options.prefetch_cache_enabled
+                            else None
+                        ),
                     )
         else:
             # There are not enough row-groups to align
