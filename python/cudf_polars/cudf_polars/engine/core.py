@@ -10,6 +10,7 @@ import json
 import os
 import socket
 import threading
+import time
 import uuid
 import weakref
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar
@@ -29,6 +30,7 @@ from rapidsmpf.streaming.core.actor import run_actor_network
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IRExecutionContext
+from cudf_polars.dsl.tracing import Scope, log
 from cudf_polars.dsl.utils.io import (
     attach_cached_parquet_metadata,
     prefetch_parquet_file_metadata_for_ir,
@@ -953,6 +955,13 @@ def evaluate_on_rank(
     )
     if query_scoped_cache is not None:
         query_scoped_cache.start(ctx)
+    log(
+        "Query Start",
+        scope=Scope.QUERY.value,
+        query_id=str(query_id),
+        rank=comm.rank,
+    )
+    start = time.monotonic()
     try:
         with ReserveOpIDs(ir, config_options) as collective_id_map:
             return execute_ir_on_rank(
@@ -966,6 +975,21 @@ def evaluate_on_rank(
                 collective_id_map,
             )
     finally:
+        if prefetch_cache is not None:
+            log(
+                "Prefetch Cache Stats",
+                scope=Scope.PREFETCH_CACHE.value,
+                query_id=str(query_id),
+                rank=comm.rank,
+                **dataclasses.asdict(prefetch_cache.stats),
+            )
+        log(
+            "Query End",
+            scope=Scope.QUERY.value,
+            query_id=str(query_id),
+            rank=comm.rank,
+            duration_s=time.monotonic() - start,
+        )
         if query_scoped_cache is not None:
             query_scoped_cache.stop()
 

@@ -11,6 +11,7 @@ import contextlib
 import dataclasses
 import enum
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import kvikio
@@ -45,6 +46,7 @@ class CachedChunk:
     reservation: MemoryReservation | None = None
     buffer: Buffer | None = None
     data: memoryview | None = None
+    registered_at: float = 0.0
 
 
 @dataclasses.dataclass
@@ -98,6 +100,59 @@ class PrefetchCacheConfig:
         )
 
 
+@dataclasses.dataclass
+class PrefetchCacheStats:
+    """
+    Cumulative counters for measuring cache effectiveness.
+
+    ``hits_immediate`` and ``hits_after_wait`` are both cache hits, but a
+    split apart on purpose: a chunk that's already ``CACHED`` by the time a
+    consumer asks for it cost that consumer nothing, while one still being
+    fetched is a real, measured wait (``wait_time_seconds``) even though it
+    still counts as a hit. ``misses`` covers both "never registered" and "a
+    worker gave up on it", both indistinguishable to a consumer, both a fall
+    back to the ordinary synchronous read.
+    """
+
+    registrations: int = 0
+    hits_immediate: int = 0
+    hits_after_wait: int = 0
+    misses: int = 0
+    wait_time_seconds: float = 0.0
+    #: Sum of (became-CACHED time - registration time), over every chunk
+    #: that reached CACHED, regardless of whether anything ever consumed
+    #: it. Divide by ``cached_count`` for the average head start a
+    #: registered chunk actually got before it was ready. A low average
+    #: relative to ``wait_time_seconds`` means there isn't enough lead
+    #: time between ``fadvise`` and consumption for prefetching to help.
+    lead_time_seconds: float = 0.0
+    cached_count: int = 0
+    reservation_failures: int = 0
+    fetch_failures: int = 0
+    max_prepare_queue_depth: int = 0
+    max_fetch_queue_depth: int = 0
+
+    def summary(self) -> str:
+        """One-line human-readable summary, e.g. for logging between passes."""
+        hits = self.hits_immediate + self.hits_after_wait
+        total = hits + self.misses
+        hit_rate = hits / total if total else 0.0
+        avg_lead_time = (
+            self.lead_time_seconds / self.cached_count if self.cached_count else 0.0
+        )
+        return (
+            f"registrations={self.registrations} gets={total} "
+            f"hit_rate={hit_rate:.1%} hits_immediate={self.hits_immediate} "
+            f"hits_after_wait={self.hits_after_wait} misses={self.misses} "
+            f"wait_time={self.wait_time_seconds:.2f}s "
+            f"avg_lead_time={avg_lead_time * 1000:.2f}ms cached_count={self.cached_count} "
+            f"reservation_failures={self.reservation_failures} "
+            f"fetch_failures={self.fetch_failures} "
+            f"max_prepare_queue_depth={self.max_prepare_queue_depth} "
+            f"max_fetch_queue_depth={self.max_fetch_queue_depth}"
+        )
+
+
 class PrefetchCache:
     """
     Engine-scoped cache of prefetched parquet byte ranges.
@@ -121,11 +176,21 @@ class PrefetchCache:
         self._fetch_queue: asyncio.Queue[tuple[str, CachedChunk]] | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._pruning_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._stats = PrefetchCacheStats()
 
     @property
     def chunk_bytes(self) -> int:
         """Size, in bytes, of the chunk-aligned ranges this cache tracks."""
         return self._config.chunk_bytes
+
+    @property
+    def stats(self) -> PrefetchCacheStats:
+        """Snapshot of the cumulative hit/miss counters."""
+        return dataclasses.replace(self._stats)
+
+    def reset_stats(self) -> None:
+        """Reset the hit/miss counters, e.g. between benchmark passes."""
+        self._stats = PrefetchCacheStats()
 
     @property
     def pruning_executor(self) -> concurrent.futures.ThreadPoolExecutor | None:
@@ -221,10 +286,16 @@ class PrefetchCache:
         entry = self._entry(path)
         if entry.find(aligned_offset) is not None:
             return
-        chunk = CachedChunk(offset=aligned_offset, size=size)
+        chunk = CachedChunk(
+            offset=aligned_offset, size=size, registered_at=time.monotonic()
+        )
         entry.insert(chunk)
+        self._stats.registrations += 1
         assert self._prepare_queue is not None
         self._prepare_queue.put_nowait((path, chunk))
+        self._stats.max_prepare_queue_depth = max(
+            self._stats.max_prepare_queue_depth, self._prepare_queue.qsize()
+        )
 
     def lookup(self, path: str, offset: int) -> CachedChunk | None:
         """Return the chunk covering ``offset`` in ``path``, if registered."""
@@ -249,13 +320,25 @@ class PrefetchCache:
         return future.result()
 
     async def _get_on_loop(self, path: str, offset: int) -> memoryview | None:
+        chunk = self.lookup(path, offset)
+        if chunk is None:
+            self._stats.misses += 1
+            return None
+        if chunk.state is ChunkState.CACHED:
+            self._stats.hits_immediate += 1
+            return chunk.data
         # A chunk whose worker gave up (see `_prepare_loop`/`_fetch_loop`) is
         # dropped from `entry.chunks` entirely rather than left in a stuck
         # state, so a lookup miss here means give up rather than wait forever.
+        start = time.monotonic()
         while (chunk := self.lookup(path, offset)) is not None:
             if chunk.state is ChunkState.CACHED:
+                self._stats.hits_after_wait += 1
+                self._stats.wait_time_seconds += time.monotonic() - start
                 return chunk.data
             await asyncio.sleep(0.001)
+        self._stats.misses += 1
+        self._stats.wait_time_seconds += time.monotonic() - start
         return None
 
     async def _prepare_loop(self) -> None:
@@ -283,8 +366,12 @@ class PrefetchCache:
                 raise
             except Exception:
                 self._entry(path).remove(chunk.offset)
+                self._stats.reservation_failures += 1
                 continue
             self._fetch_queue.put_nowait((path, chunk))
+            self._stats.max_fetch_queue_depth = max(
+                self._stats.max_fetch_queue_depth, self._fetch_queue.qsize()
+            )
 
     async def _fetch_loop(self) -> None:
         assert self._fetch_queue is not None
@@ -305,8 +392,13 @@ class PrefetchCache:
                     chunk.buffer = buffer
                     chunk.data = view
                     chunk.state = ChunkState.CACHED
+                    self._stats.lead_time_seconds += (
+                        time.monotonic() - chunk.registered_at
+                    )
+                    self._stats.cached_count += 1
             except asyncio.CancelledError:
                 self._entry(path).remove(chunk.offset)
                 raise
             except Exception:
                 self._entry(path).remove(chunk.offset)
+                self._stats.fetch_failures += 1

@@ -311,8 +311,14 @@ def _fadvise_ranges(
     cache: PrefetchCache,
     path: str,
     ranges: list[plc.io.text.ByteRangeInfo],
+    file_size: int | None,
 ) -> None:
     """Register every chunk-aligned piece covering ``ranges`` with ``cache``."""
+    # `CachedParquetInfo.size` is typically only populated for remote URLs;
+    # for a local file, stat it directly rather than risk registering a
+    # chunk that reads past EOF.
+    if file_size is None:
+        file_size = Path(path).stat().st_size
     chunk_bytes = cache.chunk_bytes
     seen: set[int] = set()
     for r in ranges:
@@ -321,7 +327,12 @@ def _fadvise_ranges(
         while aligned < end:
             if aligned not in seen:
                 seen.add(aligned)
-                cache.fadvise(path, aligned, chunk_bytes)
+                # Clamp to the file's actual size: a chunk-aligned offset near
+                # EOF can be less than a full chunk_bytes wide, and requesting
+                # more than that makes the read fail past EOF.
+                size = min(chunk_bytes, file_size - aligned)
+                if size > 0:
+                    cache.fadvise(path, aligned, size)
             aligned += chunk_bytes
 
 
@@ -353,6 +364,7 @@ def _prefetched_from_cache(
     cache: PrefetchCache,
     path: str,
     ranges: list[plc.io.text.ByteRangeInfo],
+    file_size: int | None,
 ) -> PrefetchedRanges | None:
     """
     Serve ``ranges`` entirely from ``cache``, or fall back if any piece is missing.
@@ -361,7 +373,7 @@ def _prefetched_from_cache(
     query or a future one) can benefit even when this call misses.
     """
     parts = [_read_range_from_cache(cache, path, r.offset, r.size) for r in ranges]
-    _fadvise_ranges(cache, path, ranges)
+    _fadvise_ranges(cache, path, ranges, file_size)
     if any(part is None for part in parts):
         return None
     non_none_parts = [part for part in parts if part is not None]
@@ -373,11 +385,12 @@ def _fetch_byte_ranges(
     path: str,
     ranges: list[plc.io.text.ByteRangeInfo],
     prefetch_cache: PrefetchCache | None,
+    file_size: int | None,
     stream: Stream,
 ) -> list[plc.gpumemoryview]:
     """Fetch ``ranges`` to device, serving from ``prefetch_cache`` when possible."""
     from_cache = (
-        _prefetched_from_cache(prefetch_cache, path, ranges)
+        _prefetched_from_cache(prefetch_cache, path, ranges, file_size)
         if prefetch_cache is not None
         else None
     )
@@ -469,22 +482,26 @@ def _prepare_and_fadvise_split(scan: SplitScan, cache: PrefetchCache) -> None:
         row_group_count_before_pruning,
     )
     path = cached_info[0].path
+    file_size = cached_info[0].size
     if pass_mode is HybridScanPassMode.SINGLE_PASS:
         _fadvise_ranges(
             cache,
             path,
             reader.all_column_chunks_byte_ranges(row_group_indices, options),
+            file_size,
         )
     else:
         _fadvise_ranges(
             cache,
             path,
             reader.filter_column_chunks_byte_ranges(row_group_indices, options),
+            file_size,
         )
         _fadvise_ranges(
             cache,
             path,
             reader.payload_column_chunks_byte_ranges(row_group_indices, options),
+            file_size,
         )
 
 
@@ -582,6 +599,7 @@ def _read_with_hybrid_scan(
                     cached_info.path,
                     reader.all_column_chunks_byte_ranges(row_group_indices, options),
                     prefetch_cache,
+                    cached_info.size,
                     stream,
                 )
             tbl_w_meta = reader.materialize_all_columns(
@@ -605,6 +623,7 @@ def _read_with_hybrid_scan(
                 cached_info.path,
                 reader.filter_column_chunks_byte_ranges(row_group_indices, options),
                 prefetch_cache,
+                cached_info.size,
                 stream,
             )
         filter_tbl_w_meta = reader.materialize_filter_columns(
@@ -637,6 +656,7 @@ def _read_with_hybrid_scan(
                         row_group_indices, options
                     ),
                     prefetch_cache,
+                    cached_info.size,
                     stream,
                 )
             payload_tbl_w_meta = reader.materialize_payload_columns(

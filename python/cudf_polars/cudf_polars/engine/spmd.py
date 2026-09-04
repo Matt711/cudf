@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     from cudf_polars.engine.options import StreamingOptions
     from cudf_polars.engine.persisted_result import PersistedQueryResult
     from cudf_polars.streaming.parallel import ConfigOptions
+    from cudf_polars.streaming.prefetch_cache import PrefetchCacheStats
     from cudf_polars.utils.config import StreamingExecutor
 
 
@@ -577,6 +578,15 @@ class SPMDEngine(StreamingEngine):
         if self._kvikio_monitor is not None:
             self._kvikio_monitor.stop()
             self._kvikio_monitor = None
+
+    @property
+    def prefetch_cache_stats(self) -> PrefetchCacheStats:
+        """Cumulative hit/miss counters for this rank's prefetch cache."""
+        return self._prefetch_cache.stats
+
+    def reset_prefetch_cache_stats(self) -> None:
+        """Reset the prefetch cache's hit/miss counters, e.g. between benchmark passes."""
+        self._prefetch_cache.reset_stats()
 
     def _cleanup_ctx(self) -> None:
         """

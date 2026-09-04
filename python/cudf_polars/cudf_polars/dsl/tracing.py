@@ -37,6 +37,52 @@ LOG_MEMORY = LOG_TRACES and _bool_converter(
 LOG_DATAFRAMES = LOG_TRACES and _bool_converter(
     os.environ.get("CUDF_POLARS_LOG_TRACES_DATAFRAMES", "1")
 )
+LOG_FILE = os.environ.get("CUDF_POLARS_LOG_FILE")
+
+
+def _configure_file_logging(path: str) -> None:  # pragma: no cover; requires structlog
+    """
+    Route :func:`log` records to ``path`` as JSON lines, one file per process.
+
+    The PID is inserted before the file extension (``run.jsonl`` ->
+    ``run.<pid>.jsonl``) so multiple ranks writing concurrently never
+    interleave lines from different processes into the same file.
+    """
+    import logging
+    import pathlib
+
+    import structlog.processors
+    import structlog.stdlib
+
+    base = pathlib.Path(path)
+    per_process_path = base.with_name(f"{base.stem}.{os.getpid()}{base.suffix}")
+    per_process_path.parent.mkdir(parents=True, exist_ok=True)
+
+    shared_processors = [
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=False),
+    ]
+    handler = logging.FileHandler(per_process_path)
+    handler.setFormatter(
+        structlog.stdlib.ProcessorFormatter(
+            processor=structlog.processors.JSONRenderer(),
+            foreign_pre_chain=shared_processors,
+        )
+    )
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+    structlog.configure(
+        processors=[
+            *shared_processors,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+        cache_logger_on_first_use=True,
+    )
+
+
+if LOG_TRACES and LOG_FILE:  # pragma: no cover; requires structlog
+    _configure_file_logging(LOG_FILE)
 
 CUDF_POLARS_NVTX_DOMAIN = "cudf_polars"
 
@@ -58,6 +104,8 @@ class Scope(enum.StrEnum):
     ACTOR = "actor"
     IO_TASK = "io_task"
     EVALUATE_IR_NODE = "evaluate_ir_node"
+    QUERY = "query"
+    PREFETCH_CACHE = "prefetch_cache"
 
 
 @functools.cache
