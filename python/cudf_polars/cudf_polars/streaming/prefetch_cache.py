@@ -185,6 +185,7 @@ class PrefetchCache:
         # state (i.e. reserved, whether or not the read has finished yet).
         # Only ever touched from the cache's own loop.
         self._reserved_bytes = 0
+        self._spill_function_id: int | None = None
 
     @property
     def chunk_bytes(self) -> int:
@@ -242,6 +243,12 @@ class PrefetchCache:
         self._thread = threading.Thread(target=_run, name="prefetch-cache", daemon=True)
         self._thread.start()
         ready.wait()
+        # Registered so a reservation elsewhere in the engine that's
+        # starved for pinned memory can reclaim it from cached chunks,
+        # not just this cache's own `_evict_to_fit` on its own reservations.
+        self._spill_function_id = ctx.br().spill_manager.add_spill_function(
+            self._spill, priority=0, mem_type=MemoryType.PINNED_HOST
+        )
 
     def stop(self) -> None:
         """Stop the background loop and join its thread."""
@@ -249,6 +256,10 @@ class PrefetchCache:
             return
         loop = self._loop
         assert loop is not None
+        assert self._ctx is not None
+        if self._spill_function_id is not None:
+            self._ctx.br().spill_manager.remove_spill_function(self._spill_function_id)
+            self._spill_function_id = None
 
         async def _cancel_and_stop() -> None:
             for task in self._tasks:
@@ -378,17 +389,23 @@ class PrefetchCache:
             )
 
     def _evict_to_fit(self, needed: int) -> None:
+        """Evict CACHED/ALLOCATED chunks, oldest first, until ``needed`` more bytes fit."""
+        capacity = self._config.pool_capacity_bytes
+        over = self._reserved_bytes + needed - capacity
+        if over > 0:
+            self._evict_bytes(over)
+
+    def _evict_bytes(self, amount: int) -> int:
         """
-        Evict CACHED/ALLOCATED chunks, oldest first, until ``needed`` more bytes fit.
+        Evict CACHED/ALLOCATED chunks, oldest first, until ``amount`` bytes are freed.
 
         Never touches a chunk mid-``LOADING``. Discards rather than
         preserving evicted chunks: they're a read cache, cheap to refetch,
         not the result of compute, so a later miss just falls back to the
-        ordinary synchronous read.
+        ordinary synchronous read. Returns the number of bytes actually
+        freed, which may be less than ``amount`` if there's nothing left
+        to evict.
         """
-        capacity = self._config.pool_capacity_bytes
-        if self._reserved_bytes + needed <= capacity:
-            return
         candidates = sorted(
             (
                 (path, chunk)
@@ -398,13 +415,35 @@ class PrefetchCache:
             ),
             key=lambda item: item[1].registered_at,
         )
+        freed = 0
         for path, chunk in candidates:
-            if self._reserved_bytes + needed <= capacity:
+            if freed >= amount:
                 break
             self._entry(path).remove(chunk.offset)
             self._reserved_bytes -= chunk.size
             self._stats.evictions += 1
             self._stats.evicted_bytes += chunk.size
+            freed += chunk.size
+        return freed
+
+    def _spill(self, amount: int) -> int:
+        """
+        Spill-function callback registered with the engine's ``SpillManager``.
+
+        Lets a pinned-memory reservation anywhere else in the engine
+        reclaim room from this cache under pressure, not just this
+        cache's own reservations via :meth:`_evict_to_fit`. Safe to call
+        from any thread; blocks the calling thread until the eviction
+        runs on the cache's own loop.
+        """
+        loop = self._loop
+        if loop is None:
+            return 0
+        future = asyncio.run_coroutine_threadsafe(self._spill_on_loop(amount), loop)
+        return future.result()
+
+    async def _spill_on_loop(self, amount: int) -> int:
+        return self._evict_bytes(amount)
 
     def _get_handle(self, path: str) -> kvikio.CuFile | kvikio.RemoteFile:
         handle = self._handles.get(path)
