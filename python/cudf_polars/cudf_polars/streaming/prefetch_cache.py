@@ -108,26 +108,21 @@ class PrefetchCacheStats:
     """
     Cumulative counters for measuring cache effectiveness.
 
-    ``hits_immediate`` and ``hits_after_wait`` are both cache hits, but a
-    split apart on purpose: a chunk that's already ``CACHED`` by the time a
-    consumer asks for it cost that consumer nothing, while one still being
-    fetched is a real, measured wait (``wait_time_seconds``) even though it
-    still counts as a hit. ``misses`` covers both "never registered" and "a
-    worker gave up on it", both indistinguishable to a consumer, both a fall
-    back to the ordinary synchronous read.
+    A hit means a chunk was already ``CACHED`` the moment a consumer asked
+    for it. ``get`` never waits for one still in flight -- matching
+    cuCascade's own ``host_read_from_cache_only`` -- so ``misses`` covers
+    "never registered", "a worker gave up on it", and "still loading"
+    alike, all indistinguishable to a consumer, all a fall back to the
+    ordinary synchronous read.
     """
 
     registrations: int = 0
     hits_immediate: int = 0
-    hits_after_wait: int = 0
     misses: int = 0
-    wait_time_seconds: float = 0.0
     #: Sum of (became-CACHED time - registration time), over every chunk
     #: that reached CACHED, regardless of whether anything ever consumed
     #: it. Divide by ``cached_count`` for the average head start a
-    #: registered chunk actually got before it was ready. A low average
-    #: relative to ``wait_time_seconds`` means there isn't enough lead
-    #: time between ``fadvise`` and consumption for prefetching to help.
+    #: registered chunk actually got before it was ready.
     lead_time_seconds: float = 0.0
     cached_count: int = 0
     reservation_failures: int = 0
@@ -139,17 +134,15 @@ class PrefetchCacheStats:
 
     def summary(self) -> str:
         """One-line human-readable summary, e.g. for logging between passes."""
-        hits = self.hits_immediate + self.hits_after_wait
-        total = hits + self.misses
-        hit_rate = hits / total if total else 0.0
+        total = self.hits_immediate + self.misses
+        hit_rate = self.hits_immediate / total if total else 0.0
         avg_lead_time = (
             self.lead_time_seconds / self.cached_count if self.cached_count else 0.0
         )
         return (
             f"registrations={self.registrations} gets={total} "
             f"hit_rate={hit_rate:.1%} hits_immediate={self.hits_immediate} "
-            f"hits_after_wait={self.hits_after_wait} misses={self.misses} "
-            f"wait_time={self.wait_time_seconds:.2f}s "
+            f"misses={self.misses} "
             f"avg_lead_time={avg_lead_time * 1000:.2f}ms cached_count={self.cached_count} "
             f"reservation_failures={self.reservation_failures} "
             f"fetch_failures={self.fetch_failures} "
@@ -327,11 +320,14 @@ class PrefetchCache:
 
     def get(self, path: str, offset: int) -> memoryview | None:
         """
-        Return the cached bytes for the chunk covering ``offset``, waiting if needed.
+        Return the cached bytes for the chunk covering ``offset``, if already resident.
 
-        Returns ``None`` if the range was never registered (or a worker gave
-        up on it), so callers fall back to fetching it themselves. Blocks
-        the calling thread; safe to call from any thread.
+        Returns ``None`` if the chunk isn't ``CACHED`` right now, whether
+        it was never registered, a worker gave up on it, or it's simply
+        still in flight -- this never waits for a chunk to become ready,
+        matching cuCascade's own ``host_read_from_cache_only``. Callers
+        fall back to fetching it themselves on any miss. Safe to call from
+        any thread.
         """
         loop = self._loop
         if loop is None:
@@ -341,24 +337,10 @@ class PrefetchCache:
 
     async def _get_on_loop(self, path: str, offset: int) -> memoryview | None:
         chunk = self.lookup(path, offset)
-        if chunk is None:
-            self._stats.misses += 1
-            return None
-        if chunk.state is ChunkState.CACHED:
+        if chunk is not None and chunk.state is ChunkState.CACHED:
             self._stats.hits_immediate += 1
             return chunk.data
-        # A chunk whose worker gave up (see `_prepare_loop`/`_fetch_loop`) is
-        # dropped from `entry.chunks` entirely rather than left in a stuck
-        # state, so a lookup miss here means give up rather than wait forever.
-        start = time.monotonic()
-        while (chunk := self.lookup(path, offset)) is not None:
-            if chunk.state is ChunkState.CACHED:
-                self._stats.hits_after_wait += 1
-                self._stats.wait_time_seconds += time.monotonic() - start
-                return chunk.data
-            await asyncio.sleep(0.001)
         self._stats.misses += 1
-        self._stats.wait_time_seconds += time.monotonic() - start
         return None
 
     async def _prepare_loop(self) -> None:
