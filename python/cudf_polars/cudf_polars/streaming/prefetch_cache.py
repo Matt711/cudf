@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import kvikio
 
+import pylibcudf as plc
 from rapidsmpf.memory.buffer import MemoryType
 from rapidsmpf.streaming.core.memory_reserve_or_wait import reserve_memory
 
@@ -177,6 +178,11 @@ class PrefetchCache:
         self._tasks: list[asyncio.Task[None]] = []
         self._pruning_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._stats = PrefetchCacheStats()
+        # One open handle per file, reused across every chunk fetched from
+        # it. Only ever touched from `_fetch_loop`, on the cache's own loop,
+        # so no lock needed. Opening a fresh `kvikio.RemoteFile` per chunk
+        # would cost an HTTP HEAD request every time instead of once.
+        self._handles: dict[str, kvikio.CuFile | kvikio.RemoteFile] = {}
 
     @property
     def chunk_bytes(self) -> int:
@@ -262,6 +268,10 @@ class PrefetchCache:
         if self._pruning_executor is not None:
             self._pruning_executor.shutdown(wait=True, cancel_futures=True)
             self._pruning_executor = None
+        for handle in self._handles.values():
+            with contextlib.suppress(Exception):
+                handle.close()
+        self._handles = {}
 
     def _entry(self, path: str) -> FileEntry:
         entry = self._files.get(path)
@@ -373,6 +383,17 @@ class PrefetchCache:
                 self._stats.max_fetch_queue_depth, self._fetch_queue.qsize()
             )
 
+    def _get_handle(self, path: str) -> kvikio.CuFile | kvikio.RemoteFile:
+        handle = self._handles.get(path)
+        if handle is None:
+            handle = (
+                kvikio.RemoteFile.open(path)
+                if plc.io.SourceInfo._is_remote_uri(path)
+                else kvikio.CuFile(path, "rb")
+            )
+            self._handles[path] = handle
+        return handle
+
     async def _fetch_loop(self) -> None:
         assert self._fetch_queue is not None
         assert self._ctx is not None
@@ -386,7 +407,7 @@ class PrefetchCache:
                 stream = br.stream_pool.get_stream()
                 buffer = br.make_buffer(chunk.size, stream, chunk.reservation)
                 with buffer.host_view() as view:
-                    handle = kvikio.CuFile(path, "rb")
+                    handle = self._get_handle(path)
                     future = handle.pread(view, chunk.size, chunk.offset)
                     await asyncio.get_running_loop().run_in_executor(None, future.get)
                     chunk.buffer = buffer
