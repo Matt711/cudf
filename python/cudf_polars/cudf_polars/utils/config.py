@@ -406,16 +406,22 @@ class ParquetOptions:
     prefetch_cache_chunk_bytes
         Size, in bytes, of the chunk-aligned byte ranges the cache tracks.
     prefetch_cache_pool_capacity_bytes
-        Capacity, in bytes, of the pinned host memory pool backing the
-        cache.
+        Capacity, in bytes, of the pinned host memory the cache may hold at
+        once. Before reserving memory for a new chunk, the oldest
+        ``ALLOCATED``/``CACHED`` chunks are evicted (discarded, not
+        migrated) until it fits. Default 1 GiB; the cache is engine-scoped
+        and persists across every query, so leaving this unbounded lets
+        pinned reservations accumulate for the life of the engine.
     prefetch_cache_inflight_chunk_budget
         Maximum number of chunks that may be reserved or in flight at once.
+        Not yet enforced by :class:`~cudf_polars.streaming.prefetch_cache.PrefetchCache`.
     prefetch_cache_eviction_threshold_fraction
         Fraction of ``prefetch_cache_pool_capacity_bytes`` above which
-        eviction runs.
+        eviction runs. Not yet enforced; the current eviction policy just
+        compares against ``prefetch_cache_pool_capacity_bytes`` directly.
     prefetch_cache_min_budget_fraction
         Fraction of ``prefetch_cache_pool_capacity_bytes`` reserved
-        upfront for prefetching, never evicted below.
+        upfront for prefetching, never evicted below. Not yet enforced.
     prefetch_cache_num_prepare_workers
         Number of workers reserving pinned memory for registered ranges.
         Raising this above 1 does not currently preserve submission order

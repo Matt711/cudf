@@ -85,6 +85,7 @@ class PrefetchCacheConfig:
     inflight_chunk_budget: int
     pruning_thread_pool: bool
     pruning_num_workers: int
+    pool_capacity_bytes: int
 
     @classmethod
     def from_parquet_options(
@@ -98,6 +99,7 @@ class PrefetchCacheConfig:
             inflight_chunk_budget=parquet_options.prefetch_cache_inflight_chunk_budget,
             pruning_thread_pool=parquet_options.prefetch_pruning_thread_pool,
             pruning_num_workers=parquet_options.prefetch_pruning_num_workers,
+            pool_capacity_bytes=parquet_options.prefetch_cache_pool_capacity_bytes,
         )
 
 
@@ -132,6 +134,8 @@ class PrefetchCacheStats:
     fetch_failures: int = 0
     max_prepare_queue_depth: int = 0
     max_fetch_queue_depth: int = 0
+    evictions: int = 0
+    evicted_bytes: int = 0
 
     def summary(self) -> str:
         """One-line human-readable summary, e.g. for logging between passes."""
@@ -150,7 +154,8 @@ class PrefetchCacheStats:
             f"reservation_failures={self.reservation_failures} "
             f"fetch_failures={self.fetch_failures} "
             f"max_prepare_queue_depth={self.max_prepare_queue_depth} "
-            f"max_fetch_queue_depth={self.max_fetch_queue_depth}"
+            f"max_fetch_queue_depth={self.max_fetch_queue_depth} "
+            f"evictions={self.evictions} evicted_bytes={self.evicted_bytes}"
         )
 
 
@@ -183,6 +188,10 @@ class PrefetchCache:
         # so no lock needed. Opening a fresh `kvikio.RemoteFile` per chunk
         # would cost an HTTP HEAD request every time instead of once.
         self._handles: dict[str, kvikio.CuFile | kvikio.RemoteFile] = {}
+        # Bytes currently held by chunks in ALLOCATED, LOADING, or CACHED
+        # state (i.e. reserved, whether or not the read has finished yet).
+        # Only ever touched from the cache's own loop.
+        self._reserved_bytes = 0
 
     @property
     def chunk_bytes(self) -> int:
@@ -264,6 +273,7 @@ class PrefetchCache:
         # Cached reservations/buffers belong to the `Context` this cache was
         # started with; they're invalid once that context shuts down.
         self._files = {}
+        self._reserved_bytes = 0
         self._ctx = None
         if self._pruning_executor is not None:
             self._pruning_executor.shutdown(wait=True, cancel_futures=True)
@@ -363,6 +373,7 @@ class PrefetchCache:
             path, chunk = await self._prepare_queue.get()
             if chunk.state is not ChunkState.EMPTY:
                 continue
+            self._evict_to_fit(chunk.size)
             chunk.state = ChunkState.ALLOCATED
             try:
                 chunk.reservation = await reserve_memory(
@@ -378,10 +389,40 @@ class PrefetchCache:
                 self._entry(path).remove(chunk.offset)
                 self._stats.reservation_failures += 1
                 continue
+            self._reserved_bytes += chunk.size
             self._fetch_queue.put_nowait((path, chunk))
             self._stats.max_fetch_queue_depth = max(
                 self._stats.max_fetch_queue_depth, self._fetch_queue.qsize()
             )
+
+    def _evict_to_fit(self, needed: int) -> None:
+        """
+        Evict CACHED/ALLOCATED chunks, oldest first, until ``needed`` more bytes fit.
+
+        Never touches a chunk mid-``LOADING``. Discards rather than
+        preserving evicted chunks: they're a read cache, cheap to refetch,
+        not the result of compute, so a later miss just falls back to the
+        ordinary synchronous read.
+        """
+        capacity = self._config.pool_capacity_bytes
+        if self._reserved_bytes + needed <= capacity:
+            return
+        candidates = sorted(
+            (
+                (path, chunk)
+                for path, entry in self._files.items()
+                for chunk in entry.chunks
+                if chunk.state in (ChunkState.ALLOCATED, ChunkState.CACHED)
+            ),
+            key=lambda item: item[1].registered_at,
+        )
+        for path, chunk in candidates:
+            if self._reserved_bytes + needed <= capacity:
+                break
+            self._entry(path).remove(chunk.offset)
+            self._reserved_bytes -= chunk.size
+            self._stats.evictions += 1
+            self._stats.evicted_bytes += chunk.size
 
     def _get_handle(self, path: str) -> kvikio.CuFile | kvikio.RemoteFile:
         handle = self._handles.get(path)
@@ -419,7 +460,9 @@ class PrefetchCache:
                     self._stats.cached_count += 1
             except asyncio.CancelledError:
                 self._entry(path).remove(chunk.offset)
+                self._reserved_bytes -= chunk.size
                 raise
             except Exception:
                 self._entry(path).remove(chunk.offset)
+                self._reserved_bytes -= chunk.size
                 self._stats.fetch_failures += 1
