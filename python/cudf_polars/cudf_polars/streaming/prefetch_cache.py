@@ -197,6 +197,31 @@ class PrefetchCache:
         """Snapshot of the cumulative hit/miss counters."""
         return dataclasses.replace(self._stats)
 
+    def chunk_state_counts(self) -> dict[str, int]:
+        """
+        Snapshot of how many chunks are in each :class:`ChunkState` right now.
+
+        The cumulative counters in :meth:`stats` say what happened
+        overall, not where chunks are stuck at a given moment: a pile-up
+        of ``ALLOCATED`` chunks with few reaching ``CACHED`` points at a
+        `_fetch_loop` backlog, not a registration or reservation problem.
+        Safe to call from any thread.
+        """
+        loop = self._loop
+        if loop is None:
+            return {}
+        future = asyncio.run_coroutine_threadsafe(
+            self._chunk_state_counts_on_loop(), loop
+        )
+        return future.result()
+
+    async def _chunk_state_counts_on_loop(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for entry in self._files.values():
+            for chunk in entry.chunks:
+                counts[chunk.state.name] = counts.get(chunk.state.name, 0) + 1
+        return counts
+
     def reset_stats(self) -> None:
         """Reset the hit/miss counters, e.g. between benchmark passes."""
         self._stats = PrefetchCacheStats()
@@ -229,7 +254,17 @@ class PrefetchCache:
             asyncio.set_event_loop(loop)
             self._loop = loop
             self._prepare_queue = asyncio.Queue()
-            self._fetch_queue = asyncio.Queue()
+            # Bounded so `_prepare_loop` can't reserve/register far faster
+            # than `_fetch_loop` can actually drain: with no bound here,
+            # chunks pile up faster than they can be fetched and get
+            # evicted (oldest first) before `_fetch_loop` ever reaches
+            # them, wasting the reservation entirely. Sized to roughly one
+            # poolful, the same capacity concept eviction already uses,
+            # rather than a second, independently-tunable number.
+            fetch_queue_maxsize = max(
+                1, self._config.pool_capacity_bytes // max(self._config.chunk_bytes, 1)
+            )
+            self._fetch_queue = asyncio.Queue(maxsize=fetch_queue_maxsize)
             self._tasks = [
                 loop.create_task(self._prepare_loop())
                 for _ in range(self._config.num_prepare_workers)
@@ -383,7 +418,7 @@ class PrefetchCache:
                 self._stats.reservation_failures += 1
                 continue
             self._reserved_bytes += chunk.size
-            self._fetch_queue.put_nowait((path, chunk))
+            await self._fetch_queue.put((path, chunk))
             self._stats.max_fetch_queue_depth = max(
                 self._stats.max_fetch_queue_depth, self._fetch_queue.qsize()
             )
@@ -420,6 +455,12 @@ class PrefetchCache:
             if freed >= amount:
                 break
             self._entry(path).remove(chunk.offset)
+            # An evicted ALLOCATED chunk may still be sitting in
+            # `_fetch_queue`; marking it EMPTY here (instead of leaving it
+            # ALLOCATED) makes `_fetch_loop`'s own state check skip it
+            # when dequeued, rather than wastefully fetching a chunk no
+            # consumer can reach anymore.
+            chunk.state = ChunkState.EMPTY
             self._reserved_bytes -= chunk.size
             self._stats.evictions += 1
             self._stats.evicted_bytes += chunk.size

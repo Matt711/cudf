@@ -981,6 +981,7 @@ def evaluate_on_rank(
                 scope=Scope.PREFETCH_CACHE.value,
                 query_id=str(query_id),
                 rank=comm.rank,
+                chunk_states=prefetch_cache.chunk_state_counts(),
                 **dataclasses.asdict(prefetch_cache.stats),
             )
         log(
