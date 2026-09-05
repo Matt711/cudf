@@ -59,6 +59,7 @@ __all__ = [
     "ConfigOptions",
     "DaskContext",
     "DynamicPlanningOptions",
+    "HybridScanPassMode",
     "InMemoryExecutor",
     "JoinFilterPushdownOptions",
     "MaxConcurrentIOTasks",
@@ -194,6 +195,24 @@ def get_total_device_memory() -> int | None:
             return None
     else:  # pragma: no cover
         return None
+
+
+class HybridScanPassMode(enum.StrEnum):
+    """
+    How a hybrid scan read fetches and materializes its columns.
+
+    * ``HybridScanPassMode.SINGLE_PASS`` : Fetch and materialize all columns
+      in one pass, via ``HybridScanReader.materialize_all_columns``. One
+      fetch and one decode pass, same shape as the plain parquet reader.
+    * ``HybridScanPassMode.TWO_PASS`` : Fetch and materialize filter
+      columns, then payload columns, via ``materialize_filter_columns`` and
+      ``materialize_payload_columns``. Lets predicate-failing rows skip
+      payload-column decode, at the cost of a second fetch/decode pass, so
+      it pays off most when the predicate is expected to be selective.
+    """
+
+    SINGLE_PASS = "single_pass"
+    TWO_PASS = "two_pass"
 
 
 class StreamingFallbackMode(enum.StrEnum):
@@ -354,9 +373,15 @@ class ParquetOptions:
         improved performance on large datasets with complex filters.
         Default is False.
     use_hybrid_scan
-        Whether to use the two-pass ``HybridScanReader`` for ``SplitScan``
-        tasks when a predicate can be pushed down to a parquet filter.
-        Default is False.
+        Whether to use ``HybridScanReader``/``HybridScanMultifile`` for
+        parquet split/fused tasks when a predicate can be pushed down to a
+        parquet filter. Default is False.
+    pass_mode
+        How a hybrid scan read fetches and materializes its columns. See
+        :class:`HybridScanPassMode`. Ignored when ``use_hybrid_scan`` is
+        False, and when the task reads more than one physical file (fused
+        scans always use ``HybridScanMultifile``'s single-pass API).
+        Default is ``HybridScanPassMode.SINGLE_PASS``.
     fadvise_readahead_depth
         For hybrid-scan splits read through a cuCascade-backed remote
         datasource, the number of additional upcoming splits (per IO
@@ -415,6 +440,13 @@ class ParquetOptions:
             default=False,
         )
     )
+    pass_mode: HybridScanPassMode = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PASS_MODE",
+            HybridScanPassMode.__call__,
+            default=HybridScanPassMode.SINGLE_PASS,
+        )
+    )
     # Internal benchmarking flag. When False, skips stats and bloom-filter pruning
     # before the first pass of a hybrid scan so you can measure two-pass read
     # overhead in isolation. No reason to set this to False in production.
@@ -461,6 +493,8 @@ class ParquetOptions:
             raise ValueError(
                 "use_hybrid_scan requires prefetch_file_metadata to be enabled"
             )
+        if not isinstance(self.pass_mode, HybridScanPassMode):
+            raise TypeError("pass_mode must be a HybridScanPassMode")
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
         if not isinstance(self.fadvise_readahead_depth, int):

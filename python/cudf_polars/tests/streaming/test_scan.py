@@ -24,6 +24,7 @@ from cudf_polars.dsl.utils.io import (
     prefetch_parquet_file_metadata_for_ir,
 )
 from cudf_polars.engine.options import StreamingOptions
+from cudf_polars.utils.config import HybridScanPassMode
 from cudf_polars.streaming.actor_graph.io import resolve_max_concurrent_io_tasks
 from cudf_polars.streaming.base import (
     DataSourceInfo,
@@ -618,11 +619,15 @@ def test_streaming_scan_raises() -> None:
         (None, None),
     ],
 )
+@pytest.mark.parametrize(
+    "pass_mode", [HybridScanPassMode.SINGLE_PASS, HybridScanPassMode.TWO_PASS]
+)
 def test_split_scan_hybrid(
     tmp_path: Path,
     df: pl.DataFrame,
     predicate: pl.Expr | None,
     use_columns: list[str] | None,
+    pass_mode: HybridScanPassMode,
     streaming_engine_factory: Callable[..., StreamingEngine],
 ) -> None:
     streaming_engine = streaming_engine_factory(
@@ -631,6 +636,7 @@ def test_split_scan_hybrid(
             parquet_options={
                 "use_hybrid_scan": True,
                 "prefetch_file_metadata": True,
+                "pass_mode": pass_mode,
             },
         ),
     )

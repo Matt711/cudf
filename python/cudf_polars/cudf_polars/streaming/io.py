@@ -36,7 +36,7 @@ from cudf_polars.streaming.base import (
     SerializedDataSourceInfo,
 )
 from cudf_polars.streaming.dispatch import lower_ir_node
-from cudf_polars.utils.config import Cluster
+from cudf_polars.utils.config import Cluster, HybridScanPassMode
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 from cudf_polars.utils.versions import POLARS_VERSION_LT_137
 
@@ -229,7 +229,10 @@ class _PrunedHybridScanSplit(NamedTuple):
     ds: plc.io.types.Datasource
     source_info: plc.io.SourceInfo
     row_group_indices: list[int]
-    filter_ranges: list[plc.io.text.ByteRangeInfo]
+    # In `SINGLE_PASS` mode, byte ranges for all requested columns (the only
+    # fetch this split will make). In `TWO_PASS` mode, byte ranges for filter
+    # columns only (the first of two fetches).
+    fetch_ranges: list[plc.io.text.ByteRangeInfo]
 
 
 def _prune_row_groups_and_advise(
@@ -241,10 +244,11 @@ def _prune_row_groups_and_advise(
     cached_info: CachedParquetInfo,
     *,
     stats_pruning: bool = True,
+    pass_mode: HybridScanPassMode = HybridScanPassMode.SINGLE_PASS,
     cucascade_engine: object | None = None,
 ) -> _PrunedHybridScanSplit:
     """
-    Row-group prune a hybrid-scan split and fadvise its filter-column byte ranges.
+    Row-group prune a hybrid-scan split and fadvise its first-fetch byte ranges.
 
     Shared by the real read path (`_read_with_hybrid_scan`) and by producer-level
     readahead prep (`ParquetScanTask.prefetch_advise`), so a split's row groups are
@@ -279,22 +283,25 @@ def _prune_row_groups_and_advise(
                     bloom_chunks, row_group_indices, options, stream=stream
                 )
 
-    filter_ranges: list[plc.io.text.ByteRangeInfo] = []
+    fetch_ranges: list[plc.io.text.ByteRangeInfo] = []
     if row_group_indices:
-        filter_ranges = reader.filter_column_chunks_byte_ranges(
-            row_group_indices, options
+        fetch_ranges = (
+            reader.all_column_chunks_byte_ranges(row_group_indices, options)
+            if pass_mode is HybridScanPassMode.SINGLE_PASS
+            else reader.filter_column_chunks_byte_ranges(row_group_indices, options)
         )
         # cuCascade's fadvise contract is one non-disposable insert per datasource
         # instance (a second call on an already-pending handle warns and cancels
         # the first), so each fadvise gets its own `.duplicate()`.
-        # `payload_column_chunks_byte_ranges` requires filter-column selection to
-        # have already happened (it errors with "No columns selected" otherwise),
-        # so unlike `filter_ranges` it can't be computed/fadvised this early.
+        # `payload_column_chunks_byte_ranges` (TWO_PASS's second fetch) requires
+        # filter-column selection to have already happened (it errors with "No
+        # columns selected" otherwise), so unlike `fetch_ranges` it can't be
+        # computed/fadvised this early.
         if hasattr(ds, "duplicate"):
-            ds.duplicate().fadvise([(r.offset, r.size) for r in filter_ranges], -1)
+            ds.duplicate().fadvise([(r.offset, r.size) for r in fetch_ranges], -1)
 
     return _PrunedHybridScanSplit(
-        reader, options, ds, source_info, row_group_indices, filter_ranges
+        reader, options, ds, source_info, row_group_indices, fetch_ranges
     )
 
 
@@ -310,13 +317,18 @@ def _read_with_hybrid_scan(
     split_index: int = 0,
     total_splits: int = 1,
     stats_pruning: bool = True,
+    pass_mode: HybridScanPassMode = HybridScanPassMode.SINGLE_PASS,
     cucascade_engine: object | None = None,
 ) -> DataFrame:
-    """Two-pass parquet read via HybridScanReader for a row-group-aligned task."""
+    """Parquet read via HybridScanReader for a row-group-aligned task.
+
+    See `HybridScanPassMode` for the `SINGLE_PASS` (one fetch/decode, default)
+    vs `TWO_PASS` (filter columns then payload columns) tradeoff.
+    """
     with nvtx_annotate_cudf_polars(
         message="HybridScan", payload=(split_index + 1, total_splits)
     ):
-        reader, options, ds, source_info, row_group_indices, filter_ranges = (
+        reader, options, ds, source_info, row_group_indices, fetch_ranges = (
             _prune_row_groups_and_advise(
                 paths,
                 with_columns,
@@ -325,6 +337,7 @@ def _read_with_hybrid_scan(
                 stream,
                 cached_info,
                 stats_pruning=stats_pruning,
+                pass_mode=pass_mode,
                 cucascade_engine=cucascade_engine,
             )
         )
@@ -345,6 +358,27 @@ def _read_with_hybrid_scan(
                 stream=stream,
             )
 
+        if pass_mode is HybridScanPassMode.SINGLE_PASS:
+            all_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                source_info,
+                fetch_ranges,
+                plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                stream=stream,
+            )
+            tbl_w_meta = reader.materialize_all_columns(
+                row_group_indices,
+                all_chunks,
+                options,
+                stream=stream,
+            )
+            names = tbl_w_meta.column_names(include_children=False)
+            return DataFrame.from_table(
+                tbl_w_meta.tbl,
+                names,
+                [schema[n] for n in names],
+                stream=stream,
+            ).select(list(schema.keys()))
+
         # TODO: Consider implementing page-index stats pruning. For SplitScans, we can
         # reuse the same page index for all splits of the same file, so the overhead of
         # reading the page index can be amortized. For FusedScans, we would need to read
@@ -353,7 +387,7 @@ def _read_with_hybrid_scan(
 
         filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
             source_info,
-            filter_ranges,
+            fetch_ranges,
             plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
             stream=stream,
         )
@@ -776,6 +810,7 @@ class _HybridScanArgs(NamedTuple):
     split_index: int
     total_splits: int
     stats_pruning: bool
+    pass_mode: HybridScanPassMode
 
 
 class _HybridScanMultifileArgs(NamedTuple):
@@ -966,6 +1001,7 @@ class ParquetScanTask(IR):
                         split_index,
                         total_splits,
                         parquet_options._hybrid_scan_stats_pruning,
+                        parquet_options.pass_mode,
                     )
                 else:
                     hybrid_scan_multifile_args = _HybridScanMultifileArgs(
@@ -1006,6 +1042,7 @@ class ParquetScanTask(IR):
                 split_index=args.split_index,
                 total_splits=args.total_splits,
                 stats_pruning=args.stats_pruning,
+                pass_mode=args.pass_mode,
                 cucascade_engine=context.cucascade_engine,
             )
         if prep.hybrid_scan_multifile_args is not None:
@@ -1073,6 +1110,7 @@ class ParquetScanTask(IR):
                     args.stream,
                     args.cached_info,
                     stats_pruning=args.stats_pruning,
+                    pass_mode=args.pass_mode,
                     cucascade_engine=context.cucascade_engine,
                 )
             elif prep.hybrid_scan_multifile_args is not None:
