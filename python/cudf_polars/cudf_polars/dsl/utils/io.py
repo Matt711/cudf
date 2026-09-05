@@ -15,11 +15,31 @@ import pylibcudf as plc
 
 from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.dsl.traversal import traversal
-from cudf_polars.streaming.io import Scan, StreamingScan
+from cudf_polars.streaming.io import (
+    ParquetSourceInfo,
+    Scan,
+    StreamingScan,
+)
 
 if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IR
     from cudf_polars.streaming.base import StatsCollector
+
+
+def resolve_datasource(
+    path: str, size: int | None, cucascade_engine: object | None
+) -> plc.io.types.Datasource:
+    """
+    Resolve a parquet path to a ``Datasource``, using cuCascade for remote paths.
+
+    Remote (S3/HTTP) paths are opened through ``cucascade_engine`` (a
+    ``cucascade.RestEngine``) when one is available, so downstream reads can use
+    ``.duplicate()``/``.fadvise()`` for prefetching. Local paths, and remote paths
+    when no cuCascade engine is configured, fall back to a plain ``FilepathSource``.
+    """
+    if cucascade_engine is not None and plc.io.SourceInfo._is_remote_uri(path):
+        return cucascade_engine.open(path)  # type: ignore[attr-defined, no-any-return]
+    return plc.io.types.FilepathSource(path, size)
 
 
 @dataclass(frozen=True)
@@ -56,6 +76,13 @@ class CachedParquetInfo:
     _hybrid_scan_metadata: plc.io.experimental.HybridScanMetadata | None = field(
         default=None, init=False, compare=False, repr=False
     )
+    # The canonical open datasource for this file, resolved once and reused by
+    # every split of this file. Per-split reads call `.duplicate()` on this
+    # rather than reading/`fadvise`-ing through it directly, so that no two
+    # splits share a prefetch handle.
+    _datasource: plc.io.types.Datasource | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         if self.parse_hybrid_metadata:
@@ -66,6 +93,14 @@ class CachedParquetInfo:
                     self.file_metadata, self.default_reader_options()
                 ),
             )
+
+    def datasource(self, cucascade_engine: object | None) -> plc.io.types.Datasource:
+        """Return the canonical datasource for this file, resolving it if needed."""
+        ds = self._datasource
+        if ds is None:
+            ds = resolve_datasource(self.path, self.size, cucascade_engine)
+            object.__setattr__(self, "_datasource", ds)
+        return ds
 
     def hybrid_scan_reader(
         self,
@@ -80,12 +115,20 @@ class CachedParquetInfo:
             object.__setattr__(self, "_hybrid_scan_metadata", metadata)
         return plc.io.experimental.HybridScanReader.from_metadata(metadata)
 
-    def default_reader_options(self) -> plc.io.parquet.ParquetReaderOptions:
+    def default_reader_options(
+        self, datasource: plc.io.types.Datasource | None = None
+    ) -> plc.io.parquet.ParquetReaderOptions:
         """Return baseline ``ParquetReaderOptions`` for this cached parquet file."""
+        # NOTE: intentionally does not call/cache `self.datasource(...)` when no
+        # `datasource` is supplied (e.g. the metadata-only parse in
+        # `__post_init__`, before any cuCascade engine is known) -- doing so
+        # would permanently pin `self._datasource` to a plain `FilepathSource`
+        # before a real caller has a chance to resolve it through cuCascade.
+        ds = datasource if datasource is not None else plc.io.types.FilepathSource(
+            self.path, self.size
+        )
         return (
-            plc.io.parquet.ParquetReaderOptions.builder(
-                plc.io.SourceInfo([plc.io.types.FilepathSource(self.path, self.size)])
-            )
+            plc.io.parquet.ParquetReaderOptions.builder(plc.io.SourceInfo([ds]))
             .decimal_width(plc.TypeId.DECIMAL128)
             .build()
         )
@@ -181,14 +224,12 @@ def prefetch_parquet_file_metadata_for_ir(
     -------
     A dictionary mapping each individual path to its cached parquet metadata.
     """
-    from cudf_polars.streaming.io import ParquetSourceInfo, StreamingScan
-
     all_paths: set[str] = set()
 
     for node in traversal([root]):
         if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
-            for scan in node.scans:
-                for path in scan.paths:
+            for task in node.tasks:
+                for path in task.paths:
                     all_paths.add(path)
         elif isinstance(node, Scan) and node.typ == "parquet":  # pragma: no cover
             raise RuntimeError("Unexpected parquet 'Scan' node in lowered IR graph.")
@@ -241,7 +282,7 @@ def attach_cached_parquet_metadata(
     cached_parquet_info_map: dict[str, CachedParquetInfo],
 ) -> None:
     """
-    Attach prefetched metadata to scan nodes.
+    Attach prefetched metadata to parquet scan nodes.
 
     This is an optimization only and does not affect IR identity.
 
@@ -254,10 +295,10 @@ def attach_cached_parquet_metadata(
     """
     for node in traversal([root]):
         if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
-            for scan in node.scans:
-                if not all(path in cached_parquet_info_map for path in scan.paths):
-                    continue
-                cached = [cached_parquet_info_map[path] for path in scan.paths]
-                Scan._validate_cached_parquet_info(scan.paths, cached)
-                scan.cached_parquet_info = cached
-                scan._non_child_args = (*scan._non_child_args[:-1], cached)
+            base_scan = node.base_scan
+            if not all(path in cached_parquet_info_map for path in base_scan.paths):
+                continue
+            cached = [cached_parquet_info_map[path] for path in base_scan.paths]
+            Scan._validate_cached_parquet_info(base_scan.paths, cached)
+            base_scan.cached_parquet_info = cached
+            base_scan._non_child_args = (*base_scan._non_child_args[:-1], cached)

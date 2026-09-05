@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
@@ -131,6 +132,7 @@ def evaluate_pipeline_spmd_mode(
     comm = config_options.executor.spmd_context.comm
     context = config_options.executor.spmd_context.context
     py_executor = config_options.executor.spmd_context.py_executor
+    cucascade_engine = config_options.executor.spmd_context.cucascade_engine
 
     quent_context = config_options.executor.quent_context
     local_quent_context: LocalQuentContext | None = None
@@ -159,6 +161,7 @@ def evaluate_pipeline_spmd_mode(
         config_options,
         local_quent_context=local_quent_context,
         query_id=query_id,
+        cucascade_engine=cucascade_engine,
     )
     if quent_context is not None:
         assert config_options.executor.spmd_context.quent_logger is not None
@@ -263,6 +266,54 @@ def synchronize_quent_context(
         all_data = all_gather_host_data(comm, context.br(), op_id, data)
 
     return cudf_polars.quent.QuentContext._deserialize(all_data[0])
+
+
+def _make_cucascade_engine() -> object | None:
+    """
+    Construct a cuCascade ``RestEngine`` from standard AWS environment variables.
+
+    Returns ``None`` (rather than raising) when the ``cucascade`` package isn't
+    installed, or when AWS credentials aren't configured, so cuCascade remains
+    an optional dependency: engines/workloads that never touch a remote
+    (S3/HTTP) parquet path work identically whether or not it's present.
+    """
+    try:
+        import cucascade
+    except ImportError:
+        return None
+
+    access_key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    if not access_key_id or not secret_access_key:
+        # `RestEngine` requires non-empty credentials at construction time, so
+        # there's no point constructing one at all without them -- this is the
+        # common case for engines that never touch a remote path.
+        return None
+
+    region = os.environ.get(
+        "AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    )
+    # `RestEngine` requires a non-empty endpoint (it doesn't infer one the way
+    # boto3/the AWS CLI do). Respect an explicit override for S3-compatible/
+    # custom endpoints, otherwise default to AWS's standard regional endpoint.
+    endpoint = os.environ.get(
+        "AWS_ENDPOINT_URL",
+        os.environ.get("AWS_ENDPOINT_URL_S3", f"https://s3.{region}.amazonaws.com"),
+    )
+
+    try:
+        return cucascade.RestEngine(
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            session_token=os.environ.get("AWS_SESSION_TOKEN", ""),
+            region=region,
+            endpoint=endpoint,
+            enable_cache=True,
+        )
+    except Exception:
+        # Don't let a misconfigured cuCascade environment (bad endpoint, etc.)
+        # take down engine construction; fall back to no cuCascade support.
+        return None
 
 
 class SPMDEngine(StreamingEngine):
@@ -480,6 +531,10 @@ class SPMDEngine(StreamingEngine):
             enabled=executor_options["kvikio_statistics"]
         )
         exit_stack.callback(self._stop_kvikio_monitor)
+        # Constructed once per engine (not per `_reset`), like `_py_executor`: it
+        # owns its own pinned host pool and reactor threads, independent of any
+        # particular query.
+        self._cucascade_engine = _make_cucascade_engine()
 
         # TODO: there's no reason our API needs a plain dict[str, Any] rather than
         # a typed config object here.
@@ -536,6 +591,7 @@ class SPMDEngine(StreamingEngine):
                         quent_logger=self._quent_logger,
                         context=self._ctx,
                         py_executor=self._py_executor,
+                        cucascade_engine=self._cucascade_engine,
                     ),
                 },
                 engine_options={
@@ -701,6 +757,7 @@ class SPMDEngine(StreamingEngine):
                     engine_id=engine_id,
                     worker_id=self._quent_worker.id,
                     quent_logger=self._quent_logger,
+                    cucascade_engine=self._cucascade_engine,
                 ),
             },
             engine_options={

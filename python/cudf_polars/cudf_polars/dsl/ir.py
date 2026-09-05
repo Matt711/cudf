@@ -139,11 +139,17 @@ class IRExecutionContext:
         A zero-argument callable that returns a CUDA stream.
     query_id
         Identifier for the query being executed.
+    cucascade_engine
+        A ``cucascade.RestEngine`` instance used to resolve remote (S3/HTTP)
+        parquet paths to prefetch-capable datasources, or ``None`` if
+        cuCascade integration isn't enabled (e.g. non-SPMD engines, or no
+        cuCascade installation). Only ever set by the SPMD engine.
     """
 
     py_executor: concurrent.futures.ThreadPoolExecutor | None = field(default=None)
     get_cuda_stream: Callable[[], Stream] = field(default=get_cuda_stream)
     query_id: uuid.UUID = field(default_factory=uuid.uuid4)
+    cucascade_engine: object | None = field(default=None)
 
     async def to_thread(
         self, func: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs

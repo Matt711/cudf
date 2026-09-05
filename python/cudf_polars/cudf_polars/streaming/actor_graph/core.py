@@ -92,6 +92,7 @@ def evaluate_logical_plan(
                     engine_id=engine_id,
                     worker_id=engine._quent_worker.id,
                     quent_logger=engine._quent_logger,
+                    cucascade_engine=engine._cucascade_engine,
                 ),
             ),
         )

@@ -39,6 +39,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     send_metadata,
 )
 from cudf_polars.streaming.io import (
+    ParquetScanTask,
     StreamingScan,
     StreamingSink,
     _prepare_sink_directory,
@@ -60,7 +61,7 @@ if TYPE_CHECKING:
         IOPartitionPlan,
         PartitionInfo,
     )
-    from cudf_polars.streaming.io import FusedScan, SplitScan
+    from cudf_polars.streaming.io import StreamingScanTask
     from cudf_polars.utils.config import MaxConcurrentIOTasks
 
 
@@ -516,7 +517,7 @@ def _(
 
 async def read_chunk(
     context: Context,
-    scan: IR,
+    task: IR,
     seq_num: int,
     ch_out: Channel[TableChunk],
     ir_context: IRExecutionContext,
@@ -530,8 +531,8 @@ async def read_chunk(
     ----------
     context
         The rapidsmpf context.
-    scan
-        The Scan or DataFrameScan node.
+    task
+        The scan task to evaluate.
     seq_num
         The sequence number.
     ch_out
@@ -546,7 +547,7 @@ async def read_chunk(
     """
     reservation_bytes = (
         estimated_chunk_bytes
-        if isinstance(scan, DataFrameScan)
+        if isinstance(task, DataFrameScan)
         else 2 * estimated_chunk_bytes
     )
     start = time.monotonic_ns()
@@ -558,8 +559,8 @@ async def read_chunk(
     admitted = time.monotonic_ns()
     with opaque_memory_usage(reservation):
         df = await ir_context.to_thread(
-            scan.do_evaluate,
-            *scan._non_child_args,
+            task.do_evaluate,
+            *task._non_child_args,
             context=ir_context,
         )
         chunk = TableChunk.from_pylibcudf_table(
@@ -569,19 +570,28 @@ async def read_chunk(
             br=context.br(),
         )
     stop = time.monotonic_ns()
+    trace_task = task.base_task if isinstance(task, ParquetScanTask) else task
     log(
         "IO Task",
         scope=Scope.IO_TASK.value,
         start=start,
         admitted=admitted,
         stop=stop,
-        ir_id=scan.get_stable_id(),
-        ir_type=type(scan).__name__,
+        ir_id=trace_task.get_stable_id(),
+        ir_type=type(trace_task).__name__,
         sequence_number=seq_num,
         estimated_output_bytes=estimated_chunk_bytes,
         reservation_bytes=reservation_bytes,
     )
     await send_chunk(context, ch_out, chunk, seq_num, tracer=tracer)
+
+
+async def _prefetch_advise_best_effort(
+    task: StreamingScanTask, ir_context: IRExecutionContext
+) -> None:
+    """Best-effort fadvise readahead for an upcoming parquet split; never raises."""
+    if isinstance(task, ParquetScanTask):
+        await ir_context.to_thread(task.prefetch_advise, context=ir_context)
 
 
 @define_actor()
@@ -593,6 +603,7 @@ async def scan_node(
     *,
     num_producers: int,
     estimated_chunk_bytes: int,
+    fadvise_readahead_depth: int = 0,
 ) -> None:
     """
     Scan node for rapidsmpf.
@@ -612,8 +623,22 @@ async def scan_node(
     estimated_chunk_bytes
         Estimated retained output size of each chunk in bytes. Used to estimate
         peak memory for admission before launching each read.
+    fadvise_readahead_depth
+        Number of upcoming splits (per producer) to prune/``fadvise`` ahead of
+        their own read. ``0`` disables readahead. See
+        ``ParquetOptions.fadvise_readahead_depth``.
     """
-    scans: Sequence[SplitScan] | Sequence[FusedScan] = ir.scans
+    tasks: Sequence[StreamingScanTask] = ir.tasks
+    # Tracks in-flight readahead-prep tasks so they aren't garbage-collected
+    # mid-flight (a well-known asyncio gotcha for fire-and-forget tasks); each
+    # discards itself from this set once done.
+    readahead_tasks: set[asyncio.Task[None]] = set()
+
+    def _kick_off_readahead(idx: int, seq: Sequence[StreamingScanTask]) -> None:
+        if fadvise_readahead_depth > 0 and 0 <= idx < len(seq):
+            t = asyncio.create_task(_prefetch_advise_best_effort(seq[idx], ir_context))
+            readahead_tasks.add(t)
+            t.add_done_callback(readahead_tasks.discard)
 
     async with shutdown_on_error(
         context, ch_out, trace_ir=ir, ir_context=ir_context
@@ -622,21 +647,24 @@ async def scan_node(
         await send_metadata(
             ch_out,
             context,
-            ChannelMetadata(local_count=len(scans)),
+            ChannelMetadata(local_count=len(tasks)),
         )
 
         # If there is nothing to scan, drain the channel and return
-        if len(scans) == 0:
+        if len(tasks) == 0:
             await ch_out.drain(context)
             return
 
-        # If there is only one scan or one producer, we can
+        # If there is only one task or one producer, we can
         # skip the lineariser and read the chunks directly
-        if len(scans) == 1 or num_producers == 1:
-            for seq_num, scan in enumerate(scans):
+        if len(tasks) == 1 or num_producers == 1:
+            for ahead in range(fadvise_readahead_depth):
+                _kick_off_readahead(ahead, tasks)
+            for seq_num, task in enumerate(tasks):
+                _kick_off_readahead(seq_num + fadvise_readahead_depth, tasks)
                 await read_chunk(
                     context,
-                    scan,
+                    task,
                     seq_num,
                     ch_out,
                     ir_context,
@@ -647,23 +675,26 @@ async def scan_node(
             return
 
         # Use Lineariser to ensure ordered delivery
-        num_producers = min(num_producers, len(scans))
+        num_producers = min(num_producers, len(tasks))
         lineariser = Lineariser(context, ch_out, num_producers)
 
         # Assign tasks to producers using round-robin
-        producer_tasks: list[list[tuple[int, SplitScan | FusedScan]]] = [
+        producer_tasks: list[list[tuple[int, StreamingScanTask]]] = [
             [] for _ in range(num_producers)
         ]
-        for task_idx, scan in enumerate(scans):
+        for task_idx, task in enumerate(tasks):
             producer_id = task_idx % num_producers
-            # mypy resolves __iter__ on union-of-sequences to the common base (IR)
-            producer_tasks[producer_id].append((task_idx, scan))  # type: ignore[arg-type]
+            producer_tasks[producer_id].append((task_idx, task))
 
         async def _producer(producer_id: int, ch_out: Channel) -> None:
-            for task_idx, scan in producer_tasks[producer_id]:
+            my_tasks = [task for _, task in producer_tasks[producer_id]]
+            for ahead in range(fadvise_readahead_depth):
+                _kick_off_readahead(ahead, my_tasks)
+            for i, (task_idx, task) in enumerate(producer_tasks[producer_id]):
+                _kick_off_readahead(i + fadvise_readahead_depth, my_tasks)
                 await read_chunk(
                     context,
-                    scan,
+                    task,
                     task_idx,
                     ch_out,
                     ir_context,
@@ -712,6 +743,11 @@ def _(
             num_producers=num_producers,
             estimated_chunk_bytes=(
                 plan.estimated_chunk_bytes or executor.target_partition_size
+            ),
+            fadvise_readahead_depth=(
+                ir.base_scan.parquet_options.fadvise_readahead_depth
+                if ir.base_scan.typ == "parquet"
+                else 0
             ),
         )
     ]

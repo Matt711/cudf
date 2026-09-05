@@ -357,6 +357,16 @@ class ParquetOptions:
         Whether to use the two-pass ``HybridScanReader`` for ``SplitScan``
         tasks when a predicate can be pushed down to a parquet filter.
         Default is False.
+    fadvise_readahead_depth
+        For hybrid-scan splits read through a cuCascade-backed remote
+        datasource, the number of additional upcoming splits (per IO
+        producer) to prune and ``fadvise`` ahead of their own read, so
+        cuCascade's prefetch cache has real wall-clock lead time before
+        the split is actually materialized. ``0`` (default) disables
+        readahead: each split's byte ranges are only advised right before
+        that same split's own read, giving no lead time. Has no effect
+        without a cuCascade-backed datasource (e.g. local files, or no
+        ``cucascade`` package installed).
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -424,6 +434,11 @@ class ParquetOptions:
             default=False,
         )
     )
+    fadvise_readahead_depth: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__FADVISE_READAHEAD_DEPTH", int, default=0
+        )
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         if not isinstance(self.chunked, bool):
@@ -448,6 +463,10 @@ class ParquetOptions:
             )
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
+        if not isinstance(self.fadvise_readahead_depth, int):
+            raise TypeError("fadvise_readahead_depth must be an int")
+        if self.fadvise_readahead_depth < 0:
+            raise ValueError("fadvise_readahead_depth must be non-negative")
 
 
 def default_target_partition_size(min_device_size: int | None) -> int:
@@ -701,6 +720,10 @@ class SPMDContext:
         The active RapidsMPF context.
     py_executor
         Thread-pool executor used to drive the actor network on each rank.
+    cucascade_engine
+        A ``cucascade.RestEngine`` instance for resolving remote parquet
+        datasources, constructed once per engine, or ``None`` if cuCascade
+        isn't installed/enabled.
     """
 
     comm: Communicator
@@ -709,6 +732,7 @@ class SPMDContext:
     engine_id: uuid.UUID
     worker_id: uuid.UUID
     quent_logger: QuentLogger | None
+    cucascade_engine: object | None = None
 
 
 @dataclasses.dataclass(frozen=True)

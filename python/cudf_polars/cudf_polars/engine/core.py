@@ -825,6 +825,7 @@ def evaluate_on_rank(
     collect_metadata: bool = False,
     local_quent_context: LocalQuentContext | None = None,
     query_id: uuid.UUID,
+    cucascade_engine: object | None = None,
 ) -> tuple[DataFrame, list[ChannelMetadata]]:
     """
     Evaluate a polars IR plan on a single rank.
@@ -856,6 +857,9 @@ def evaluate_on_rank(
         disabled.
     query_id
         A unique identifier for the query.
+    cucascade_engine
+        A ``cucascade.RestEngine`` instance for resolving remote parquet
+        datasources, or ``None`` if cuCascade integration isn't enabled.
 
     Returns
     -------
@@ -917,7 +921,10 @@ def evaluate_on_rank(
             logical_op_by_id=logical_op_by_id,
         )
     ir_context = IRExecutionContext(
-        py_executor, get_cuda_stream=ctx.br().stream_pool.get_stream, query_id=query_id
+        py_executor,
+        get_cuda_stream=ctx.br().stream_pool.get_stream,
+        query_id=query_id,
+        cucascade_engine=cucascade_engine,
     )
 
     prefetch_file_metadata = config_options.parquet_options.prefetch_file_metadata
