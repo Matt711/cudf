@@ -117,6 +117,15 @@ class PrefetchCacheStats:
     """
 
     registrations: int = 0
+    #: Registrations for a (file, offset) that was registered at some
+    #: earlier point too (and has since been evicted or failed), as
+    #: opposed to one never seen before. Answers "is there real reuse
+    #: demand for this data at all" independent of whether eviction or
+    #: fetch speed happens to be fast enough to turn that demand into an
+    #: actual hit -- a low ratio to ``registrations`` means most requested
+    #: ranges are simply never asked for twice, which no amount of tuning
+    #: fetch speed or eviction policy can turn into a hit.
+    re_registrations: int = 0
     hits_immediate: int = 0
     misses: int = 0
     #: Sum of (became-CACHED time - registration time), over every chunk
@@ -140,7 +149,8 @@ class PrefetchCacheStats:
             self.lead_time_seconds / self.cached_count if self.cached_count else 0.0
         )
         return (
-            f"registrations={self.registrations} gets={total} "
+            f"registrations={self.registrations} "
+            f"re_registrations={self.re_registrations} gets={total} "
             f"hit_rate={hit_rate:.1%} hits_immediate={self.hits_immediate} "
             f"misses={self.misses} "
             f"avg_lead_time={avg_lead_time * 1000:.2f}ms cached_count={self.cached_count} "
@@ -186,6 +196,10 @@ class PrefetchCache:
         # Only ever touched from the cache's own loop.
         self._reserved_bytes = 0
         self._spill_function_id: int | None = None
+        # Every (path, aligned offset) ever registered, for the life of
+        # the cache. Never shrinks (unlike `_files`, which eviction
+        # prunes), so it's purely diagnostic: see `_fadvise_on_loop`.
+        self._ever_registered: set[tuple[str, int]] = set()
 
     @property
     def chunk_bytes(self) -> int:
@@ -345,6 +359,18 @@ class PrefetchCache:
         entry = self._entry(path)
         if entry.find(aligned_offset) is not None:
             return
+        # `_ever_registered` never shrinks, unlike `entry.chunks`: a hit
+        # here means this exact (file, offset) was registered before and
+        # is only being asked for again now because it's since been
+        # evicted or failed, not because this fadvise call is a duplicate
+        # of one still live. That's the direct signal for whether there's
+        # real reuse demand at all, independent of whether eviction or
+        # fetch speed happens to be fast enough to actually deliver a hit.
+        key = (path, aligned_offset)
+        if key in self._ever_registered:
+            self._stats.re_registrations += 1
+        else:
+            self._ever_registered.add(key)
         chunk = CachedChunk(
             offset=aligned_offset, size=size, registered_at=time.monotonic()
         )
