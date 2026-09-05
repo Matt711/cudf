@@ -62,10 +62,12 @@ from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
 from cudf_polars.streaming.actor_graph.utils import set_memory_resource
 from cudf_polars.unstable import unstable
 from cudf_polars.utils.config import (
+    CuCascadeOptions,
     MemoryResourceConfig,
     SPMDContext,
     StreamingExecutor,
     configure_kvikio,
+    resolve_cucascade_options,
     resolve_kvikio_nthreads,
     resolve_kvikio_statistics,
 )
@@ -268,9 +270,10 @@ def synchronize_quent_context(
     return cudf_polars.quent.QuentContext._deserialize(all_data[0])
 
 
-def _make_cucascade_engine() -> object | None:
+def _make_cucascade_engine(options: CuCascadeOptions) -> object | None:
     """
-    Construct a cuCascade ``RestEngine`` from standard AWS environment variables.
+    Construct a cuCascade ``RestEngine`` from AWS environment variables and
+    ``options``.
 
     Returns ``None`` (rather than raising) when the ``cucascade`` package isn't
     installed, or when AWS credentials aren't configured, so cuCascade remains
@@ -308,7 +311,14 @@ def _make_cucascade_engine() -> object | None:
             session_token=os.environ.get("AWS_SESSION_TOKEN", ""),
             region=region,
             endpoint=endpoint,
-            enable_cache=True,
+            n_reactors=options.n_reactors,
+            tls_verify=options.tls_verify,
+            pool_capacity=options.pool_capacity,
+            block_size=options.block_size,
+            max_connections=options.max_connections,
+            chunk_size=options.chunk_size,
+            max_n_chunks=options.max_n_chunks,
+            enable_cache=options.enable_cache,
         )
     except Exception:
         # Don't let a misconfigured cuCascade environment (bad endpoint, etc.)
@@ -534,7 +544,9 @@ class SPMDEngine(StreamingEngine):
         # Constructed once per engine (not per `_reset`), like `_py_executor`: it
         # owns its own pinned host pool and reactor threads, independent of any
         # particular query.
-        self._cucascade_engine = _make_cucascade_engine()
+        self._cucascade_engine = _make_cucascade_engine(
+            resolve_cucascade_options(executor_options)
+        )
 
         # TODO: there's no reason our API needs a plain dict[str, Any] rather than
         # a typed config object here.

@@ -57,6 +57,7 @@ __all__ = [
     "UNSPECIFIED",
     "Cluster",
     "ConfigOptions",
+    "CuCascadeOptions",
     "DaskContext",
     "DynamicPlanningOptions",
     "HybridScanPassMode",
@@ -286,7 +287,6 @@ def resolve_kvikio_nthreads(executor_options: dict[str, Any]) -> int:
         )
     )
 
-
 def configure_kvikio(nthreads: int) -> None:
     """Set the remote I/O backend to ``EASY_THREADPOOL`` with ``nthreads`` threads."""
     # HACK: libcudf calls set_up_kvikio() on the first IO op and that resets the thread
@@ -311,6 +311,134 @@ def _bool_converter(v: str) -> bool:
         return False
     else:
         raise ValueError(f"Invalid boolean value: '{v}'")
+
+
+@dataclasses.dataclass(frozen=True)
+class CuCascadeOptions:
+    """
+    Tuning knobs for cuCascade's ``RestEngine``, used to resolve remote
+    (S3/HTTP) parquet datasources.
+
+    Constructed once per engine (like ``num_py_executors``/
+    ``kvikio_statistics``), not per query -- ``RestEngine`` owns a real
+    pinned host pool and reactor threads allocated at construction time, so
+    these are engine-scoped ``executor_options``, not ``ParquetOptions``.
+
+    Credentials (access key, secret key, session token) and region/endpoint
+    are always read from standard AWS environment variables
+    (``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, ``AWS_SESSION_TOKEN``,
+    ``AWS_REGION``/``AWS_DEFAULT_REGION``, ``AWS_ENDPOINT_URL``/
+    ``AWS_ENDPOINT_URL_S3``), not through this class -- these options only
+    cover ``RestEngine``'s other constructor arguments.
+
+    These options can be configured via environment variables with the
+    prefix ``CUDF_POLARS__CUCASCADE_OPTIONS__``, or via the
+    ``cucascade_options`` executor option (a dict or a ``CuCascadeOptions``
+    instance).
+
+    Parameters
+    ----------
+    n_reactors
+        Number of reactor threads driving cuCascade's remote I/O.
+    tls_verify
+        Whether to verify TLS certificates for HTTPS requests.
+    pool_capacity
+        Size, in bytes, of ``RestEngine``'s pinned host staging pool. This
+        is separate from rapidsmpf's own pinned pool
+        (``RAPIDSMPF_PINNED_INITIAL_POOL_SIZE``); size both deliberately
+        rather than assuming they won't compete for host memory. Must be
+        large enough to hold ``max_n_chunks`` blocks of ``block_size``
+        bytes each, or ``RestEngine`` construction raises ``MemoryError``.
+    block_size
+        Block size, in bytes, used by the pinned pool allocator.
+    max_connections
+        Maximum number of concurrent HTTP connections.
+    chunk_size
+        Chunk size, in bytes, used by cuCascade's prefetch cache.
+    max_n_chunks
+        Maximum number of chunks held by cuCascade's prefetch cache.
+    enable_cache
+        Whether to enable cuCascade's prefetch cache. Disabling this makes
+        ``fadvise`` a no-op; reads still happen, just synchronously on
+        demand instead of prefetched ahead of time.
+    """
+
+    _env_prefix = "CUDF_POLARS__CUCASCADE_OPTIONS"
+
+    n_reactors: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__N_REACTORS", int, default=4
+        )
+    )
+    tls_verify: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__TLS_VERIFY", _bool_converter, default=True
+        )
+    )
+    pool_capacity: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__POOL_CAPACITY", int, default=2_684_354_560
+        )
+    )
+    block_size: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__BLOCK_SIZE", int, default=1_048_576
+        )
+    )
+    max_connections: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__MAX_CONNECTIONS", int, default=16
+        )
+    )
+    chunk_size: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__CHUNK_SIZE", int, default=8_388_608
+        )
+    )
+    max_n_chunks: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__MAX_N_CHUNKS", int, default=16
+        )
+    )
+    enable_cache: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__ENABLE_CACHE", _bool_converter, default=True
+        )
+    )
+
+    @classmethod
+    def from_config(
+        cls, value: dict[str, Any] | CuCascadeOptions | None
+    ) -> CuCascadeOptions:
+        """Construct from the supported configuration shapes."""
+        if value is None:
+            return cls()
+        if isinstance(value, CuCascadeOptions):
+            return value
+        if not isinstance(value, dict):
+            raise TypeError("cucascade_options must be a dict, CuCascadeOptions, or None")
+        return cls(**value)
+
+    def __post_init__(self) -> None:  # noqa: D105
+        if type(self.n_reactors) is not int or self.n_reactors < 1:
+            raise ValueError("n_reactors must be a positive int")
+        if not isinstance(self.tls_verify, bool):
+            raise TypeError("tls_verify must be a bool")
+        for name in ("pool_capacity", "block_size", "chunk_size"):
+            v = getattr(self, name)
+            if type(v) is not int or v < 1:
+                raise ValueError(f"{name} must be a positive int")
+        for name in ("max_connections", "max_n_chunks"):
+            v = getattr(self, name)
+            if type(v) is not int or v < 1:
+                raise ValueError(f"{name} must be a positive int")
+        if not isinstance(self.enable_cache, bool):
+            raise TypeError("enable_cache must be a bool")
+
+
+def resolve_cucascade_options(executor_options: dict[str, Any]) -> CuCascadeOptions:
+    """Resolve cuCascade RestEngine tuning options, with env var fallback."""
+    return CuCascadeOptions.from_config(executor_options.get("cucascade_options"))
 
 
 def _quent_context_converter(v: str) -> QuentContext | None:

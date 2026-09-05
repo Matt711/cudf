@@ -30,6 +30,7 @@ from cudf_polars.testing.asserts import (
 from cudf_polars.utils.config import (
     Cluster,
     ConfigOptions,
+    CuCascadeOptions,
     DynamicPlanningOptions,
     HybridScanPassMode,
     InMemoryExecutor,
@@ -40,6 +41,7 @@ from cudf_polars.utils.config import (
     StreamingExecutor,
     Unspecified,
     configure_kvikio,
+    resolve_cucascade_options,
 )
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 
@@ -680,6 +682,73 @@ def test_pass_mode_default(monkeypatch: pytest.MonkeyPatch) -> None:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PASS_MODE", "foo")
         with pytest.raises(ValueError, match="'foo' is not a valid HybridScanPassMode"):
             ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
+
+
+def test_cucascade_options_default() -> None:
+    options = CuCascadeOptions()
+    assert options.n_reactors == 4
+    assert options.tls_verify is True
+    assert options.pool_capacity == 2_684_354_560
+    assert options.block_size == 1_048_576
+    assert options.max_connections == 16
+    assert options.chunk_size == 8_388_608
+    assert options.max_n_chunks == 16
+    assert options.enable_cache is True
+
+    assert resolve_cucascade_options({}) == options
+
+
+def test_cucascade_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as m:
+        m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__N_REACTORS", "8")
+        m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__TLS_VERIFY", "0")
+        m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__POOL_CAPACITY", "100")
+        m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__BLOCK_SIZE", "200")
+        m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__MAX_CONNECTIONS", "32")
+        m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__CHUNK_SIZE", "300")
+        m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__MAX_N_CHUNKS", "8")
+        m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__ENABLE_CACHE", "0")
+
+        options = CuCascadeOptions()
+        assert options.n_reactors == 8
+        assert options.tls_verify is False
+        assert options.pool_capacity == 100
+        assert options.block_size == 200
+        assert options.max_connections == 32
+        assert options.chunk_size == 300
+        assert options.max_n_chunks == 8
+        assert options.enable_cache is False
+
+
+def test_cucascade_options_executor_option_override() -> None:
+    options = resolve_cucascade_options(
+        {"cucascade_options": {"n_reactors": 2, "enable_cache": False}}
+    )
+    assert options.n_reactors == 2
+    assert options.enable_cache is False
+    # Unspecified fields keep their defaults.
+    assert options.pool_capacity == 2_684_354_560
+
+    passthrough = CuCascadeOptions(n_reactors=16)
+    assert resolve_cucascade_options({"cucascade_options": passthrough}) is passthrough
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "n_reactors",
+        "tls_verify",
+        "pool_capacity",
+        "block_size",
+        "max_connections",
+        "chunk_size",
+        "max_n_chunks",
+        "enable_cache",
+    ],
+)
+def test_validate_cucascade_options(option: str) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        CuCascadeOptions(**{option: object()})
 
 
 def test_parquet_options_object_passthrough() -> None:
