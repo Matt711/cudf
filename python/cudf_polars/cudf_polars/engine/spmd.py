@@ -166,6 +166,16 @@ def evaluate_pipeline_spmd_mode(
         query_id=query_id,
         cucascade_engine=cucascade_engine,
     )
+    if cucascade_engine is not None:
+        # Logged once per query (not just at engine shutdown) so it lands
+        # inside whatever per-query trace-capture window a benchmark harness
+        # uses -- a shutdown-time-only log can fire after harnesses have
+        # already finalized that query's trace collection.
+        log(
+            "cucascade_cache_summary",
+            scope=Scope.FADVISE.value,
+            summary=cucascade_engine.cache_summary(),  # type: ignore[attr-defined]
+        )
     if quent_context is not None:
         assert config_options.executor.spmd_context.quent_logger is not None
         assert local_quent_context is not None
