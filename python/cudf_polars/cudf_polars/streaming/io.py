@@ -9,6 +9,8 @@ import functools
 import itertools
 import math
 import statistics
+import time
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Self, TypeAlias, overload
@@ -28,7 +30,7 @@ from cudf_polars.dsl.ir import (
     _prepare_parquet_predicate,
 )
 from cudf_polars.dsl.to_ast import to_parquet_filter
-from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
+from cudf_polars.dsl.tracing import Scope, log, nvtx_annotate_cudf_polars
 from cudf_polars.streaming.base import (
     IOPartitionFlavor,
     IOPartitionPlan,
@@ -246,6 +248,7 @@ def _prune_row_groups_and_advise(
     stats_pruning: bool = True,
     pass_mode: HybridScanPassMode = HybridScanPassMode.SINGLE_PASS,
     cucascade_engine: object | None = None,
+    call_kind: str = "real",
 ) -> _PrunedHybridScanSplit:
     """
     Row-group prune a hybrid-scan split and fadvise its first-fetch byte ranges.
@@ -253,9 +256,11 @@ def _prune_row_groups_and_advise(
     Shared by the real read path (`_read_with_hybrid_scan`) and by producer-level
     readahead prep (`ParquetScanTask.prefetch_advise`), so a split's row groups are
     pruned and fadvised identically whether the call is the eventual real read or
-    a look-ahead prep call issued ahead of it.
+    a look-ahead prep call issued ahead of it. `call_kind` ("prep" or "real") is
+    purely a logging label distinguishing the two.
     """
     assert len(paths) == 1, "hybrid scan only supports one physical file"
+    t_start = time.monotonic_ns()
     ds = cached_info.datasource(cucascade_engine)
     source_info = plc.io.SourceInfo([ds])
     options = cached_info.default_reader_options(ds)
@@ -265,6 +270,7 @@ def _prune_row_groups_and_advise(
 
     reader = cached_info.hybrid_scan_reader(options)
 
+    row_group_count_before = len(row_group_indices)
     if stats_pruning:
         row_group_indices = reader.filter_row_groups_with_stats(
             row_group_indices, options, stream=stream
@@ -282,8 +288,10 @@ def _prune_row_groups_and_advise(
                 row_group_indices = reader.filter_row_groups_with_bloom_filters(
                     bloom_chunks, row_group_indices, options, stream=stream
                 )
+    t_pruned = time.monotonic_ns()
 
     fetch_ranges: list[plc.io.text.ByteRangeInfo] = []
+    fadvise_called = False
     if row_group_indices:
         fetch_ranges = (
             reader.all_column_chunks_byte_ranges(row_group_indices, options)
@@ -298,11 +306,65 @@ def _prune_row_groups_and_advise(
         # columns selected" otherwise), so unlike `fetch_ranges` it can't be
         # computed/fadvised this early.
         if hasattr(ds, "duplicate"):
+            fadvise_called = True
             ds.duplicate().fadvise([(r.offset, r.size) for r in fetch_ranges], -1)
+    t_advised = time.monotonic_ns()
+
+    log(
+        "hybrid_scan_prune_and_advise",
+        scope=Scope.FADVISE.value,
+        call_kind=call_kind,
+        path=paths[0],
+        pass_mode=pass_mode.value,
+        row_group_count_before=row_group_count_before,
+        row_group_count_after=len(row_group_indices),
+        fetch_range_count=len(fetch_ranges),
+        fetch_bytes=sum(r.size for r in fetch_ranges),
+        fadvise_called=fadvise_called,
+        prune_ns=t_pruned - t_start,
+        advise_ns=t_advised - t_pruned,
+        wall_clock_ns=t_start,
+    )
 
     return _PrunedHybridScanSplit(
         reader, options, ds, source_info, row_group_indices, fetch_ranges
     )
+
+
+def _timed_fetch_byte_ranges(
+    source_info: plc.io.SourceInfo,
+    ranges: list[plc.io.text.ByteRangeInfo],
+    stream: Stream,
+    *,
+    path: str,
+    phase: str,
+) -> list[Any]:
+    """`fetch_byte_ranges_to_device` wrapped with duration/byte-count logging.
+
+    This is the direct measure of whether cuCascade's prefetch cache is
+    actually paying off: a `fadvise`d, already-cached range should fetch much
+    faster than a cold one. cuCascade's Python bindings expose no cache
+    hit/miss counters, so fetch duration is the closest proxy we have.
+    """
+    t_start = time.monotonic_ns()
+    chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+        source_info,
+        ranges,
+        plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+        stream=stream,
+    )
+    t_end = time.monotonic_ns()
+    log(
+        "hybrid_scan_fetch",
+        scope=Scope.FADVISE.value,
+        path=path,
+        phase=phase,
+        range_count=len(ranges),
+        fetch_bytes=sum(r.size for r in ranges),
+        fetch_ns=t_end - t_start,
+        wall_clock_ns=t_start,
+    )
+    return chunks
 
 
 def _read_with_hybrid_scan(
@@ -359,11 +421,8 @@ def _read_with_hybrid_scan(
             )
 
         if pass_mode is HybridScanPassMode.SINGLE_PASS:
-            all_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-                source_info,
-                fetch_ranges,
-                plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
-                stream=stream,
+            all_chunks = _timed_fetch_byte_ranges(
+                source_info, fetch_ranges, stream, path=paths[0], phase="single_pass"
             )
             tbl_w_meta = reader.materialize_all_columns(
                 row_group_indices,
@@ -385,11 +444,8 @@ def _read_with_hybrid_scan(
         # the page index for all files, which may be too expensive.
         row_mask = reader.build_all_true_row_mask(row_group_indices, stream=stream)
 
-        filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-            source_info,
-            fetch_ranges,
-            plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
-            stream=stream,
+        filter_chunks = _timed_fetch_byte_ranges(
+            source_info, fetch_ranges, stream, path=paths[0], phase="two_pass_filter"
         )
         filter_tbl_w_meta = reader.materialize_filter_columns(
             row_group_indices,
@@ -418,11 +474,12 @@ def _read_with_hybrid_scan(
                 ds.duplicate().fadvise(
                     [(r.offset, r.size) for r in payload_ranges], -1
                 )
-            payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+            payload_chunks = _timed_fetch_byte_ranges(
                 source_info,
                 payload_ranges,
-                plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
-                stream=stream,
+                stream,
+                path=paths[0],
+                phase="two_pass_payload",
             )
             payload_tbl_w_meta = reader.materialize_payload_columns(
                 row_group_indices,
@@ -465,6 +522,7 @@ def _prune_row_groups_and_advise_multifile(
     *,
     stats_pruning: bool = True,
     cucascade_engine: object | None = None,
+    call_kind: str = "real",
 ) -> _PrunedHybridScanMultifileSplit:
     """
     Row-group prune a fused (multi-file) hybrid-scan split and fadvise its
@@ -477,9 +535,10 @@ def _prune_row_groups_and_advise_multifile(
     reads every requested column in one pass, honoring `options`' pushed-down
     filter during decode the same way cudf's regular parquet reader does), and
     it doesn't expose bloom-filter row-group pruning, so pruning here is
-    stats-only.
+    stats-only. `call_kind` ("prep" or "real") is purely a logging label.
     """
     assert len(paths) == len(cached_infos)
+    t_start = time.monotonic_ns()
     datasources = [info.datasource(cucascade_engine) for info in cached_infos]
     source_info = plc.io.SourceInfo(datasources)
     options = (
@@ -495,13 +554,16 @@ def _prune_row_groups_and_advise_multifile(
         [info.file_metadata for info in cached_infos], options
     )
 
+    row_group_count_before = sum(len(rg) for rg in row_group_indices)
     if stats_pruning:
         row_group_indices = reader.filter_row_groups_with_stats(
             row_group_indices, options, stream=stream
         )
+    t_pruned = time.monotonic_ns()
 
     all_ranges: list[plc.io.text.ByteRangeInfo] = []
     range_source_indices: list[int] = []
+    fadvise_source_count = 0
     if any(row_group_indices):
         all_ranges, range_source_indices = reader.all_column_chunks_byte_ranges(
             row_group_indices, options
@@ -515,7 +577,24 @@ def _prune_row_groups_and_advise_multifile(
         for src_idx, src_ranges in ranges_by_source.items():
             ds = datasources[src_idx]
             if hasattr(ds, "duplicate"):
+                fadvise_source_count += 1
                 ds.duplicate().fadvise(src_ranges, -1)
+    t_advised = time.monotonic_ns()
+
+    log(
+        "hybrid_scan_multifile_prune_and_advise",
+        scope=Scope.FADVISE.value,
+        call_kind=call_kind,
+        paths=paths,
+        row_group_count_before=row_group_count_before,
+        row_group_count_after=sum(len(rg) for rg in row_group_indices),
+        fetch_range_count=len(all_ranges),
+        fetch_bytes=sum(r.size for r in all_ranges),
+        fadvise_source_count=fadvise_source_count,
+        prune_ns=t_pruned - t_start,
+        advise_ns=t_advised - t_pruned,
+        wall_clock_ns=t_start,
+    )
 
     return _PrunedHybridScanMultifileSplit(
         reader, options, datasources, row_group_indices, all_ranges, range_source_indices
@@ -577,11 +656,12 @@ def _read_with_hybrid_scan_multifile(
         for src_idx, idxs in indices_by_source.items():
             src_source_info = plc.io.SourceInfo([datasources[src_idx]])
             src_ranges = [all_ranges[i] for i in idxs]
-            fetched = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+            fetched = _timed_fetch_byte_ranges(
                 src_source_info,
                 src_ranges,
-                plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
-                stream=stream,
+                stream,
+                path=paths[src_idx],
+                phase="multifile",
             )
             for i, chunk in zip(idxs, fetched, strict=True):
                 column_chunks[i] = chunk
@@ -839,6 +919,10 @@ class _ParquetScanPrep(NamedTuple):
     bounds: ParquetTaskBounds
     hybrid_scan_args: _HybridScanArgs | None
     hybrid_scan_multifile_args: _HybridScanMultifileArgs | None
+    # Why hybrid scan wasn't used, when both `hybrid_scan_args` fields are
+    # None. Diagnostic-only (see `Scope.FADVISE` logging in `do_evaluate`/
+    # `prefetch_advise`), not used for any control flow.
+    ineligible_reason: str | None
 
 
 class ParquetScanTask(IR):
@@ -952,6 +1036,7 @@ class ParquetScanTask(IR):
 
         hybrid_scan_args: _HybridScanArgs | None = None
         hybrid_scan_multifile_args: _HybridScanMultifileArgs | None = None
+        ineligible_reason: str | None = None
         # Hybrid scan reads through cached parquet metadata, so it is only used
         # when the metadata is available to this task. Single-file splits use
         # `HybridScanReader` (two-pass, filter/payload column split);
@@ -959,17 +1044,24 @@ class ParquetScanTask(IR):
         # stats-only row-group pruning -- see `_read_with_hybrid_scan_multifile`).
         # TODO: Investigate re-enabling for some of the excluded paths
         # (row_index / include_file_paths). Needs performance investigation.
-        if (
-            bounds.row_groups is not None
-            and len(bounds.row_groups) == len(paths)
-            and hybrid_scan_eligible(
-                parquet_options,
-                cached_parquet_info=cached_parquet_info,
-                row_index=base_scan.row_index,
-                include_file_paths=base_scan.include_file_paths,
-                predicate=base_scan.predicate,
-            )
+        if bounds.row_groups is None:
+            # Most commonly: this task's split count exceeds the file's row
+            # group count, so `SplitScan._parquet_task_bounds` couldn't give
+            # every split a distinct, non-empty set of whole row groups (the
+            # granularity `HybridScanReader` operates at) and fell back to a
+            # plain row-count split instead.
+            ineligible_reason = "bounds_row_groups_none"
+        elif len(bounds.row_groups) != len(paths):
+            ineligible_reason = "row_groups_path_count_mismatch"  # pragma: no cover
+        elif not hybrid_scan_eligible(
+            parquet_options,
+            cached_parquet_info=cached_parquet_info,
+            row_index=base_scan.row_index,
+            include_file_paths=base_scan.include_file_paths,
+            predicate=base_scan.predicate,
         ):
+            ineligible_reason = "not_hybrid_scan_eligible"
+        else:
             assert base_scan.predicate is not None
             assert cached_parquet_info is not None
             stream = context.get_cuda_stream()
@@ -982,41 +1074,46 @@ class ParquetScanTask(IR):
                 ),
                 stream=stream,
             )
-            if plc_filter is not None and residual is None:
-                if len(paths) == 1:
-                    if isinstance(base_task, SplitScan):
-                        split_index = base_task.split_index
-                        total_splits = base_task.total_splits
-                    else:
-                        split_index = 0
-                        total_splits = 1
-                    hybrid_scan_args = _HybridScanArgs(
-                        base_scan.schema,
-                        paths,
-                        base_scan.with_columns,
-                        plc_filter,
-                        bounds.row_groups[0],
-                        stream,
-                        cached_parquet_info[0],
-                        split_index,
-                        total_splits,
-                        parquet_options._hybrid_scan_stats_pruning,
-                        parquet_options.pass_mode,
-                    )
+            if plc_filter is None or residual is not None:
+                ineligible_reason = "filter_compile_failed"
+            elif len(paths) == 1:
+                if isinstance(base_task, SplitScan):
+                    split_index = base_task.split_index
+                    total_splits = base_task.total_splits
                 else:
-                    hybrid_scan_multifile_args = _HybridScanMultifileArgs(
-                        base_scan.schema,
-                        paths,
-                        base_scan.with_columns,
-                        plc_filter,
-                        bounds.row_groups,
-                        stream,
-                        cached_parquet_info,
-                        parquet_options._hybrid_scan_stats_pruning,
-                    )
+                    split_index = 0
+                    total_splits = 1
+                hybrid_scan_args = _HybridScanArgs(
+                    base_scan.schema,
+                    paths,
+                    base_scan.with_columns,
+                    plc_filter,
+                    bounds.row_groups[0],
+                    stream,
+                    cached_parquet_info[0],
+                    split_index,
+                    total_splits,
+                    parquet_options._hybrid_scan_stats_pruning,
+                    parquet_options.pass_mode,
+                )
+            else:
+                hybrid_scan_multifile_args = _HybridScanMultifileArgs(
+                    base_scan.schema,
+                    paths,
+                    base_scan.with_columns,
+                    plc_filter,
+                    bounds.row_groups,
+                    stream,
+                    cached_parquet_info,
+                    parquet_options._hybrid_scan_stats_pruning,
+                )
 
         return _ParquetScanPrep(
-            cached_parquet_info, bounds, hybrid_scan_args, hybrid_scan_multifile_args
+            cached_parquet_info,
+            bounds,
+            hybrid_scan_args,
+            hybrid_scan_multifile_args,
+            ineligible_reason,
         )
 
     @classmethod
@@ -1066,8 +1163,19 @@ class ParquetScanTask(IR):
                 f"SplitScan: {paths[0]} "
                 f"[{base_task.split_index + 1}/{base_task.total_splits}]"
             )
+            split_index, total_splits = base_task.split_index, base_task.total_splits
         else:
             nvtx_message = f"FusedScan: {', '.join(paths)}"
+            split_index, total_splits = 0, 1
+        log(
+            "hybrid_scan_not_used",
+            scope=Scope.FADVISE.value,
+            paths=paths,
+            task_type=type(base_task).__name__,
+            split_index=split_index,
+            total_splits=total_splits,
+            reason=prep.ineligible_reason,
+        )
         with nvtx_annotate_cudf_polars(message=nvtx_message):
             return Scan.do_evaluate(
                 base_scan.schema,
@@ -1098,6 +1206,7 @@ class ParquetScanTask(IR):
         `streaming/actor_graph/io.py`), and must not affect correctness or
         propagate an exception into that unrelated background task.
         """
+        t_start = time.monotonic_ns()
         try:
             prep = self._prepare(context=context)
             if prep.hybrid_scan_args is not None:
@@ -1112,6 +1221,7 @@ class ParquetScanTask(IR):
                     stats_pruning=args.stats_pruning,
                     pass_mode=args.pass_mode,
                     cucascade_engine=context.cucascade_engine,
+                    call_kind="prep",
                 )
             elif prep.hybrid_scan_multifile_args is not None:
                 margs = prep.hybrid_scan_multifile_args
@@ -1124,9 +1234,27 @@ class ParquetScanTask(IR):
                     margs.cached_infos,
                     stats_pruning=margs.stats_pruning,
                     cucascade_engine=context.cucascade_engine,
+                    call_kind="prep",
                 )
-        except Exception:  # pragma: no cover
-            pass
+            else:
+                log(
+                    "prefetch_advise_ineligible",
+                    scope=Scope.FADVISE.value,
+                    paths=self.paths,
+                    reason=prep.ineligible_reason,
+                )
+        except Exception as e:  # pragma: no cover
+            # Purely advisory: never let a prep failure propagate into this
+            # unrelated background task. Still log it -- a silent `except: pass`
+            # here would hide real bugs in the prep path from anyone trying to
+            # diagnose why readahead doesn't seem to be helping.
+            log(
+                "prefetch_advise_failed",
+                scope=Scope.FADVISE.value,
+                paths=self.paths,
+                error=repr(e),
+                elapsed_ns=time.monotonic_ns() - t_start,
+            )
 
 
 StreamingScanTask: TypeAlias = SplitScan | FusedScan | ParquetScanTask

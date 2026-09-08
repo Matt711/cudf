@@ -587,11 +587,23 @@ async def read_chunk(
 
 
 async def _prefetch_advise_best_effort(
-    task: StreamingScanTask, ir_context: IRExecutionContext
+    task: StreamingScanTask, ir_context: IRExecutionContext, *, kicked_off_ns: int
 ) -> None:
     """Best-effort fadvise readahead for an upcoming parquet split; never raises."""
     if isinstance(task, ParquetScanTask):
+        t_running = time.monotonic_ns()
         await ir_context.to_thread(task.prefetch_advise, context=ir_context)
+        t_done = time.monotonic_ns()
+        log(
+            "readahead_task",
+            scope=Scope.FADVISE.value,
+            paths=task.paths,
+            # Time between this coroutine being scheduled and actually getting
+            # a thread to run on -- if this is large, readahead tasks are
+            # queued behind other work and aren't getting genuine lead time.
+            scheduling_delay_ns=t_running - kicked_off_ns,
+            prefetch_advise_ns=t_done - t_running,
+        )
 
 
 @define_actor()
@@ -636,7 +648,11 @@ async def scan_node(
 
     def _kick_off_readahead(idx: int, seq: Sequence[StreamingScanTask]) -> None:
         if fadvise_readahead_depth > 0 and 0 <= idx < len(seq):
-            t = asyncio.create_task(_prefetch_advise_best_effort(seq[idx], ir_context))
+            t = asyncio.create_task(
+                _prefetch_advise_best_effort(
+                    seq[idx], ir_context, kicked_off_ns=time.monotonic_ns()
+                )
+            )
             readahead_tasks.add(t)
             t.add_done_callback(readahead_tasks.discard)
 

@@ -58,6 +58,7 @@ class Scope(enum.StrEnum):
     ACTOR = "actor"
     IO_TASK = "io_task"
     EVALUATE_IR_NODE = "evaluate_ir_node"
+    FADVISE = "fadvise"
 
 
 @functools.cache
