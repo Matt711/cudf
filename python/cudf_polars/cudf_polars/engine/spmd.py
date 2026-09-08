@@ -35,6 +35,7 @@ from rapidsmpf.streaming.core.context import Context
 import cudf_polars.quent
 import cudf_polars.quent._logging
 from cudf_polars.containers import DataFrame, DataType
+from cudf_polars.dsl.tracing import Scope, log
 from cudf_polars.engine import persisted_result, rank_local_store
 from cudf_polars.engine.core import (
     ClusterInfo,
@@ -547,6 +548,7 @@ class SPMDEngine(StreamingEngine):
         self._cucascade_engine = _make_cucascade_engine(
             resolve_cucascade_options(executor_options)
         )
+        exit_stack.callback(self._log_cucascade_cache_summary)
 
         # TODO: there's no reason our API needs a plain dict[str, Any] rather than
         # a typed config object here.
@@ -624,6 +626,23 @@ class SPMDEngine(StreamingEngine):
         if self._kvikio_monitor is not None:
             self._kvikio_monitor.stop()
             self._kvikio_monitor = None
+
+    def _log_cucascade_cache_summary(self) -> None:
+        """
+        Log the cuCascade ``RestEngine``'s cumulative cache read/hit/miss/
+        eviction counters (see ``CuCascadeOptions``), if one was constructed;
+        called from exit-stack at engine shutdown.
+
+        cuCascade's own logging is compiled out, so ``cache_summary()`` is
+        the only way to observe whether the prefetch cache is actually
+        recording hits, or whether it silently failed to initialize at all.
+        """
+        if self._cucascade_engine is not None:
+            log(
+                "cucascade_cache_summary",
+                scope=Scope.FADVISE.value,
+                summary=self._cucascade_engine.cache_summary(),  # type: ignore[attr-defined]
+            )
 
     def _cleanup_ctx(self) -> None:
         """
