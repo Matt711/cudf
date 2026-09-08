@@ -166,15 +166,19 @@ def evaluate_pipeline_spmd_mode(
         query_id=query_id,
         cucascade_engine=cucascade_engine,
     )
-    if cucascade_engine is not None:
+    if cucascade_engine is not None and hasattr(cucascade_engine, "cache_summary"):
         # Logged once per query (not just at engine shutdown) so it lands
         # inside whatever per-query trace-capture window a benchmark harness
         # uses -- a shutdown-time-only log can fire after harnesses have
         # already finalized that query's trace collection.
+        #
+        # `hasattr` guards against an installed `cucascade` package built
+        # before `cache_summary()` existed -- we don't control version parity
+        # between cudf-polars and whatever cuCascade build is installed.
         log(
             "cucascade_cache_summary",
             scope=Scope.FADVISE.value,
-            summary=cucascade_engine.cache_summary(),  # type: ignore[attr-defined]
+            summary=cucascade_engine.cache_summary(),
         )
     if quent_context is not None:
         assert config_options.executor.spmd_context.quent_logger is not None
@@ -281,31 +285,89 @@ def synchronize_quent_context(
     return cudf_polars.quent.QuentContext._deserialize(all_data[0])
 
 
+def _resolve_aws_credentials() -> tuple[str, str, str, str | None] | None:
+    """
+    Resolve AWS credentials (and region) via boto3's default credential chain.
+
+    Explicit ``AWS_ACCESS_KEY_ID``/``AWS_SECRET_ACCESS_KEY`` environment
+    variables are one source boto3 already checks, but so are IAM
+    instance-role credentials (the standard EC2 pattern -- no env vars at
+    all), ECS/EKS task roles, SSO, and ``~/.aws/credentials``. Reading only
+    the two env vars directly (the previous behavior) silently disabled
+    cuCascade on any instance authenticating a different way, with no
+    error -- it just meant ``RestEngine`` was never constructed and every
+    read fell back to plain kvikio.
+
+    Returns ``None`` if boto3 isn't installed or no credentials could be
+    resolved from any source. The region element may be ``None`` if boto3
+    couldn't resolve one either (caller falls back to a default).
+    """
+    try:
+        import boto3
+    except ImportError:
+        return None
+    session = boto3.Session()
+    creds = session.get_credentials()
+    if creds is None:
+        return None
+    frozen = creds.get_frozen_credentials()
+    if not frozen.access_key or not frozen.secret_key:
+        return None
+    return frozen.access_key, frozen.secret_key, frozen.token or "", session.region_name
+
+
 def _make_cucascade_engine(options: CuCascadeOptions) -> object | None:
     """
-    Construct a cuCascade ``RestEngine`` from AWS environment variables and
+    Construct a cuCascade ``RestEngine`` from resolved AWS credentials and
     ``options``.
 
-    Returns ``None`` (rather than raising) when the ``cucascade`` package isn't
-    installed, or when AWS credentials aren't configured, so cuCascade remains
-    an optional dependency: engines/workloads that never touch a remote
-    (S3/HTTP) parquet path work identically whether or not it's present.
+    Returns ``None`` when the ``cucascade`` package isn't installed, or when
+    AWS credentials aren't configured, so cuCascade remains an optional
+    dependency by default: engines/workloads that never touch a remote
+    (S3/HTTP) parquet path work identically whether or not it's present. Set
+    ``options.required`` to raise a ``RuntimeError`` on any such failure
+    instead of silently falling back -- see ``CuCascadeOptions.required``.
+
+    Credentials from short-lived sources (IAM instance role, SSO, etc.) are
+    resolved once, at engine construction time, and used for the engine's
+    entire lifetime -- see ``RestEngine``'s own docstring on reconstructing
+    before a short-lived token expires. Not handled here since a single
+    engine's lifetime is expected to stay well under typical credential TTLs.
     """
     try:
         import cucascade
-    except ImportError:
+    except ImportError as e:
+        if options.required:
+            raise RuntimeError(
+                "cucascade_options.required is True, but the `cucascade` "
+                "package isn't installed. Install cuCascade's Python "
+                "bindings, or set required=False to allow falling back to "
+                "plain kvikio for remote reads."
+            ) from e
         return None
 
-    access_key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
-    secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-    if not access_key_id or not secret_access_key:
+    resolved = _resolve_aws_credentials()
+    if resolved is None:
+        if options.required:
+            raise RuntimeError(
+                "cucascade_options.required is True, but no AWS credentials "
+                "could be resolved (checked explicit AWS_* environment "
+                "variables, IAM instance role, and every other source in "
+                "boto3's default credential chain). RestEngine cannot be "
+                "constructed without credentials; set required=False to "
+                "allow falling back to plain kvikio for remote reads."
+            )
         # `RestEngine` requires non-empty credentials at construction time, so
         # there's no point constructing one at all without them -- this is the
         # common case for engines that never touch a remote path.
         return None
+    access_key_id, secret_access_key, session_token, resolved_region = resolved
 
-    region = os.environ.get(
-        "AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    region = (
+        os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or resolved_region
+        or "us-east-1"
     )
     # `RestEngine` requires a non-empty endpoint (it doesn't infer one the way
     # boto3/the AWS CLI do). Respect an explicit override for S3-compatible/
@@ -319,7 +381,7 @@ def _make_cucascade_engine(options: CuCascadeOptions) -> object | None:
         return cucascade.RestEngine(
             access_key_id=access_key_id,
             secret_access_key=secret_access_key,
-            session_token=os.environ.get("AWS_SESSION_TOKEN", ""),
+            session_token=session_token,
             region=region,
             endpoint=endpoint,
             n_reactors=options.n_reactors,
@@ -331,7 +393,16 @@ def _make_cucascade_engine(options: CuCascadeOptions) -> object | None:
             max_n_chunks=options.max_n_chunks,
             enable_cache=options.enable_cache,
         )
-    except Exception:
+    except Exception as e:
+        if options.required:
+            raise RuntimeError(
+                "cucascade_options.required is True, but RestEngine "
+                "construction raised (bad endpoint, pool_capacity too small "
+                "for max_n_chunks/block_size, etc.); see the chained "
+                "exception for the underlying cuCascade error. Set "
+                "required=False to allow falling back to plain kvikio for "
+                "remote reads."
+            ) from e
         # Don't let a misconfigured cuCascade environment (bad endpoint, etc.)
         # take down engine construction; fall back to no cuCascade support.
         return None
@@ -647,11 +718,13 @@ class SPMDEngine(StreamingEngine):
         the only way to observe whether the prefetch cache is actually
         recording hits, or whether it silently failed to initialize at all.
         """
-        if self._cucascade_engine is not None:
+        if self._cucascade_engine is not None and hasattr(
+            self._cucascade_engine, "cache_summary"
+        ):
             log(
                 "cucascade_cache_summary",
                 scope=Scope.FADVISE.value,
-                summary=self._cucascade_engine.cache_summary(),  # type: ignore[attr-defined]
+                summary=self._cucascade_engine.cache_summary(),
             )
 
     def _cleanup_ctx(self) -> None:

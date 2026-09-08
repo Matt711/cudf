@@ -694,6 +694,7 @@ def test_cucascade_options_default() -> None:
     assert options.chunk_size == 8_388_608
     assert options.max_n_chunks == 16
     assert options.enable_cache is True
+    assert options.required is False
 
     assert resolve_cucascade_options({}) == options
 
@@ -708,6 +709,7 @@ def test_cucascade_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__CHUNK_SIZE", "300")
         m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__MAX_N_CHUNKS", "8")
         m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__ENABLE_CACHE", "0")
+        m.setenv("CUDF_POLARS__CUCASCADE_OPTIONS__REQUIRED", "1")
 
         options = CuCascadeOptions()
         assert options.n_reactors == 8
@@ -718,6 +720,7 @@ def test_cucascade_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         assert options.chunk_size == 300
         assert options.max_n_chunks == 8
         assert options.enable_cache is False
+        assert options.required is True
 
 
 def test_cucascade_options_executor_option_override() -> None:
@@ -744,6 +747,7 @@ def test_cucascade_options_executor_option_override() -> None:
         "chunk_size",
         "max_n_chunks",
         "enable_cache",
+        "required",
     ],
 )
 def test_validate_cucascade_options(option: str) -> None:

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import uuid
 from itertools import pairwise
 from pathlib import Path
@@ -27,12 +28,13 @@ from cudf_polars.engine.hardware_binding import HardwareBindingPolicy
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.engine.spmd import (
     SPMDEngine,
+    _make_cucascade_engine,
     allgather_polars_dataframe,
 )
 from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 from cudf_polars.testing.io import make_partitioned_source
-from cudf_polars.utils.config import MemoryResourceConfig
+from cudf_polars.utils.config import CuCascadeOptions, MemoryResourceConfig
 
 if TYPE_CHECKING:
     from rapidsmpf.communicator.communicator import Communicator
@@ -890,3 +892,34 @@ def test_memory_error_hint(spmd_engine: SPMDEngine) -> None:
             pytest.raises(MemoryError, match="target_partition_size"),
         ):
             q.collect(engine=spmd_engine)
+
+
+def test_make_cucascade_engine_required_raises_when_package_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`required=True` raises rather than silently returning None when the
+    `cucascade` package isn't importable."""
+    monkeypatch.setitem(sys.modules, "cucascade", None)
+    with pytest.raises(RuntimeError, match="cucascade` package isn't installed"):
+        _make_cucascade_engine(CuCascadeOptions(required=True))
+
+
+def test_make_cucascade_engine_not_required_returns_none_when_package_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`required=False` (the default) silently returns None on the same failure."""
+    monkeypatch.setitem(sys.modules, "cucascade", None)
+    assert _make_cucascade_engine(CuCascadeOptions(required=False)) is None
+
+
+def test_make_cucascade_engine_required_raises_when_no_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`required=True` raises rather than silently returning None when no AWS
+    credentials can be resolved."""
+    pytest.importorskip("cucascade")
+    monkeypatch.setattr(
+        "cudf_polars.engine.spmd._resolve_aws_credentials", lambda: None
+    )
+    with pytest.raises(RuntimeError, match="no AWS credentials could be resolved"):
+        _make_cucascade_engine(CuCascadeOptions(required=True))

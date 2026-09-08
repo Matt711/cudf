@@ -361,6 +361,21 @@ class CuCascadeOptions:
         Whether to enable cuCascade's prefetch cache. Disabling this makes
         ``fadvise`` a no-op; reads still happen, just synchronously on
         demand instead of prefetched ahead of time.
+    required
+        Whether ``RestEngine`` construction must succeed. When ``False``
+        (default), any failure to construct it -- ``cucascade`` not
+        installed, no AWS credentials resolvable, or the constructor itself
+        raising -- silently falls back to no cuCascade support: remote reads
+        still work, just through plain kvikio, with no ``fadvise``/prefetch.
+        That fallback is silent by design (so cuCascade stays a fully
+        optional dependency), which also means a genuine misconfiguration
+        (e.g. no AWS credentials resolvable in the environment) produces no
+        error at all, just a slower run with no explanation why -- exactly
+        what happened for an entire benchmarking investigation before this
+        flag existed. Set ``True`` to turn that same failure into a raised
+        ``RuntimeError`` at engine construction time instead, once you
+        already know the workload needs cuCascade and want a hard failure
+        rather than a silent, unexplained fallback.
     """
 
     _env_prefix = "CUDF_POLARS__CUCASCADE_OPTIONS"
@@ -405,6 +420,11 @@ class CuCascadeOptions:
             f"{_env_prefix}__ENABLE_CACHE", _bool_converter, default=True
         )
     )
+    required: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__REQUIRED", _bool_converter, default=False
+        )
+    )
 
     @classmethod
     def from_config(
@@ -434,6 +454,8 @@ class CuCascadeOptions:
                 raise ValueError(f"{name} must be a positive int")
         if not isinstance(self.enable_cache, bool):
             raise TypeError("enable_cache must be a bool")
+        if not isinstance(self.required, bool):
+            raise TypeError("required must be a bool")
 
 
 def resolve_cucascade_options(executor_options: dict[str, Any]) -> CuCascadeOptions:
