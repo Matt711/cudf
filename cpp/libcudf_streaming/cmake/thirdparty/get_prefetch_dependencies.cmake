@@ -5,6 +5,9 @@
 # No Sirius or cuCascade network checkout is required; sources are vendored.
 
 function(find_and_configure_prefetch_dependencies)
+  # KvikIO (for cuFile/GDS and remote I/O backends)
+  find_package(kvikio REQUIRED)
+
   # libcurl (for REST/S3 I/O)
   find_package(CURL REQUIRED)
 
