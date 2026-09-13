@@ -1,0 +1,184 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include "fixed_size_host_memory_resource.hpp"
+
+#include <cuda/memory_resource>
+#include <cuda/stream>
+#include <cuda_runtime_api.h>
+
+#include <array>
+#include <cstddef>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+namespace cudf_streaming {
+namespace prefetch {
+namespace memory {
+
+/**
+ * @brief A small slab allocator backed by fixed_size_host_memory_resource.
+ *
+ * Manages three pools of pinned host memory: 512 B, 1 KB, and 2 KB.
+ * Each pool is populated on demand by acquiring one upstream block from the
+ * provided fixed_size_host_memory_resource and carving it into slabs of the
+ * appropriate size.
+ *
+ * Satisfies the ::cuda::mr::device_accessible and ::cuda::mr::host_accessible
+ * properties, making it compatible with rmm::host_device_async_resource_ref
+ * and suitable for use as cuDF's default pinned memory resource.
+ *
+ * Typical use:
+ * @code
+ *   small_pinned_host_memory_resource slab_mr(host_fixed_mr);
+ *   cudf::set_pinned_memory_resource(slab_mr);
+ *   cudf::set_allocate_host_as_pinned_threshold(
+ *       small_pinned_host_memory_resource::MAX_SLAB_SIZE);
+ * @endcode
+ *
+ * This eliminates the pageable H2D transfers that cuDF would otherwise issue
+ * when building column_device_view metadata arrays for cudf::concatenate.
+ */
+class small_pinned_host_memory_resource {
+ public:
+  /// Maximum allocation size handled by the slab pools.
+  /// Requests larger than this use pageable memory.
+  static constexpr std::size_t MAX_SLAB_SIZE = 8192;
+
+  /**
+   * @brief Construct with the upstream fixed-size host memory resource.
+   *
+   * @param upstream Block allocator backed by pinned host memory. Must outlive
+   *                 this object.
+   */
+  explicit small_pinned_host_memory_resource(fixed_size_host_memory_resource& upstream);
+
+  small_pinned_host_memory_resource(const small_pinned_host_memory_resource&)            = delete;
+  small_pinned_host_memory_resource& operator=(const small_pinned_host_memory_resource&) = delete;
+  small_pinned_host_memory_resource(small_pinned_host_memory_resource&&)                 = delete;
+  small_pinned_host_memory_resource& operator=(small_pinned_host_memory_resource&&)      = delete;
+
+  ~small_pinned_host_memory_resource();
+
+  /**
+   * @brief Allocate pinned memory.
+   *
+   * For @p bytes <= MAX_SLAB_SIZE: rounds up to the next slab boundary
+   * (512 / 1 KB / 2 KB / 4 KB / 8 KB) and returns a pointer from the matching
+   * free list, expanding the pool from upstream if the list is empty.
+   *
+   * For @p bytes > MAX_SLAB_SIZE: falls back to cudaMallocHost (pinned).
+   */
+  void* allocate(::cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t));
+
+  /**
+   * @brief Return memory to the appropriate pool.
+   *
+   * Slabs (@p bytes <= MAX_SLAB_SIZE) are returned to the free list.
+   * Pinned allocations (@p bytes > MAX_SLAB_SIZE) are freed via cudaFreeHost.
+   * @p bytes must equal the value passed to the corresponding allocate.
+   */
+  void deallocate(::cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept;
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    auto* ptr = allocate(::cuda::stream_ref{cudaStream_t{nullptr}}, bytes, alignment);
+    cudaStreamSynchronize(cudaStreamDefault);
+    return ptr;
+  }
+
+  void deallocate_sync(void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    deallocate(::cuda::stream_ref{cudaStream_t{nullptr}}, ptr, bytes, alignment);
+    cudaStreamSynchronize(cudaStreamDefault);
+  }
+
+  bool operator==(small_pinned_host_memory_resource const& other) const noexcept;
+
+  /**
+   * @brief Declares that memory allocated here is accessible from GPU devices.
+   * Required to satisfy rmm::host_device_async_resource_ref.
+   */
+  friend void get_property(small_pinned_host_memory_resource const&,
+                           ::cuda::mr::device_accessible) noexcept
+  {
+  }
+
+  /**
+   * @brief Declares that memory allocated here is accessible from the host.
+   * Required to satisfy rmm::host_device_async_resource_ref.
+   */
+  friend void get_property(small_pinned_host_memory_resource const&,
+                           ::cuda::mr::host_accessible) noexcept
+  {
+  }
+
+  /// Slab sizes in ascending order.
+  static constexpr std::array<std::size_t, 5> SLAB_SIZES{512, 1024, 2048, 4096, 8192};
+
+  /// Returns the index into SLAB_SIZES of the smallest slab >= bytes.
+  static std::size_t slab_index_for(std::size_t bytes) noexcept;
+
+  /// Populate the free list for slab @p idx by acquiring one upstream block.
+  /// Must be called with mutex_ held.
+  void expand_pool_locked(std::size_t slab_idx);
+
+  /// A free slab plus, when it was just deallocated, a CUDA event recorded on
+  /// the freeing stream. Reusing the slab must wait on this event so an
+  /// in-flight async H2D copy that still reads the slab (e.g. cuDF's parquet
+  /// stats min/max buffers) completes before another stream overwrites it.
+  /// @c ready_event is null for freshly-carved slabs that were never used, and
+  /// for slabs whose freeing stream was synchronized outright (see deallocate).
+  ///
+  /// @c event_device records the device the event belongs to. A CUDA event is
+  /// bound to the device that was current when it was created, and
+  /// cudaEventRecord rejects an event/stream pair from different devices with
+  /// cudaErrorInvalidResourceHandle. This resource is shared by every GPU in a
+  /// NUMA domain, so events must be pooled per device rather than globally.
+  struct free_slab {
+    void* ptr;
+    cudaEvent_t ready_event;
+    int event_device;
+  };
+
+  /// The device @p stream belongs to, or the current device if that cannot be
+  /// determined. Events must be created on, and recorded against, this device.
+  static int device_of_stream(::cuda::stream_ref stream) noexcept;
+
+  /// Borrow a timing-disabled CUDA event owned by @p device (recycled from that
+  /// device's pool, or newly created with @p device current). Returns null if
+  /// event creation fails. Must hold @c mutex_.
+  cudaEvent_t acquire_event_locked(int device);
+
+  /// Return an event to @p device's pool for reuse, or destroy it if caching
+  /// would allocate and fail. Must hold @c mutex_.
+  void release_event_locked(cudaEvent_t event, int device) noexcept;
+
+  fixed_size_host_memory_resource& upstream_;
+  mutable std::mutex mutex_;
+  std::array<std::vector<free_slab>, 5> free_lists_{};
+  /// Idle events keyed by the device they were created on.
+  std::unordered_map<int, std::vector<cudaEvent_t>> event_pool_;
+  std::vector<fixed_multiple_blocks_allocation> owned_allocations_;
+  /// A failed synchronization quarantines a slab and prevents its backing block
+  /// from being returned upstream during destruction.
+  bool has_quarantined_slab_{false};
+};
+
+static_assert(::cuda::mr::resource_with<small_pinned_host_memory_resource,
+                                        ::cuda::mr::device_accessible,
+                                        ::cuda::mr::host_accessible>);
+
+}  // namespace memory
+}  // namespace prefetch
+}  // namespace cudf_streaming

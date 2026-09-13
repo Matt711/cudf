@@ -1,0 +1,410 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+/*
+ * Copyright 2025, NVIDIA CORPORATION & AFFILIATES.
+ * (Ported from cuCascade, commit 1b0e7b6c28dafa43bfe2c48011a3657c0dd6f127)
+ */
+
+#include "common.hpp"
+#include "disk_access_limiter.hpp"
+#include "fixed_size_host_memory_resource.hpp"
+#include "memory_reservation.hpp"
+#include "memory_space.hpp"
+#include "null_device_memory_resource.hpp"
+#include "reservation_aware_resource_adaptor.hpp"
+
+#include "../utils/overloaded.hpp"
+
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream_pool.hpp>
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
+
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <variant>
+
+namespace cudf_streaming {
+namespace prefetch {
+namespace memory {
+
+namespace {
+
+class fixed_size_host_resource_ref {
+ public:
+  explicit fixed_size_host_resource_ref(fixed_size_host_memory_resource& resource)
+    : resource_(&resource)
+  {
+  }
+
+  void* allocate(::cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t))
+  {
+    return resource_->allocate(stream, bytes, alignment);
+  }
+
+  void deallocate(::cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    resource_->deallocate(stream, ptr, bytes, alignment);
+  }
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    return resource_->allocate_sync(bytes, alignment);
+  }
+
+  void deallocate_sync(void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    resource_->deallocate_sync(ptr, bytes, alignment);
+  }
+
+  bool operator==(fixed_size_host_resource_ref const& other) const noexcept
+  {
+    return resource_ == other.resource_;
+  }
+
+  friend void get_property(fixed_size_host_resource_ref const&,
+                           ::cuda::mr::device_accessible) noexcept
+  {
+  }
+
+ private:
+  fixed_size_host_memory_resource* resource_;
+};
+
+}  // namespace
+
+//===----------------------------------------------------------------------===//
+// memory_space Implementation
+//===----------------------------------------------------------------------===//
+
+memory_space::memory_space(const gpu_memory_space_config& config)
+  : _id(config.tier(), config.device_id),
+    _capacity(config.memory_capacity),
+    _memory_limit(config.reservation_limit()),
+    _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
+    _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
+    _stream_pool{[&]() -> std::unique_ptr<rmm::cuda_stream_pool> {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id(config.device_id)};
+      return std::make_unique<rmm::cuda_stream_pool>(16, rmm::cuda_stream::flags::non_blocking);
+    }()}
+{
+  if (config.mr_factory_fn) {
+    _allocator = config.mr_factory_fn(config.device_id, config.memory_capacity);
+  } else {
+    rmm::cuda_set_device_raii set_device(rmm::cuda_device_id{config.device_id});
+    _allocator = ::cuda::mr::any_resource<::cuda::mr::device_accessible>(
+      rmm::mr::cuda_async_memory_resource(config.memory_capacity));
+  }
+
+  _reservation_allocator = std::make_unique<reservation_aware_resource_adaptor>(
+    _id,
+    rmm::device_async_resource_ref(_allocator),
+    _memory_limit,
+    _capacity,
+    nullptr,
+    nullptr,
+    config.per_stream_reservation
+      ? reservation_aware_resource_adaptor::AllocationTrackingScope::PER_STREAM
+      : reservation_aware_resource_adaptor::AllocationTrackingScope::PER_THREAD);
+}
+
+memory_space::memory_space(const host_memory_space_config& config)
+  : _id(config.tier(), config.numa_id),
+    _capacity(config.memory_capacity),
+    _memory_limit(config.reservation_limit()),
+    _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
+    _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
+    _allocator(config.mr_factory_fn
+                 ? config.mr_factory_fn(config.numa_id, config.memory_capacity)
+                 : make_default_host_memory_resource(
+                     config.numa_id, config.memory_capacity, config.make_portable))
+{
+  _reservation_allocator =
+    std::make_unique<fixed_size_host_memory_resource>(_id.device_id,
+                                                      rmm::device_async_resource_ref(_allocator),
+                                                      _memory_limit,
+                                                      _capacity,
+                                                      config.block_size,
+                                                      config.pool_size,
+                                                      config.initial_number_pools);
+  auto& host_allocator =
+    std::get<std::unique_ptr<fixed_size_host_memory_resource>>(_reservation_allocator);
+  _reservation_allocator_resource.emplace(fixed_size_host_resource_ref{*host_allocator});
+  register_host_pool(config.numa_id, host_allocator.get());
+}
+
+memory_space::memory_space(const disk_memory_space_config& config)
+  : _id(config.tier(), config.disk_id),
+    _capacity(config.memory_capacity),
+    _memory_limit(config.reservation_limit()),
+    _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
+    _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
+    _allocator(null_device_memory_resource{})
+{
+  throw std::runtime_error(
+    "cudf_streaming: DISK memory tier is not supported in this build. "
+    "Rebuild with CUDF_STREAMING_HAS_DISK=ON to enable disk I/O support.");
+}
+
+memory_space::memory_space(const disk_memory_space_config& config,
+                           std::shared_ptr<idisk_io_backend> /*io_backend*/)
+  : _id(config.tier(), config.disk_id),
+    _capacity(config.memory_capacity),
+    _memory_limit(config.reservation_limit()),
+    _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
+    _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
+    _allocator(null_device_memory_resource{})
+{
+  throw std::runtime_error(
+    "cudf_streaming: DISK memory tier is not supported in this build. "
+    "Rebuild with CUDF_STREAMING_HAS_DISK=ON to enable disk I/O support.");
+}
+
+memory_space::~memory_space()
+{
+  if (_id.tier == Tier::HOST) {
+    if (auto* host_alloc =
+          std::get_if<std::unique_ptr<fixed_size_host_memory_resource>>(&_reservation_allocator)) {
+      unregister_host_pool(_id.device_id, host_alloc->get());
+    }
+  }
+}
+
+bool memory_space::operator==(const memory_space& other) const { return _id == other.get_id(); }
+
+bool memory_space::operator!=(const memory_space& other) const { return !(*this == other); }
+
+memory_space_id memory_space::get_id() const noexcept { return _id; }
+
+Tier memory_space::get_tier() const noexcept { return _id.tier; }
+
+int memory_space::get_device_id() const noexcept { return _id.device_id; }
+
+std::unique_ptr<reservation> memory_space::make_reservation_or_null(size_t size)
+{
+  std::unique_ptr<reserved_arena> arena =
+    std::visit(utils::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
+                                   return mr->reserve(size, _notification_channel->get_notifier());
+                                 },
+                                 [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                                   return mr->reserve(size, _notification_channel->get_notifier());
+                                 },
+                                 [&](std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                                   return mr->reserve(size, _notification_channel->get_notifier());
+                                 }},
+               _reservation_allocator);
+  if (arena == nullptr) return nullptr;
+  return reservation::create(*this, std::move(arena));
+}
+
+std::unique_ptr<reservation> memory_space::make_reservation_upto(size_t size)
+{
+  std::unique_ptr<reserved_arena> arena = std::visit(
+    utils::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
+                        return mr->reserve_upto(size, _notification_channel->get_notifier());
+                      },
+                      [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                        return mr->reserve_upto(size, _notification_channel->get_notifier());
+                      },
+                      [&](std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                        return mr->reserve_upto(size, _notification_channel->get_notifier());
+                      }},
+    _reservation_allocator);
+  return reservation::create(*this, std::move(arena));
+}
+
+std::unique_ptr<reservation> memory_space::make_reservation(size_t size)
+{
+  std::unique_ptr<reservation> res = make_reservation_or_null(size);
+  while (!res) {
+    auto status = _notification_channel->wait();
+    if (status == notification_channel::wait_status::SHUTDOWN) { return nullptr; }
+    if (status == notification_channel::wait_status::IDLE) { return make_reservation_upto(size); }
+    res = make_reservation_or_null(size);
+  }
+  return res;
+}
+
+rmm::cuda_stream_view memory_space::acquire_stream() const
+{
+  if (!_stream_pool) {
+    throw std::runtime_error("Stream pool is not available for non-GPU memory spaces");
+  }
+  return _stream_pool->get_stream();
+}
+
+std::size_t memory_space::get_active_reservation_count() const
+{
+  return std::visit(
+    utils::overloaded{[&](const std::unique_ptr<disk_access_limiter>& mr) {
+                        return mr->get_active_reservation_count();
+                      },
+                      [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                        return mr->get_active_reservation_count();
+                      },
+                      [&](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                        return mr->get_active_reservation_count();
+                      }},
+    _reservation_allocator);
+}
+
+bool memory_space::should_downgrade_memory() const
+{
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return false; }
+  return _memory_limit - available_memory >= _start_downgrading_memory_threshold;
+}
+
+bool memory_space::should_stop_downgrading_memory() const
+{
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return true; }
+  return _memory_limit - available_memory <= _stop_downgrading_memory_threshold;
+}
+
+size_t memory_space::get_amount_to_downgrade() const
+{
+  auto available_memory = get_available_memory();
+  if (available_memory >= _memory_limit) { return 0; }
+  size_t consumed = _memory_limit - available_memory;
+  if (consumed <= _stop_downgrading_memory_threshold) { return 0; }
+  return consumed - _stop_downgrading_memory_threshold;
+}
+
+size_t memory_space::get_available_memory(rmm::cuda_stream_view stream) const
+{
+  return std::visit(
+    utils::overloaded{
+      [&](const std::unique_ptr<disk_access_limiter>& mr) { return mr->get_available_memory(); },
+      [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+        return mr->get_available_memory(stream);
+      },
+      [&](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+        return mr->get_available_memory();
+      }},
+    _reservation_allocator);
+}
+
+size_t memory_space::get_available_memory() const
+{
+  return std::visit(
+    utils::overloaded{
+      [&](const std::unique_ptr<disk_access_limiter>& mr) { return mr->get_available_memory(); },
+      [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+        return mr->get_available_memory();
+      },
+      [](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+        return mr->get_available_memory();
+      }},
+    _reservation_allocator);
+}
+
+size_t memory_space::get_total_reserved_memory() const
+{
+  return std::visit(
+    utils::overloaded{[&](const std::unique_ptr<disk_access_limiter>& mr) {
+                        return mr->get_total_reserved_bytes();
+                      },
+                      [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                        return mr->get_total_reserved_bytes();
+                      },
+                      [](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                        return mr->get_total_reserved_bytes();
+                      }},
+    _reservation_allocator);
+}
+
+size_t memory_space::get_max_memory() const noexcept { return _memory_limit; }
+
+rmm::device_async_resource_ref memory_space::get_default_allocator() const noexcept
+{
+  return std::visit(
+    utils::overloaded{
+      [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+        return rmm::device_async_resource_ref{
+          const_cast<reservation_aware_resource_adaptor&>(*mr)};
+      },
+      [&](const std::unique_ptr<fixed_size_host_memory_resource>&) {
+        return rmm::device_async_resource_ref{
+          const_cast<::cuda::mr::any_resource<::cuda::mr::device_accessible>&>(
+            *_reservation_allocator_resource)};
+      },
+      [&](const std::unique_ptr<disk_access_limiter>&) {
+        return rmm::device_async_resource_ref{
+          const_cast<::cuda::mr::any_resource<::cuda::mr::device_accessible>&>(_allocator)};
+      }},
+    _reservation_allocator);
+}
+
+const chunked_resource_info* memory_space::get_chunked_resource_info() const noexcept
+{
+  const chunked_resource_info* result = nullptr;
+  std::visit(
+    [&result](const auto& ptr) {
+      using held_type = std::remove_reference_t<decltype(*ptr)>;
+      if constexpr (std::is_base_of_v<chunked_resource_info, held_type>) {
+        if (ptr != nullptr) { result = static_cast<const chunked_resource_info*>(ptr.get()); }
+      }
+    },
+    _reservation_allocator);
+  return result;
+}
+
+std::string_view memory_space::get_disk_mount_path() const
+{
+  if (_id.tier != Tier::DISK) {
+    throw std::logic_error("get_disk_mount_path called on non-DISK memory space");
+  }
+  auto& limiter = std::get<std::unique_ptr<disk_access_limiter>>(_reservation_allocator);
+  return limiter->get_mount_path();
+}
+
+idisk_io_backend& memory_space::get_io_backend() const
+{
+  if (_id.tier != Tier::DISK) {
+    throw std::logic_error("get_io_backend called on non-DISK memory space");
+  }
+  return *_io_backend;
+}
+
+std::string memory_space::to_string() const
+{
+  std::ostringstream oss;
+  oss << "memory_space(tier=";
+  switch (_id.tier) {
+    case Tier::GPU: oss << "GPU"; break;
+    case Tier::HOST: oss << "HOST"; break;
+    case Tier::DISK: oss << "DISK"; break;
+    default: oss << "UNKNOWN"; break;
+  }
+  oss << ", device_id=" << _id.device_id << ", limit=" << _memory_limit << ")";
+  return oss.str();
+}
+
+void memory_space::shutdown()
+{
+  if (_notification_channel) { _notification_channel->shutdown(); }
+}
+
+//===----------------------------------------------------------------------===//
+// memory_space_hash Implementation
+//===----------------------------------------------------------------------===//
+
+size_t memory_space_hash::operator()(const memory_space& ms) const
+{
+  return std::hash<int>{}(static_cast<int>(ms.get_tier())) ^
+         (std::hash<size_t>{}(static_cast<size_t>(ms.get_device_id())) << 1);
+}
+
+}  // namespace memory
+}  // namespace prefetch
+}  // namespace cudf_streaming

@@ -153,6 +153,7 @@ class IRExecutionContext:
     query_id: uuid.UUID = field(default_factory=uuid.uuid4)
     quent_ir_execution_context: QuentIRExecutionContext | None = None
     tracer: ActorTracer | None = None
+    cucascade_engine: object | None = None
 
     async def to_thread(
         self, func: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs

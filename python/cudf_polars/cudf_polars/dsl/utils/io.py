@@ -17,6 +17,25 @@ from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.io import Scan, StreamingScan
 
+
+def resolve_datasource(
+    path: str, size: int | None, cucascade_engine: object | None
+) -> plc.io.types.Datasource:
+    """
+    Resolve a parquet path to a ``Datasource``, using cuCascade/Sirius for remote paths.
+
+    Remote (S3/HTTP) paths are opened through ``cucascade_engine`` (a
+    ``cucascade.RestEngine`` or ``SiriusAdapter``) when one is available, so
+    downstream reads can use ``.duplicate()``/``.fadvise()`` for prefetching.
+    Local paths, and remote paths when no engine is configured, fall back to a
+    plain ``FilepathSource``.
+    """
+    if cucascade_engine is not None and plc.io.SourceInfo._is_remote_uri(path):
+        if size is not None:
+            return cucascade_engine.open(path, size)  # type: ignore[attr-defined, no-any-return]
+        return cucascade_engine.open(path)  # type: ignore[attr-defined, no-any-return]
+    return plc.io.types.FilepathSource(path, size)
+
 if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IR
     from cudf_polars.streaming.base import StatsCollector
@@ -56,6 +75,12 @@ class CachedParquetInfo:
     _hybrid_scan_metadata: plc.io.experimental.HybridScanMetadata | None = field(
         default=None, init=False, compare=False, repr=False
     )
+    # Canonical open datasource for this file, resolved lazily through
+    # resolve_datasource() on first use and reused across all splits so that
+    # every split of the same file shares a single cuCascade/Sirius handle.
+    _datasource: plc.io.types.Datasource | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         if self.parse_hybrid_metadata:
@@ -80,11 +105,38 @@ class CachedParquetInfo:
             object.__setattr__(self, "_hybrid_scan_metadata", metadata)
         return plc.io.experimental.HybridScanReader.from_metadata(metadata)
 
-    def default_reader_options(self) -> plc.io.parquet.ParquetReaderOptions:
-        """Return baseline ``ParquetReaderOptions`` for this cached parquet file."""
+    def datasource(self, cucascade_engine: object | None) -> plc.io.types.Datasource:
+        """Return the canonical datasource for this file, resolving it if needed.
+
+        When a cuCascade/Sirius engine is active and the path is a remote URI,
+        the datasource is a cuCascade handle; otherwise a plain FilepathSource.
+        The result is cached so all splits of the same file share one handle.
+        NOTE: intentionally does not cache when called without an engine (e.g.
+        from __post_init__) so the engine-backed path is not replaced by a plain
+        FilepathSource before the real caller has a chance to provide an engine.
+        """
+        ds = self._datasource
+        if ds is None:
+            ds = resolve_datasource(self.path, self.size, cucascade_engine)
+            object.__setattr__(self, "_datasource", ds)
+        return ds
+
+    def default_reader_options(
+        self, datasource: plc.io.types.Datasource | None = None
+    ) -> plc.io.parquet.ParquetReaderOptions:
+        """Return baseline ``ParquetReaderOptions`` for this cached parquet file.
+
+        When ``datasource`` is provided (e.g. a cuCascade/Sirius handle), it is
+        used in the SourceInfo instead of constructing a fresh FilepathSource.
+        Pass ``None`` (the default) during metadata-only operations such as the
+        ``__post_init__`` hybrid-metadata parse, where no engine is yet known.
+        """
+        ds = datasource if datasource is not None else plc.io.types.FilepathSource(
+            self.path, self.size
+        )
         return (
             plc.io.parquet.ParquetReaderOptions.builder(
-                plc.io.SourceInfo([plc.io.types.FilepathSource(self.path, self.size)])
+                plc.io.SourceInfo([ds])
             )
             .decimal_width(plc.TypeId.DECIMAL128)
             .build()

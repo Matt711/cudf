@@ -27,6 +27,8 @@ from cudf_polars.dsl.ir import (
     Sink,
     _prepare_parquet_predicate,
 )
+import os
+
 from cudf_polars.dsl.to_ast import to_parquet_filter
 from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.streaming.base import (
@@ -36,7 +38,7 @@ from cudf_polars.streaming.base import (
     SerializedDataSourceInfo,
 )
 from cudf_polars.streaming.dispatch import lower_ir_node
-from cudf_polars.utils.config import Cluster
+from cudf_polars.utils.config import Cluster, HybridScanPassMode
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 from cudf_polars.utils.versions import POLARS_VERSION_LT_137
 
@@ -233,116 +235,186 @@ def _read_with_hybrid_scan(
     split_index: int = 0,
     total_splits: int = 1,
     stats_pruning: bool = True,
+    pass_mode: HybridScanPassMode = HybridScanPassMode.SINGLE_PASS,
+    cucascade_engine: object | None = None,
 ) -> DataFrame:
-    """Two-pass parquet read via HybridScanReader for a row-group-aligned split."""
+    """Parquet read via HybridScanReader for a row-group-aligned split.
+
+    In SINGLE_PASS mode all columns are fetched and materialized together via
+    ``all_column_chunks_byte_ranges`` + ``materialize_all_columns``, avoiding
+    hybrid scan's two-phase overhead for splits where pruning buys little.
+
+    In TWO_PASS mode the traditional filter-then-payload pipeline runs, which
+    reduces the second fetch when the predicate prunes a large fraction of rows.
+    """
     assert len(paths) == 1, (
         "hybrid scan only supported for SplitScan; one physical file"
     )
-    with nvtx_annotate_cudf_polars(
-        message="HybridScan", payload=(split_index + 1, total_splits)
-    ):
-        source_info = plc.io.SourceInfo(
-            [plc.io.types.FilepathSource(cached_info.path, cached_info.size)]
-        )
-        options = cached_info.default_reader_options()
-        if with_columns is not None:
-            options.set_column_names(with_columns)
-        options.set_filter(plc_filter)
 
-        reader = cached_info.hybrid_scan_reader(options)
+    # Eagerly start the readahead thread on the first split so that the C++
+    # background thread issues fadvise + prepare_prefetch + prefetch_async for
+    # all row-group splits before we start processing split 0.
+    use_readahead = (
+        cucascade_engine is not None
+        and total_splits > 1
+        and hasattr(cucascade_engine, "start_readahead")
+    )
+    if use_readahead and split_index == 0:
+        all_rgs = cached_info.file_metadata.row_groups()
+        total_rgs = len(all_rgs)
+        stride = max(1, total_rgs // total_splits)
+        gpu_id = int(os.environ.get("SIRIUS_GPU_DEVICE_ID", "0"))
+        budget = int(os.environ.get("SIRIUS_READAHEAD_BUDGET", "16"))
+        ra_splits: list[tuple[str, list[tuple[int, int]]]] = []
+        for s in range(total_splits):
+            s_skip = stride * s
+            s_end = total_rgs if s == total_splits - 1 else s_skip + stride
+            rg_ranges = [
+                (rg.file_offset, rg.total_compressed_size)
+                for rg in all_rgs[s_skip:s_end]
+                if rg.file_offset is not None and rg.total_compressed_size is not None
+            ]
+            ra_splits.append((paths[0], rg_ranges))
+        cucascade_engine.start_readahead(ra_splits, gpu_id=gpu_id, budget=budget)
 
-        if stats_pruning:
-            row_group_indices = reader.filter_row_groups_with_stats(
-                row_group_indices, options, stream=stream
-            )
+    try:
+        with nvtx_annotate_cudf_polars(
+            message="HybridScan", payload=(split_index + 1, total_splits)
+        ):
+            if use_readahead:
+                ds = cucascade_engine.get_datasource_for_split(split_index)
+            else:
+                ds = cached_info.datasource(cucascade_engine)
+            source_info = plc.io.SourceInfo([ds])
+            options = cached_info.default_reader_options(ds)
+            if with_columns is not None:
+                options.set_column_names(with_columns)
+            options.set_filter(plc_filter)
 
-            if row_group_indices:
-                bloom_ranges = reader.bloom_filters_byte_ranges(
+            reader = cached_info.hybrid_scan_reader(options)
+
+            if stats_pruning:
+                row_group_indices = reader.filter_row_groups_with_stats(
+                    row_group_indices, options, stream=stream
+                )
+
+                if row_group_indices:
+                    bloom_ranges = reader.bloom_filters_byte_ranges(
+                        row_group_indices, options
+                    )
+                    if bloom_ranges:
+                        bloom_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                            source_info,
+                            bloom_ranges,
+                            plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                            stream=stream,
+                        )
+                        row_group_indices = reader.filter_row_groups_with_bloom_filters(
+                            bloom_chunks, row_group_indices, options, stream=stream
+                        )
+
+            if not row_group_indices:
+                col_names = with_columns if with_columns is not None else list(schema)
+                return DataFrame(
+                    [
+                        Column(
+                            plc.column_factories.make_empty_column(
+                                schema[name].plc_type, stream=stream
+                            ),
+                            dtype=schema[name],
+                            name=name,
+                        )
+                        for name in col_names
+                    ],
+                    stream=stream,
+                )
+
+            if pass_mode is HybridScanPassMode.SINGLE_PASS:
+                all_ranges = reader.all_column_chunks_byte_ranges(
                     row_group_indices, options
                 )
-                if bloom_ranges:
-                    bloom_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-                        source_info,
-                        bloom_ranges,
-                        plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
-                        stream=stream,
-                    )
-                    row_group_indices = reader.filter_row_groups_with_bloom_filters(
-                        bloom_chunks, row_group_indices, options, stream=stream
-                    )
+                all_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                    source_info,
+                    all_ranges,
+                    plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                    stream=stream,
+                )
+                tbl_w_meta = reader.materialize_all_columns(
+                    row_group_indices,
+                    all_chunks,
+                    options,
+                    stream=stream,
+                )
+                names = tbl_w_meta.column_names(include_children=False)
+                return DataFrame.from_table(
+                    tbl_w_meta.tbl,
+                    names,
+                    [schema[n] for n in names],
+                    stream=stream,
+                ).select(list(schema.keys()))
 
-        if not row_group_indices:
-            col_names = with_columns if with_columns is not None else list(schema)
-            return DataFrame(
-                [
-                    Column(
-                        plc.column_factories.make_empty_column(
-                            schema[name].plc_type, stream=stream
-                        ),
-                        dtype=schema[name],
-                        name=name,
-                    )
-                    for name in col_names
-                ],
-                stream=stream,
-            )
+            # TWO_PASS: filter columns first, then payload columns for surviving rows.
+            # TODO: Consider implementing page-index stats pruning. For SplitScans, we can
+            # reuse the same page index for all splits of the same file, so the overhead of
+            # reading the page index can be amortized. For FusedScans, we would need to read
+            # the page index for all files, which may be too expensive.
+            row_mask = reader.build_all_true_row_mask(row_group_indices, stream=stream)
 
-        # TODO: Consider implementing page-index stats pruning. For SplitScans, we can
-        # reuse the same page index for all splits of the same file, so the overhead of
-        # reading the page index can be amortized. For FusedScans, we would need to read
-        # the page index for all files, which may be too expensive.
-        row_mask = reader.build_all_true_row_mask(row_group_indices, stream=stream)
-
-        filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
-            source_info,
-            reader.filter_column_chunks_byte_ranges(row_group_indices, options),
-            plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
-            stream=stream,
-        )
-        filter_tbl_w_meta = reader.materialize_filter_columns(
-            row_group_indices,
-            filter_chunks,
-            row_mask,
-            plc.io.experimental.UseDataPageMask.YES,
-            options,
-            stream=stream,
-        )
-
-        filter_names = filter_tbl_w_meta.column_names(include_children=False)
-        filter_df = DataFrame.from_table(
-            filter_tbl_w_meta.tbl,
-            filter_names,
-            [schema[n] for n in filter_names],
-            stream=stream,
-        )
-
-        requested_columns = with_columns if with_columns is not None else list(schema)
-        columns = filter_df.columns
-        if set(requested_columns) - set(filter_names):
-            payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+            filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                 source_info,
-                reader.payload_column_chunks_byte_ranges(row_group_indices, options),
+                reader.filter_column_chunks_byte_ranges(row_group_indices, options),
                 plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
                 stream=stream,
             )
-            payload_tbl_w_meta = reader.materialize_payload_columns(
+            filter_tbl_w_meta = reader.materialize_filter_columns(
                 row_group_indices,
-                payload_chunks,
+                filter_chunks,
                 row_mask,
                 plc.io.experimental.UseDataPageMask.YES,
                 options,
                 stream=stream,
             )
-            payload_names = payload_tbl_w_meta.column_names(include_children=False)
-            payload_df = DataFrame.from_table(
-                payload_tbl_w_meta.tbl,
-                payload_names,
-                [schema[n] for n in payload_names],
+
+            filter_names = filter_tbl_w_meta.column_names(include_children=False)
+            filter_df = DataFrame.from_table(
+                filter_tbl_w_meta.tbl,
+                filter_names,
+                [schema[n] for n in filter_names],
                 stream=stream,
             )
-            columns = [*columns, *payload_df.columns]
 
-        return DataFrame(columns, stream=stream).select(list(schema.keys()))
+            requested_columns = with_columns if with_columns is not None else list(schema)
+            columns = filter_df.columns
+            if set(requested_columns) - set(filter_names):
+                payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                    source_info,
+                    reader.payload_column_chunks_byte_ranges(row_group_indices, options),
+                    plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                    stream=stream,
+                )
+                payload_tbl_w_meta = reader.materialize_payload_columns(
+                    row_group_indices,
+                    payload_chunks,
+                    row_mask,
+                    plc.io.experimental.UseDataPageMask.YES,
+                    options,
+                    stream=stream,
+                )
+                payload_names = payload_tbl_w_meta.column_names(include_children=False)
+                payload_df = DataFrame.from_table(
+                    payload_tbl_w_meta.tbl,
+                    payload_names,
+                    [schema[n] for n in payload_names],
+                    stream=stream,
+                )
+                columns = [*columns, *payload_df.columns]
+
+            return DataFrame(columns, stream=stream).select(list(schema.keys()))
+    finally:
+        if use_readahead:
+            cucascade_engine.release_datasource(split_index)
+            if split_index == total_splits - 1:
+                cucascade_engine.stop_readahead()
 
 
 class SplitScan(IR):
@@ -539,6 +611,8 @@ class SplitScan(IR):
                         split_index=split_index,
                         total_splits=total_splits,
                         stats_pruning=parquet_options._hybrid_scan_stats_pruning,
+                        pass_mode=parquet_options.pass_mode,
+                        cucascade_engine=context.cucascade_engine,
                     )
         else:
             # There are not enough row-groups to align

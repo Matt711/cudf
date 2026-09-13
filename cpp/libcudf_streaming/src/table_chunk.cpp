@@ -253,6 +253,14 @@ std::unique_ptr<rapidsmpf::PackedData> table_chunk::into_packed_data(
     std::move(packed_columns.metadata), br->move(std::move(packed_columns.gpu_data), stream_));
 }
 
+std::unique_ptr<rapidsmpf::PackedData> table_chunk::into_packed_data(
+  rapidsmpf::BufferResource* br) &&
+{
+  auto reservation =
+    br->reserve_device_memory_and_spill(into_packed_data_cost(), rapidsmpf::AllowOverbooking::NO);
+  return std::move(*this).into_packed_data(reservation);
+}
+
 std::pair<cudf::size_type, cudf::size_type> table_chunk::shape() const noexcept
 {
   if (packed_data_ != nullptr) {

@@ -1,0 +1,269 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include "common.hpp"
+#include "config.hpp"
+#include "memory_space.hpp"
+
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream_view.hpp>
+
+#include <condition_variable>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace cudf_streaming {
+namespace prefetch {
+namespace memory {
+
+// Forward declarations
+class memory_reservation_manager;
+class reservation_aware_resource_adaptor;
+class fixed_size_host_memory_resource;
+class reservation;
+
+//===----------------------------------------------------------------------===//
+// Reservation Request Strategies
+//===----------------------------------------------------------------------===//
+
+struct reservation_request_strategy {
+  explicit reservation_request_strategy(bool strong_ordering) : _strong_ordering(strong_ordering) {}
+
+  virtual std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const = 0;
+
+  [[nodiscard]] bool has_strong_ordering() const noexcept { return _strong_ordering; }
+
+ protected:
+  static std::span<memory_space*> get_all_memory_resource(memory_reservation_manager& manager);
+
+  static std::span<memory_space*> get_all_memory_resource(memory_reservation_manager& manager,
+                                                          Tier tier);
+
+  static memory_space* get_memory_resource(memory_reservation_manager& manager,
+                                           memory_space_id source_id);
+
+  static std::vector<memory_space*> get_memory_resource(memory_reservation_manager& manager,
+                                                        std::span<memory_space_id> source_ids);
+
+  bool _strong_ordering{false};
+};
+
+/**
+ * Request reservation in any memory space within a tier, with optional device preference.
+ * If preferred_device_id is specified, that device will be tried first.
+ */
+struct any_memory_space_in_tier_with_preference : public reservation_request_strategy {
+  Tier tier;
+  std::optional<size_t> preferred_device_id;  // Optional preferred device within tier
+
+  explicit any_memory_space_in_tier_with_preference(Tier t,
+                                                    std::optional<size_t> device_id = std::nullopt)
+    : reservation_request_strategy(true), tier(t), preferred_device_id(device_id)
+  {
+  }
+
+  std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+};
+
+/**
+ * Request reservation in any memory space within a specific tier.
+ */
+struct any_memory_space_in_tier : public reservation_request_strategy {
+  Tier tier;
+  explicit any_memory_space_in_tier(Tier t) : reservation_request_strategy(false), tier(t) {}
+
+  std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+};
+
+/**
+ * Request reservation in memory spaces across multiple tiers, ordered by preference.
+ * The first available tier in the list will be selected.
+ */
+struct any_memory_space_in_tiers : public reservation_request_strategy {
+  std::vector<Tier> tiers;  // Ordered by preference
+
+  explicit any_memory_space_in_tiers(std::vector<Tier> t)
+    : reservation_request_strategy(false), tiers(std::move(t))
+  {
+  }
+
+  std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+};
+
+/**
+ * Request reservation in memory spaces across multiple tiers, ordered by preference.
+ * The first available tier in the list will be selected.
+ */
+struct specific_memory_space : public reservation_request_strategy {
+  memory_space_id target_id;
+
+  specific_memory_space(Tier t, int32_t dev_id)
+    : reservation_request_strategy(true), target_id(t, dev_id)
+  {
+  }
+
+  std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+};
+
+/**
+ * Request reservation by downgrading from a source memory space to target tiers.
+ */
+struct any_memory_space_to_downgrade : public reservation_request_strategy {
+  memory_space_id src_id;
+  std::vector<Tier> target_tiers;
+
+  explicit any_memory_space_to_downgrade(memory_space_id src, Tier target)
+    : reservation_request_strategy(true), src_id(src), target_tiers({target})
+  {
+  }
+
+  explicit any_memory_space_to_downgrade(memory_space_id src, std::vector<Tier> targets)
+    : reservation_request_strategy(true), src_id(src), target_tiers(std::move(targets))
+  {
+  }
+
+  std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+};
+
+/**
+ * Request reservation by upgrading from a source memory space to a target tier.
+ */
+struct any_memory_space_to_upgrade : public reservation_request_strategy {
+  memory_space_id src_id;
+  Tier target_tier;
+
+  explicit any_memory_space_to_upgrade(memory_space_id src, Tier target)
+    : reservation_request_strategy(true), src_id(src), target_tier(target)
+  {
+  }
+
+  std::vector<memory_space*> get_candidates(memory_reservation_manager& manager) const override;
+};
+
+//===----------------------------------------------------------------------===//
+// memory_reservation_manager
+//===----------------------------------------------------------------------===//
+
+/**
+ * Central manager for memory reservations across multiple memory spaces.
+ * Coordinates reservation requests using different strategies
+ * (specific space, tier-based, multi-tier fallback).
+ */
+class memory_reservation_manager {
+  friend class reservation;
+  friend struct reservation_request_strategy;
+
+ public:
+  //===----------------------------------------------------------------------===//
+  // Configuration and Initialization
+  //===----------------------------------------------------------------------===//
+
+  /**
+   * Construct a memory_reservation_manager with the given memory space configurations.
+   * @param configs Vector of memory_space_config objects defining each memory space.
+   * @throws std::invalid_argument if configs is empty.
+   */
+  explicit memory_reservation_manager(std::vector<memory_space_config> configs);
+
+  // Non-copyable, non-movable (owns unique resources)
+  memory_reservation_manager(const memory_reservation_manager&)            = delete;
+  memory_reservation_manager& operator=(const memory_reservation_manager&) = delete;
+  memory_reservation_manager(memory_reservation_manager&&)                 = delete;
+  memory_reservation_manager& operator=(memory_reservation_manager&&)      = delete;
+
+  ~memory_reservation_manager();
+
+  //===----------------------------------------------------------------------===//
+  // Reservation Interface
+  //===----------------------------------------------------------------------===//
+
+  /**
+   * Main reservation interface using strategy pattern.
+   * Supports different reservation strategies through the reservation_request variant.
+   */
+  std::unique_ptr<reservation> request_reservation(const reservation_request_strategy& request,
+                                                   size_t size);
+
+  //===----------------------------------------------------------------------===//
+  // memory_space Access and Queries
+  //===----------------------------------------------------------------------===//
+
+  /**
+   * Get a specific memory_space by tier and device ID.
+   * Returns nullptr if no such space exists.
+   */
+  const memory_space* get_memory_space(Tier tier, int32_t device_id) const;
+
+  /**
+   * Get a specific memory_space by tier and device ID.
+   * Returns nullptr if no such space exists.
+   */
+  memory_space* get_memory_space(Tier tier, int32_t device_id);
+
+  /**
+   * Get all memory_spaces for a specific tier.
+   * Returns empty vector if no spaces exist for that tier.
+   */
+  std::span<const memory_space*> get_memory_spaces_for_tier(Tier tier) const;
+
+  /**
+   * Get all memory_spaces managed by this instance.
+   */
+  std::span<const memory_space*> get_all_memory_spaces() const noexcept;
+
+  //===----------------------------------------------------------------------===//
+  // Aggregated Queries
+  //===----------------------------------------------------------------------===//
+
+  // Tier-level aggregations
+  size_t get_available_memory_for_tier(Tier tier) const;
+  size_t get_total_reserved_memory_for_tier(Tier tier) const;
+  size_t get_active_reservation_count_for_tier(Tier tier) const;
+
+  // System-wide aggregations
+  size_t get_total_available_memory() const;
+  size_t get_total_reserved_memory() const;
+  size_t get_active_reservation_count() const;
+
+  void shutdown();
+
+ private:
+  memory_space* get_mutable_memory_space(Tier tier, int32_t device_id);
+  std::vector<memory_space*> get_mutable_memory_space(std::span<memory_space_id> ids);
+  std::span<memory_space*> get_mutable_memory_spaces_for_tier(Tier tier);
+  std::span<memory_space*> get_mutable_all_memory_spaces() noexcept;
+
+  // Storage for memory_space instances (owned by the manager)
+  std::vector<std::unique_ptr<memory_space>> _memory_spaces;
+
+  // Fast lookups
+  std::vector<memory_space*> _memory_space_views;
+  std::vector<const memory_space*> _const_memory_space_views;
+  std::unordered_map<memory_space_id, memory_space*> _memory_space_lookup;
+  std::unordered_map<Tier, std::vector<memory_space*>> _tier_to_memory_spaces;
+  std::unordered_map<Tier, std::vector<const memory_space*>> _const_tier_to_memory_spaces;
+
+  // Helper method: attempts to select a space and immediately make a reservation
+  // Returns a reservation when successful, or std::nullopt if none can satisfy the request
+  std::optional<std::unique_ptr<reservation>> select_memory_space_and_make_reservation(
+    const reservation_request_strategy& request, size_t size);
+
+  void build_lookup_tables();
+
+  // Synchronization for cross-space waiting when no memory_space can currently satisfy a request
+  mutable std::mutex _wait_mutex;
+  std::condition_variable _wait_cv;
+};
+
+}  // namespace memory
+}  // namespace prefetch
+}  // namespace cudf_streaming

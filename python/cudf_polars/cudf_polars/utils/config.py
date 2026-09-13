@@ -59,6 +59,7 @@ __all__ = [
     "ConfigOptions",
     "DaskContext",
     "DynamicPlanningOptions",
+    "HybridScanPassMode",
     "InMemoryExecutor",
     "JoinFilterPushdownOptions",
     "MaxConcurrentIOTasks",
@@ -229,6 +230,25 @@ class Cluster(enum.StrEnum):
     DASK = "dask"
 
 
+class HybridScanPassMode(enum.StrEnum):
+    """
+    How a hybrid-scan split fetches and materializes its columns.
+
+    * ``HybridScanPassMode.SINGLE_PASS``: Fetch and materialize all columns
+      in one pass via ``all_column_chunks_byte_ranges`` +
+      ``materialize_all_columns``. Preferred when pruning eliminates few or
+      no row groups; avoids hybrid scan's two-phase overhead.
+    * ``HybridScanPassMode.TWO_PASS``: Fetch and materialize filter columns
+      first (``filter_column_chunks_byte_ranges`` + ``materialize_filter_columns``),
+      evaluate the predicate, then fetch and materialize payload columns for
+      surviving rows. Preferred when pruning eliminates a significant fraction
+      of rows so the second fetch is substantially smaller than the first.
+    """
+
+    SINGLE_PASS = "single_pass"
+    TWO_PASS = "two_pass"
+
+
 T = TypeVar("T")
 DefaultT = TypeVar("DefaultT")
 
@@ -357,6 +377,20 @@ class ParquetOptions:
         Whether to use the two-pass ``HybridScanReader`` for ``SplitScan``
         tasks when a predicate can be pushed down to a parquet filter.
         Default is False.
+    pass_mode
+        How a hybrid scan read fetches and materializes its columns. See
+        :class:`HybridScanPassMode`. Ignored when ``use_hybrid_scan`` is
+        False. Default is ``HybridScanPassMode.SINGLE_PASS``.
+    prefetch_byte_ranges
+        Whether to report byte-range hints for upcoming splits to a
+        cuCascade-backed datasource (``fadvise``). Currently a no-op when
+        no cuCascade datasource is active; reserved for the Phase 2
+        prefetch worker. Default is False.
+    prefetch_cache_enabled
+        Whether the cuCascade prefetch cache is active for this scan.
+        Currently advisory/logging only; actual cache activation is
+        controlled by whether a cuCascade-backed datasource is wired in.
+        Default is False.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -405,6 +439,27 @@ class ParquetOptions:
             default=False,
         )
     )
+    pass_mode: HybridScanPassMode = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PASS_MODE",
+            HybridScanPassMode,
+            default=HybridScanPassMode.SINGLE_PASS,
+        )
+    )
+    prefetch_byte_ranges: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_BYTE_RANGES",
+            _bool_converter,
+            default=False,
+        )
+    )
+    prefetch_cache_enabled: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCH_CACHE_ENABLED",
+            _bool_converter,
+            default=False,
+        )
+    )
     # Internal benchmarking flag. When False, skips stats and bloom-filter pruning
     # before the first pass of a hybrid scan so you can measure two-pass read
     # overhead in isolation. No reason to set this to False in production.
@@ -448,6 +503,12 @@ class ParquetOptions:
             raise ValueError(
                 "use_hybrid_scan requires prefetch_file_metadata to be enabled"
             )
+        if not isinstance(self.pass_mode, HybridScanPassMode):
+            raise TypeError("pass_mode must be a HybridScanPassMode")
+        if not isinstance(self.prefetch_byte_ranges, bool):
+            raise TypeError("prefetch_byte_ranges must be a bool")
+        if not isinstance(self.prefetch_cache_enabled, bool):
+            raise TypeError("prefetch_cache_enabled must be a bool")
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
 
@@ -734,6 +795,7 @@ class SPMDContext:
     worker_id: uuid.UUID
     quent_logger: QuentLogger | None
     worker_resources: WorkerResources | None = None
+    cucascade_engine: object | None = None
 
 
 @dataclasses.dataclass(frozen=True)

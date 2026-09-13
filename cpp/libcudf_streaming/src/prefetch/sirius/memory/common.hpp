@@ -1,0 +1,163 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <rmm/error.hpp>
+#include <rmm/version_config.hpp>
+
+#include <cuda/memory_resource>
+#include <cuda/stream>
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <utility>
+#include <vector>
+
+namespace cudf_streaming {
+namespace prefetch {
+namespace memory {
+/**
+ * Memory tier enumeration representing different types of memory storage.
+ * Ordered roughly by performance (fastest to slowest access).
+ */
+enum class Tier : int32_t {
+  GPU,   // GPU device memory (fastest but limited)
+  HOST,  // Host system memory (fast, larger capacity)
+  DISK,  // Disk/storage memory (slowest but largest capacity)
+  SIZE   // Value = size of the enum, allows code to be more dynamic
+};
+
+/**
+ * Memory space id, comprised of device id, and tier
+ *
+ */
+class memory_space_id {
+ public:
+  Tier tier;
+  int32_t device_id;
+
+  explicit memory_space_id(Tier t, int32_t d_id) : tier(t), device_id(d_id) {}
+
+  auto operator<=>(const memory_space_id&) const noexcept = default;
+
+  std::size_t uuid() const noexcept
+  {
+    std::size_t key = 0;
+    std::memcpy(&key, this, sizeof(key));
+    return key;
+  }
+};
+
+using DeviceMemoryResourceFactoryFn =
+  std::function<::cuda::mr::any_resource<::cuda::mr::device_accessible>(int device_id,
+                                                                        std::size_t capacity)>;
+
+::cuda::mr::any_resource<::cuda::mr::device_accessible> make_default_gpu_memory_resource(
+  int device_id, std::size_t capacity);
+
+/**
+ * @brief Grant cross-device peer ReadWrite access on a cudaMallocAsync pool.
+ *
+ * cudaMallocAsync pools require explicit `cudaMemPoolSetAccess` for cross-device peer copy
+ * (cudaMemcpyPeer*) to actually transfer bytes; `cudaDeviceEnablePeerAccess` alone only
+ * governs legacy cudaMalloc memory. This helper iterates all visible CUDA devices and
+ * declares that each peer (other than `owner_device_id`) may read/write the pool.
+ * Best effort — non-P2P-capable peers are skipped silently.
+ */
+void enable_pool_peer_access_for_all_visible_devices(cudaMemPool_t pool, int owner_device_id);
+
+/**
+ * @brief Empirical probe: does direct peer DMA actually move bytes between two GPUs?
+ *
+ * `cudaDeviceCanAccessPeer`, `cudaDeviceEnablePeerAccess`, and `cudaMemPoolGetAccess`
+ * report peer access as available on hardware that physically cannot do peer DMA
+ * (notably consumer Intel chipsets — Core i9 / Core Ultra desktop platforms — where
+ * GPUDirect P2P is not supported). The standard APIs return success, but
+ * `cudaMemcpyPeer*` then silently no-ops: it returns success without moving bytes.
+ *
+ * This probe allocates a tiny (64-byte) test buffer on each device, writes a known
+ * sentinel pattern on the source, peer-copies to a different sentinel on the
+ * destination, and verifies the destination matches the source. Returns true iff
+ * bytes actually moved.
+ *
+ * Caller policy: call this AFTER `cudaDeviceEnablePeerAccess` so the probe sees the
+ * "lying enable" failure mode. With peer access disabled, the driver auto-stages
+ * through host and the probe always passes — which is correct, but doesn't
+ * distinguish "real peer DMA" from "host fallback".
+ */
+[[nodiscard]] bool probe_peer_dma_works(int src_device, int dst_device);
+
+/**
+ * @brief Run the empirical probe across every P2P-capable GPU pair and DISABLE
+ * peer access wherever direct DMA does not actually work.
+ *
+ * On consumer platforms where peer DMA is broken, leaving peer access enabled
+ * forces the driver onto a silent-no-op path. Disabling peer access (and resetting
+ * pool access to ProtNone) tells the driver to fall back to its internal pinned
+ * host-staging path for `cudaMemcpyPeer*` — slower than real peer DMA but correct.
+ *
+ * Intended call site: once after memory_spaces are constructed and the application has
+ * called `cudaDeviceEnablePeerAccess` for each pair (e.g. by the cucascade-cudf layer that
+ * registers tier converters). Idempotent.
+ *
+ * @param pools_by_device A vector indexed by device id (0..N-1) of the cucascade
+ *        pool to also reset access on. Pass an empty vector if cucascade pools
+ *        don't need pool-level peer access reset (legacy memory only).
+ * @return Number of (i, j) pairs where peer access was disabled because the probe
+ *         failed.
+ */
+int disable_peer_access_where_broken(std::vector<cudaMemPool_t> const& pools_by_device = {});
+
+::cuda::mr::any_resource<::cuda::mr::device_accessible, ::cuda::mr::host_accessible>
+make_default_host_memory_resource(int device_id, std::size_t capacity);
+
+::cuda::mr::any_resource<::cuda::mr::device_accessible, ::cuda::mr::host_accessible>
+make_default_host_memory_resource(int device_id, std::size_t capacity, bool make_portable);
+
+DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier);
+
+// Forward declaration — fixed_size_host_memory_resource.hpp is heavy.
+class fixed_size_host_memory_resource;
+
+/**
+ * @brief Register a HOST-tier `fixed_size_host_memory_resource` so cross-tier
+ * code paths (notably the peer-DMA-broken host-staging branch in
+ * representation_converter.cpp) can borrow blocks from the pre-pinned pool
+ * instead of calling cudaHostAlloc per transfer.
+ *
+ * Called by memory_space's HOST constructor; unregistered by its destructor.
+ * Multiple pools may be registered against the same numa_id (test fixtures
+ * commonly create overlapping HOST memory_spaces); re-registering the same
+ * pointer is a no-op.
+ */
+void register_host_pool(int numa_id, fixed_size_host_memory_resource* pool);
+
+/**
+ * @brief Unregister a previously registered HOST pool. No-op if not present.
+ */
+void unregister_host_pool(int numa_id, fixed_size_host_memory_resource* pool) noexcept;
+
+/**
+ * @brief Look up a registered HOST pool. Returns the most recently registered
+ * pool for the requested numa_id; falls back to any registered pool from any
+ * numa_id (cross-NUMA staging is suboptimal but correct). Returns nullptr if
+ * no HOST pool has been registered.
+ */
+[[nodiscard]] fixed_size_host_memory_resource* find_host_pool(int numa_id) noexcept;
+
+}  // namespace memory
+}  // namespace prefetch
+}  // namespace cudf_streaming
+
+// Specialization for std::hash to enable use of std::pair<Tier, size_t> as key
+namespace std {
+template <>
+struct hash<cudf_streaming::prefetch::memory::memory_space_id> {
+  size_t operator()(const cudf_streaming::prefetch::memory::memory_space_id& p) const;
+};
+
+}  // namespace std

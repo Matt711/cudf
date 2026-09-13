@@ -67,6 +67,9 @@ include(cmake/thirdparty/get_rapidsmpf.cmake)
 cudf_streaming_configure_optional_communication()
 include(../cmake/thirdparty/get_cucollections.cmake)
 
+# Prefetch extension dependencies
+include(cmake/thirdparty/get_prefetch_dependencies.cmake)
+
 # ##################################################################################################
 # * library target --------------------------------------------------------------------------------
 add_library(
@@ -123,6 +126,20 @@ endif()
 
 add_library(cudf_streaming::cudf_streaming ALIAS cudf_streaming)
 
+# Private prefetch extension (Stage 1+; enabled once sources exist)
+add_subdirectory(src/prefetch)
+# If the prefetch target was created, link it into cudf_streaming.
+# --whole-archive is required so the linker does not strip the prefetch
+# symbols when no cudf_streaming translation unit directly calls them.
+# Python bindings and user code reach the API via dlsym/dlopen.
+if(TARGET cudf_streaming_prefetch)
+  target_link_libraries(cudf_streaming PRIVATE
+    -Wl,--whole-archive
+    cudf_streaming_prefetch
+    -Wl,--no-whole-archive
+  )
+endif()
+
 # # GTests if enabled
 if(BUILD_TESTS)
   # GoogleTest
@@ -157,6 +174,13 @@ install(
   FILES_MATCHING
   PATTERN "*.hpp"
   PATTERN "detail" EXCLUDE
+)
+install(
+  FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/cudf_streaming/experimental/prefetch_export.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/cudf_streaming/experimental/prefetch_version.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/cudf_streaming/experimental/prefetch_context.hpp
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cudf_streaming/experimental
 )
 
 rapids_export(

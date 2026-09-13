@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
@@ -167,6 +168,7 @@ def evaluate_pipeline_spmd_mode(
         config_options,
         local_quent_context=local_quent_context,
         query_id=query_id,
+        cucascade_engine=config_options.executor.spmd_context.cucascade_engine,
     )
     if quent_context is not None:
         assert config_options.executor.spmd_context.quent_logger is not None
@@ -273,6 +275,91 @@ def synchronize_quent_context(
         all_data = all_gather_host_data(comm, context.br(), op_id, data)
 
     return cudf_polars.quent.QuentContext._deserialize(all_data[0])
+
+
+def _resolve_aws_credentials() -> tuple[str, str, str, str | None] | None:
+    """
+    Resolve AWS credentials (and region) via boto3's default credential chain.
+
+    Explicit ``AWS_ACCESS_KEY_ID``/``AWS_SECRET_ACCESS_KEY`` environment
+    variables are one source boto3 already checks, but so are IAM
+    instance-role credentials (the standard EC2 pattern -- no env vars at
+    all), ECS/EKS task roles, SSO, and ``~/.aws/credentials``. Reading only
+    the two env vars directly (the previous behavior) silently disabled
+    cuCascade on any instance authenticating a different way, with no
+    error -- it just meant ``RestEngine`` was never constructed and every
+    read fell back to plain kvikio.
+
+    Returns ``None`` if boto3 isn't installed or no credentials could be
+    resolved from any source. The region element may be ``None`` if boto3
+    couldn't resolve one either (caller falls back to a default).
+    """
+    try:
+        import boto3
+    except ImportError:
+        return None
+    session = boto3.Session()
+    creds = session.get_credentials()
+    if creds is None:
+        return None
+    frozen = creds.get_frozen_credentials()
+    if not frozen.access_key or not frozen.secret_key:
+        return None
+    return frozen.access_key, frozen.secret_key, frozen.token or "", session.region_name
+
+
+def _make_sirius_engine() -> object | None:
+    """
+    Construct a SiriusAdapter backed by cudf_streaming::prefetch::scan_context.
+
+    Only activated when CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_CACHE_ENABLED=1
+    is set in the environment. Returns None otherwise (falls back to kvikio).
+
+    AWS credentials are resolved via boto3's standard credential chain (EC2 IAM
+    role, environment variables, ~/.aws/credentials, etc.) -- the same chain used
+    by the old cuCascade RestEngine path.
+    """
+    if not int(os.environ.get("CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_CACHE_ENABLED", "0")):
+        return None
+
+    try:
+        from sirius_prefetch._scan_context import ScanContext, SiriusAdapter
+    except ImportError as e:
+        raise RuntimeError(
+            "PREFETCH_CACHE_ENABLED=1 but the sirius_prefetch package is not installed. "
+            "Build it with 'pip install docker/sirius_prefetch_src/' and ensure "
+            "libcudf_streaming.so is on LD_LIBRARY_PATH."
+        ) from e
+
+    resolved = _resolve_aws_credentials()
+    if resolved is None:
+        raise RuntimeError(
+            "PREFETCH_CACHE_ENABLED=1 but no AWS credentials could be resolved. "
+            "Check IAM instance role, AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY env "
+            "vars, or ~/.aws/credentials."
+        )
+    access_key, secret_key, session_token, resolved_region = resolved
+    region = (
+        os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or resolved_region
+        or "us-east-1"
+    )
+    endpoint = os.environ.get(
+        "AWS_ENDPOINT_URL",
+        os.environ.get("AWS_ENDPOINT_URL_S3", f"https://s3.{region}.amazonaws.com"),
+    )
+
+    ctx = ScanContext(
+        host_memory_bytes=int(os.environ.get("SIRIUS_HOST_MEMORY_BYTES", str(4 * 1024**3))),
+        gpu_device_id=int(os.environ.get("SIRIUS_GPU_DEVICE_ID", "0")),
+        s3_endpoint=endpoint,
+        s3_region=region,
+        s3_access_key=access_key,
+        s3_secret_key=secret_key,
+        s3_session_token=session_token or "",
+    )
+    return SiriusAdapter(ctx)
 
 
 class SPMDEngine(StreamingEngine):
@@ -550,6 +637,8 @@ class SPMDEngine(StreamingEngine):
                 self._py_executor.shutdown, wait=True, cancel_futures=True
             )
 
+            self._cucascade_engine = _make_sirius_engine()
+
             super().__init__(
                 nranks=comm.nranks,
                 executor_options={
@@ -563,6 +652,7 @@ class SPMDEngine(StreamingEngine):
                         context=self._ctx,
                         py_executor=self._py_executor,
                         worker_resources=self._worker_resources,
+                        cucascade_engine=self._cucascade_engine,
                     ),
                 },
                 engine_options={
@@ -726,6 +816,7 @@ class SPMDEngine(StreamingEngine):
                     worker_id=self._quent_worker.id,
                     quent_logger=self._quent_logger,
                     worker_resources=self._worker_resources,
+                    cucascade_engine=self._cucascade_engine,
                 ),
             },
             engine_options={

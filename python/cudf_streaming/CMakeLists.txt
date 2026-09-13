@@ -42,6 +42,7 @@ set(cython_sources
     cudf_streaming/channel_metadata.pyx
     cudf_streaming/partition.pyx
     cudf_streaming/partition_utils.pyx
+    cudf_streaming/prefetch.pyx
     cudf_streaming/table_chunk.pyx
 )
 set(linked_libraries cudf_streaming::cudf_streaming)

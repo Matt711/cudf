@@ -74,3 +74,29 @@ cdef extern from "cudf/io/experimental/hybrid_scan_multifile.hpp" \
         ) except +libcudf_exception_handler
 
         bool has_next_table_chunk() except +libcudf_exception_handler
+
+        pair[vector[byte_range_info], vector[size_type]] all_column_chunks_byte_ranges(
+            host_span[const_vector_size_type] row_group_indices,
+            const parquet_reader_options& options
+        ) except +libcudf_exception_handler
+
+        table_with_metadata materialize_all_columns(
+            host_span[const_vector_size_type] row_group_indices,
+            host_span[const_device_span_const_uint8_t] column_chunk_data,
+            const parquet_reader_options& options,
+            cudaStream_t stream,
+            device_async_resource_ref mr
+        ) except +libcudf_exception_handler
+
+        void setup_chunking_for_all_columns(
+            size_t chunk_read_limit,
+            size_t pass_read_limit,
+            host_span[const_vector_size_type] row_group_indices,
+            host_span[const_device_span_const_uint8_t] column_chunk_data,
+            const parquet_reader_options& options,
+            cudaStream_t stream,
+            device_async_resource_ref mr
+        ) except +libcudf_exception_handler
+
+        table_with_metadata materialize_all_columns_chunk(
+        ) except +libcudf_exception_handler

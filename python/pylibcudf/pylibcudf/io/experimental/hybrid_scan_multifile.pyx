@@ -408,3 +408,167 @@ cdef class HybridScanMultiFile:
         with nogil:
             result = self.c_obj.get()[0].has_next_table_chunk()
         return result
+
+    def all_column_chunks_byte_ranges(
+        self,
+        list row_group_indices,
+        ParquetReaderOptions options,
+    ):
+        """Get byte ranges of column chunks of all (or selected) columns.
+
+        Parameters
+        ----------
+        row_group_indices : list[list[int]]
+            Input row group indices, one inner list per source
+        options : ParquetReaderOptions
+            Parquet reader options
+
+        Returns
+        -------
+        tuple[list[ByteRangeInfo], list[int]]
+            Flattened byte ranges to column chunks of all columns and their
+            corresponding source indices
+        """
+        cdef vector[vector[size_type]] indices = _get_row_group_indices(
+            row_group_indices
+        )
+        cdef pair[vector[byte_range_info], vector[size_type]] result
+        with nogil:
+            result = self.c_obj.get()[0].all_column_chunks_byte_ranges(
+                host_span[const_vector_size_type](
+                    <const_vector_size_type*>indices.data(), indices.size()
+                ),
+                options.c_obj
+            )
+        ranges = [ByteRangeInfo(r.offset(), r.size()) for r in result.first]
+        source_indices = list(result.second)
+        return (ranges, source_indices)
+
+    def materialize_all_columns(
+        self,
+        list row_group_indices,
+        list column_chunk_data,
+        ParquetReaderOptions options,
+        object stream=None,
+        DeviceMemoryResource mr=None,
+    ):
+        """Materialize all (or selected) columns from external device buffers.
+
+        Parameters
+        ----------
+        row_group_indices : list[list[int]]
+            Input row group indices, one inner list per source
+        column_chunk_data : list[Span]
+            Flattened device spans of column chunk data, in the same order
+            as ``all_column_chunks_byte_ranges``
+        options : ParquetReaderOptions
+            Parquet reader options
+        stream : Stream, optional
+            CUDA stream
+        mr : DeviceMemoryResource, optional
+            Device memory resource
+
+        Returns
+        -------
+        TableWithMetadata
+            Table of materialized all columns and metadata
+        """
+        cdef Stream _stream = _get_stream(stream)
+        _mr = _get_memory_resource(mr)
+        cdef vector[vector[size_type]] indices = _get_row_group_indices(
+            row_group_indices
+        )
+        cdef vector[device_span[const_uint8_t]] spans_vec
+        for span in column_chunk_data:
+            spans_vec.push_back(_get_device_span(span))
+        cdef table_with_metadata c_result
+        with nogil:
+            c_result = self.c_obj.get()[0].materialize_all_columns(
+                host_span[const_vector_size_type](
+                    <const_vector_size_type*>indices.data(), indices.size()
+                ),
+                host_span[const_device_span_const_uint8_t](
+                    <const_device_span_const_uint8_t*>spans_vec.data(),
+                    spans_vec.size()
+                ),
+                options.c_obj,
+                _stream.view().value(),
+                _mr.get_mr()
+            )
+        return TableWithMetadata.from_libcudf(c_result, _stream, _mr)
+
+    def setup_chunking_for_all_columns(
+        self,
+        size_t chunk_read_limit,
+        size_t pass_read_limit,
+        list row_group_indices,
+        list column_chunk_data,
+        ParquetReaderOptions options,
+        object stream=None,
+        DeviceMemoryResource mr=None,
+    ) -> None:
+        """Setup chunking for all (or selected) columns from external device buffers.
+
+        Parameters
+        ----------
+        chunk_read_limit : int
+            Limit on total bytes per table chunk; 0 for no limit
+        pass_read_limit : int
+            Limit on memory used for reading and decompressing; 0 for no limit
+        row_group_indices : list[list[int]]
+            Input row group indices, one inner list per source
+        column_chunk_data : list[Span]
+            Flattened device spans of column chunk data, in the same order
+            as ``all_column_chunks_byte_ranges``
+        options : ParquetReaderOptions
+            Parquet reader options
+        stream : Stream, optional
+            CUDA stream
+        mr : DeviceMemoryResource, optional
+            Device memory resource
+        """
+        self._stream = _get_stream(stream)
+        self.mr = _get_memory_resource(mr)
+        cdef vector[vector[size_type]] indices = _get_row_group_indices(
+            row_group_indices
+        )
+        cdef vector[device_span[const_uint8_t]] spans_vec
+        for span in column_chunk_data:
+            spans_vec.push_back(_get_device_span(span))
+        # keep reference to avoid use-after-free of device spans
+        self._all_column_chunk_data = column_chunk_data
+        with nogil:
+            self.c_obj.get()[0].setup_chunking_for_all_columns(
+                chunk_read_limit,
+                pass_read_limit,
+                host_span[const_vector_size_type](
+                    <const_vector_size_type*>indices.data(), indices.size()
+                ),
+                host_span[const_device_span_const_uint8_t](
+                    <const_device_span_const_uint8_t*>spans_vec.data(),
+                    spans_vec.size()
+                ),
+                options.c_obj,
+                self._stream.view().value(),
+                self.mr.get_mr()
+            )
+
+    def materialize_all_columns_chunk(self) -> TableWithMetadata:
+        """Materialize the next chunk of all (or selected) columns.
+
+        Must be called after ``setup_chunking_for_all_columns``.
+        Use ``has_next_table_chunk`` to determine if more chunks remain.
+
+        Returns
+        -------
+        TableWithMetadata
+            Table chunk of materialized all columns and metadata
+        """
+        cdef table_with_metadata c_result
+        cdef bool more_chunks
+        with nogil:
+            c_result = self.c_obj.get()[0].materialize_all_columns_chunk()
+            more_chunks = self.c_obj.get()[0].has_next_table_chunk()
+        if not more_chunks:
+            self._all_column_chunk_data = None
+        return TableWithMetadata.from_libcudf(c_result, self._stream, self.mr)

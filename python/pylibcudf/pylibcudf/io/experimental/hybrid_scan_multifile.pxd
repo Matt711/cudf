@@ -21,3 +21,4 @@ cdef class HybridScanMultiFile:
     cdef Stream _stream
     cdef DeviceMemoryResource mr
     cdef object _payload_page_data
+    cdef object _all_column_chunk_data

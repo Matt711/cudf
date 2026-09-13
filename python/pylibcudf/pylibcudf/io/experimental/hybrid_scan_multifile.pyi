@@ -60,3 +60,27 @@ class HybridScanMultiFile:
         pass_read_limit: int,
     ) -> list[list[list[int]]]: ...
     def has_next_table_chunk(self) -> bool: ...
+    def all_column_chunks_byte_ranges(
+        self,
+        row_group_indices: list[list[int]],
+        options: ParquetReaderOptions,
+    ) -> tuple[list[ByteRangeInfo], list[int]]: ...
+    def materialize_all_columns(
+        self,
+        row_group_indices: list[list[int]],
+        column_chunk_data: list[Span],
+        options: ParquetReaderOptions,
+        stream: CudaStreamLike | None = None,
+        mr: DeviceMemoryResource | None = None,
+    ) -> TableWithMetadata: ...
+    def setup_chunking_for_all_columns(
+        self,
+        chunk_read_limit: int,
+        pass_read_limit: int,
+        row_group_indices: list[list[int]],
+        column_chunk_data: list[Span],
+        options: ParquetReaderOptions,
+        stream: CudaStreamLike | None = None,
+        mr: DeviceMemoryResource | None = None,
+    ) -> None: ...
+    def materialize_all_columns_chunk(self) -> TableWithMetadata: ...

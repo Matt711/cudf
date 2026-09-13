@@ -285,6 +285,10 @@ class table_chunk {
   [[nodiscard]] std::unique_ptr<rapidsmpf::PackedData> into_packed_data(
     rapidsmpf::MemoryReservation& reservation) &&;
 
+  // Compatibility overload for callers compiled against the 26.10 API (BufferResource* signature).
+  [[nodiscard]] std::unique_ptr<rapidsmpf::PackedData> into_packed_data(
+    rapidsmpf::BufferResource* br) &&;
+
   /**
    * @brief Return the device memory `into_packed_data()` allocates.
    *

@@ -1,0 +1,7 @@
+{
+  "sirius_baseline": "94327db060ee02a14958816e81da91ddacfcb206",
+  "sirius_pr_head": "31c1b7c8249cb248f21031fbf7b763a5c17d405f",
+  "cucascade_pinned": "1b0e7b6c28dafa43bfe2c48011a3657c0dd6f127",
+  "duckdb_queue_vendor": "3ff87f1ec7282ef44727e0e1d84237e88dd9a7b5",
+  "description": "Sirius PR #1661 Parquet byte-prefetch port into cuDF libcudf_streaming"
+}

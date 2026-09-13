@@ -1,0 +1,324 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+/*
+ * Copyright 2025, NVIDIA CORPORATION & AFFILIATES.
+ * (Ported from cuCascade, commit 1b0e7b6c28dafa43bfe2c48011a3657c0dd6f127)
+ */
+
+#include "common.hpp"
+#include "memory_reservation.hpp"
+#include "memory_reservation_manager.hpp"
+#include "memory_space.hpp"
+
+#include "../utils/overloaded.hpp"
+
+#include <rmm/cuda_device.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
+
+#include <algorithm>
+#include <cstdint>
+#include <mutex>
+#include <stdexcept>
+#include <variant>
+
+namespace cudf_streaming {
+namespace prefetch {
+namespace memory {
+
+//===----------------------------------------------------------------------===//
+// Reservation Strategy Implementations
+//===----------------------------------------------------------------------===//
+
+std::span<memory_space*> reservation_request_strategy::get_all_memory_resource(
+  memory_reservation_manager& manager)
+{
+  return manager.get_mutable_all_memory_spaces();
+}
+
+std::span<memory_space*> reservation_request_strategy::get_all_memory_resource(
+  memory_reservation_manager& manager, Tier tier)
+{
+  return manager.get_mutable_memory_spaces_for_tier(tier);
+}
+
+memory_space* reservation_request_strategy::get_memory_resource(memory_reservation_manager& manager,
+                                                                memory_space_id source_id)
+{
+  return manager.get_mutable_memory_space(source_id.tier, source_id.device_id);
+}
+
+std::vector<memory_space*> reservation_request_strategy::get_memory_resource(
+  memory_reservation_manager& manager, std::span<memory_space_id> source_ids)
+{
+  return manager.get_mutable_memory_space(source_ids);
+}
+
+std::vector<memory_space*> any_memory_space_in_tier_with_preference::get_candidates(
+  memory_reservation_manager& manager) const
+{
+  auto cs = this->get_all_memory_resource(manager, tier);
+  std::vector<memory_space*> candidates{cs.begin(), cs.end()};
+  if (preferred_device_id.has_value()) {
+    std::stable_partition(candidates.begin(),
+                          candidates.end(),
+                          [device_id = static_cast<int>(preferred_device_id.value())](
+                            const auto* ms) { return ms->get_device_id() == device_id; });
+  }
+  return candidates;
+}
+
+std::vector<memory_space*> any_memory_space_in_tier::get_candidates(
+  memory_reservation_manager& manager) const
+{
+  auto cs = this->get_all_memory_resource(manager, tier);
+  return {cs.begin(), cs.end()};
+}
+
+std::vector<memory_space*> any_memory_space_in_tiers::get_candidates(
+  memory_reservation_manager& manager) const
+{
+  std::vector<memory_space*> candidates;
+  for (Tier t : tiers) {
+    for (auto candidate : this->get_all_memory_resource(manager, t)) {
+      candidates.emplace_back(candidate);
+    }
+  }
+  return candidates;
+}
+
+std::vector<memory_space*> specific_memory_space::get_candidates(
+  memory_reservation_manager& manager) const
+{
+  auto* ms = this->get_memory_resource(manager, target_id);
+  if (ms) { return {ms}; }
+  return {};
+}
+
+std::vector<memory_space*> any_memory_space_to_downgrade::get_candidates(
+  [[maybe_unused]] memory_reservation_manager& manager) const
+{
+  return {};
+}
+
+std::vector<memory_space*> any_memory_space_to_upgrade::get_candidates(
+  [[maybe_unused]] memory_reservation_manager& manager) const
+{
+  return {};
+}
+
+//===----------------------------------------------------------------------===//
+// memory_reservation_manager Implementation
+//===----------------------------------------------------------------------===//
+
+memory_reservation_manager::memory_reservation_manager(std::vector<memory_space_config> configs)
+{
+  if (configs.empty()) {
+    throw std::invalid_argument("At least one memory_space configuration must be provided");
+  }
+
+  for (auto& config : configs) {
+    std::visit(utils::overloaded{
+                 [&](auto&& specific_config) {
+                   _memory_spaces.emplace_back(std::make_unique<memory_space>(specific_config));
+                 },
+                 [](std::monostate&) {
+                   throw std::invalid_argument("Unknown memory_space configuration type");
+                 }},
+               config);
+  }
+
+  build_lookup_tables();
+}
+
+memory_reservation_manager::~memory_reservation_manager() { shutdown(); }
+
+std::unique_ptr<reservation> memory_reservation_manager::request_reservation(
+  const reservation_request_strategy& request, std::size_t size)
+{
+  if (auto res = select_memory_space_and_make_reservation(request, size); res.has_value()) {
+    return std::move(res.value());
+  }
+
+  std::unique_lock<std::mutex> lock(_wait_mutex);
+  for (;;) {
+    if (auto res = select_memory_space_and_make_reservation(request, size); res.has_value()) {
+      lock.unlock();
+      return std::move(res.value());
+    }
+    _wait_cv.wait(lock);
+  }
+}
+
+const memory_space* memory_reservation_manager::get_memory_space(Tier tier,
+                                                                  int32_t device_id) const
+{
+  memory_space_id id(tier, device_id);
+  auto it = _memory_space_lookup.find(id);
+  return (it != _memory_space_lookup.end()) ? it->second : nullptr;
+}
+
+memory_space* memory_reservation_manager::get_memory_space(Tier tier, int32_t device_id)
+{
+  return get_mutable_memory_space(tier, device_id);
+}
+
+std::span<const memory_space*> memory_reservation_manager::get_memory_spaces_for_tier(
+  Tier tier) const
+{
+  auto it = _const_tier_to_memory_spaces.find(tier);
+  if (it != _const_tier_to_memory_spaces.end()) {
+    return const_cast<std::vector<const memory_space*>&>(it->second);
+  }
+  return {};
+}
+
+std::span<const memory_space*> memory_reservation_manager::get_all_memory_spaces() const noexcept
+{
+  return const_cast<std::vector<const memory_space*>&>(_const_memory_space_views);
+}
+
+memory_space* memory_reservation_manager::get_mutable_memory_space(Tier tier, int32_t device_id)
+{
+  memory_space_id id(tier, device_id);
+  auto it = _memory_space_lookup.find(id);
+  return (it != _memory_space_lookup.end()) ? it->second : nullptr;
+}
+
+std::vector<memory_space*> memory_reservation_manager::get_mutable_memory_space(
+  std::span<memory_space_id> ids)
+{
+  std::vector<memory_space*> spaces;
+  for (const auto& id : ids) {
+    auto* ms = get_mutable_memory_space(id.tier, id.device_id);
+    if (ms) { spaces.push_back(ms); }
+  }
+  return spaces;
+}
+
+std::span<memory_space*> memory_reservation_manager::get_mutable_memory_spaces_for_tier(Tier tier)
+{
+  auto it = _tier_to_memory_spaces.find(tier);
+  if (it != _tier_to_memory_spaces.end()) { return it->second; }
+  return {};
+}
+
+std::span<memory_space*> memory_reservation_manager::get_mutable_all_memory_spaces() noexcept
+{
+  return _memory_space_views;
+}
+
+std::size_t memory_reservation_manager::get_available_memory_for_tier(Tier tier) const
+{
+  std::size_t total_available = 0;
+  auto spaces                 = get_memory_spaces_for_tier(tier);
+  for (const auto* space : spaces) {
+    total_available += space->get_available_memory();
+  }
+  return total_available;
+}
+
+std::size_t memory_reservation_manager::get_total_reserved_memory_for_tier(Tier tier) const
+{
+  std::size_t total_reserved = 0;
+  auto spaces                = get_memory_spaces_for_tier(tier);
+  for (const auto* space : spaces) {
+    total_reserved += space->get_total_reserved_memory();
+  }
+  return total_reserved;
+}
+
+std::size_t memory_reservation_manager::get_active_reservation_count_for_tier(Tier tier) const
+{
+  std::size_t total_count = 0;
+  auto spaces             = get_memory_spaces_for_tier(tier);
+  for (const auto* space : spaces) {
+    total_count += space->get_active_reservation_count();
+  }
+  return total_count;
+}
+
+std::size_t memory_reservation_manager::get_total_available_memory() const
+{
+  std::size_t total = 0;
+  for (const auto& space : _memory_spaces) {
+    total += space->get_available_memory();
+  }
+  return total;
+}
+
+std::size_t memory_reservation_manager::get_total_reserved_memory() const
+{
+  std::size_t total = 0;
+  for (const auto& space : _memory_spaces) {
+    total += space->get_total_reserved_memory();
+  }
+  return total;
+}
+
+std::size_t memory_reservation_manager::get_active_reservation_count() const
+{
+  std::size_t total = 0;
+  for (const auto& space : _memory_spaces) {
+    total += space->get_active_reservation_count();
+  }
+  return total;
+}
+
+std::optional<std::unique_ptr<reservation>>
+memory_reservation_manager::select_memory_space_and_make_reservation(
+  const reservation_request_strategy& request, std::size_t size)
+{
+  using ReserveFnPtr = std::unique_ptr<reservation> (memory_space::*)(std::size_t);
+
+  auto try_candidates = [](std::span<memory_space*> candidates,
+                           ReserveFnPtr res_fn,
+                           std::size_t size) -> std::optional<std::unique_ptr<reservation>> {
+    for (memory_space* space : candidates) {
+      if (space) {
+        if (auto res = std::invoke(res_fn, space, size)) { return res; }
+      }
+    }
+    return std::nullopt;
+  };
+
+  bool has_strong_ordering = request.has_strong_ordering();
+  auto candidates          = request.get_candidates(*this);
+  if (has_strong_ordering) {
+    return try_candidates(candidates, &memory_space::make_reservation, size);
+  } else {
+    if (auto res = try_candidates(candidates, &memory_space::make_reservation_or_null, size)) {
+      return res;
+    }
+    return try_candidates(candidates, &memory_space::make_reservation, size);
+  }
+}
+
+void memory_reservation_manager::build_lookup_tables()
+{
+  _memory_space_lookup.clear();
+  _tier_to_memory_spaces.clear();
+  _const_tier_to_memory_spaces.clear();
+  _memory_space_views.clear();
+  _const_memory_space_views.clear();
+
+  for (const auto& space : _memory_spaces) {
+    memory_space* space_ptr = space.get();
+    _memory_space_views.push_back(space_ptr);
+    _const_memory_space_views.push_back(space_ptr);
+
+    _memory_space_lookup[space_ptr->get_id()] = space_ptr;
+    _tier_to_memory_spaces[space_ptr->get_tier()].push_back(space_ptr);
+    _const_tier_to_memory_spaces[space_ptr->get_tier()].push_back(space_ptr);
+  }
+}
+
+void memory_reservation_manager::shutdown()
+{
+  for (const auto& space : _memory_spaces) {
+    space->shutdown();
+  }
+}
+
+}  // namespace memory
+}  // namespace prefetch
+}  // namespace cudf_streaming
