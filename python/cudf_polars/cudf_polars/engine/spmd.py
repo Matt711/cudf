@@ -350,13 +350,14 @@ def _make_sirius_engine() -> object | None:
         os.environ.get("AWS_ENDPOINT_URL_S3", f"https://s3.{region}.amazonaws.com"),
     )
 
+    _host_mem_bytes = int(os.environ.get("SIRIUS_HOST_MEMORY_BYTES", str(64 * 1024**3)))
     ctx = ScanContext(
-        host_memory_bytes=int(os.environ.get("SIRIUS_HOST_MEMORY_BYTES", str(4 * 1024**3))),
+        host_memory_gb=_host_mem_bytes / (1024.0**3),
         gpu_device_id=int(os.environ.get("SIRIUS_GPU_DEVICE_ID", "0")),
         s3_endpoint=endpoint,
         s3_region=region,
-        s3_access_key=access_key,
-        s3_secret_key=secret_key,
+        s3_access_key_id=access_key,
+        s3_secret_access_key=secret_key,
         s3_session_token=session_token or "",
     )
     return SiriusAdapter(ctx)
