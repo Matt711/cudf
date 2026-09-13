@@ -9,7 +9,7 @@ import contextlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-import kvikio
+from urllib.parse import urlparse
 
 import pylibcudf as plc
 
@@ -172,13 +172,14 @@ def _prefetch_parquet_footers_for_paths(
     sizes: list[int | None] = []
 
     for path in paths:
-        if paths and plc.io.SourceInfo._is_remote_uri(path):
-            # We're OK to use `kvikio.RemoteFile.open_s3_url` here. It does make an
-            # HTTP HEAD request to get the file size, but that's the entire reason we're
-            # running this code. So long as it makes just *one* HTTP request, there's no
-            # advantage to inferring the endpoint type.
-            with kvikio.RemoteFile.open_s3_url(path) as remote_file:  # pragma: no cover
-                sizes.append(remote_file.nbytes())
+        if paths and plc.io.SourceInfo._is_remote_uri(path):  # pragma: no cover
+            # Use boto3 for the HEAD request rather than kvikio: boto3 follows the full
+            # AWS credential chain (IAM task roles, instance profiles, env vars, etc.)
+            # while kvikio only reads AWS_ACCESS_KEY_ID and fails in ECS task-role envs.
+            import boto3
+            parsed = urlparse(path)
+            resp = boto3.client("s3").head_object(Bucket=parsed.netloc, Key=parsed.path.lstrip("/"))
+            sizes.append(resp["ContentLength"])
         else:
             sizes.append(None)
 
