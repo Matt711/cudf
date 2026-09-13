@@ -77,6 +77,7 @@ target_link_libraries(cudf_streaming_prefetch
     OpenSSL::SSL
     OpenSSL::Crypto
     Threads::Threads
+    CUDA::nvml_static
 )
 
 if(CUDF_STREAMING_HAS_URING)
