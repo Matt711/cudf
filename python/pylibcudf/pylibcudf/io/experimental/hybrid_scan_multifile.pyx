@@ -9,6 +9,7 @@ from libcpp.pair cimport pair
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
 
+from cuda.bindings.cyruntime cimport cudaStream_t
 from rmm.pylibrmm.memory_resource cimport DeviceMemoryResource
 from rmm.pylibrmm.stream cimport Stream
 
@@ -237,6 +238,7 @@ cdef class HybridScanMultiFile:
             row_group_indices
         )
         cdef Stream _stream = _get_stream(stream)
+        cdef cudaStream_t _cs = _stream.view().get()
         cdef column_view mask_view = row_mask.view()
         cdef pair[vector[byte_range_info], vector[size_type]] c_result
         with nogil:
@@ -246,7 +248,7 @@ cdef class HybridScanMultiFile:
                 ),
                 mask_view,
                 options.c_obj,
-                _stream.view().value()
+                _cs
             ))
         return (
             [ByteRangeInfo(r.offset(), r.size()) for r in c_result.first],
@@ -307,6 +309,7 @@ cdef class HybridScanMultiFile:
         # keep reference to avoid use-after-free of device spans
         self._payload_page_data = page_data
 
+        cdef cudaStream_t _cs = self._stream.view().get()
         cdef column_view mask_view = row_mask.view()
         with nogil:
             self.c_obj.get()[0].setup_chunking_for_payload_columns(
@@ -321,7 +324,7 @@ cdef class HybridScanMultiFile:
                     spans_vec.size()
                 ),
                 options.c_obj,
-                self._stream.view().value(),
+                _cs,
                 self.mr.get_mr()
             )
 
@@ -475,6 +478,7 @@ cdef class HybridScanMultiFile:
         """
         cdef Stream _stream = _get_stream(stream)
         _mr = _get_memory_resource(mr)
+        cdef cudaStream_t _cs = _stream.view().get()
         cdef vector[vector[size_type]] indices = _get_row_group_indices(
             row_group_indices
         )
@@ -492,7 +496,7 @@ cdef class HybridScanMultiFile:
                     spans_vec.size()
                 ),
                 options.c_obj,
-                _stream.view().value(),
+                _cs,
                 _mr.get_mr()
             )
         return TableWithMetadata.from_libcudf(c_result, _stream, _mr)
@@ -529,6 +533,7 @@ cdef class HybridScanMultiFile:
         """
         self._stream = _get_stream(stream)
         self.mr = _get_memory_resource(mr)
+        cdef cudaStream_t _cs = self._stream.view().get()
         cdef vector[vector[size_type]] indices = _get_row_group_indices(
             row_group_indices
         )
@@ -549,7 +554,7 @@ cdef class HybridScanMultiFile:
                     spans_vec.size()
                 ),
                 options.c_obj,
-                self._stream.view().value(),
+                _cs,
                 self.mr.get_mr()
             )
 
