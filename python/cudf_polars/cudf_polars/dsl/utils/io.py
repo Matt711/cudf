@@ -173,14 +173,12 @@ def _prefetch_parquet_footers_for_paths(
 
     for path in paths:
         if paths and plc.io.SourceInfo._is_remote_uri(path):
-            # Try to get the file size via kvikio for an early HTTP HEAD request.
-            # kvikio.RemoteFile.open does not support all URI schemes (e.g. s3://)
-            # in all build configurations, so fall back to None if it fails.
-            try:  # pragma: no cover
-                with kvikio.RemoteFile.open(path) as remote_file:
-                    sizes.append(remote_file.nbytes())
-            except Exception:  # pragma: no cover
-                sizes.append(None)
+            # We're OK to use `kvikio.RemoteFile.open_s3_url` here. It does make an
+            # HTTP HEAD request to get the file size, but that's the entire reason we're
+            # running this code. So long as it makes just *one* HTTP request, there's no
+            # advantage to inferring the endpoint type.
+            with kvikio.RemoteFile.open_s3_url(path) as remote_file:  # pragma: no cover
+                sizes.append(remote_file.nbytes())
         else:
             sizes.append(None)
 
