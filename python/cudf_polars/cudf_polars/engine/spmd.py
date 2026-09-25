@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
@@ -445,6 +446,10 @@ class SPMDEngine(StreamingEngine):
             engine_options.get("hardware_binding", HardwareBindingPolicy()),
         )
         bind_to_gpu(hw_binding)
+
+        if os.environ.get("SIRIUS_DATASOURCE", "0") == "1":
+            from cudf_polars.engine.core import _get_or_create_sirius_registry
+            _get_or_create_sirius_registry(None)
 
         configure_kvikio(
             executor_options["kvikio_nthreads"],

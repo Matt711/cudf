@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+# Use the classic setuptools + Cython build path rather than scikit-build-core;
+# this extension depends on non-rapids C++ libraries (libcudf_prefetch_io,
+# libcucascade) whose CMake targets are not available via find_package() in
+# general Docker / CI environments.  setup.py performs direct path discovery
+# and is easier to override via environment variables.
+requires = [
+    "setuptools>=68",
+    "Cython>=3.0,<4",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sirius-cache"
+version = "0.1.0.dev0"
+description = "Sirius prefetch-cache IO stack binding for cudf-polars benchmarks"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+
+# Runtime dependencies expected to be satisfied by the Docker image.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sirius_cache*"]

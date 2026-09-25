@@ -10,6 +10,7 @@ import json
 import os
 import socket
 import threading
+import time
 import uuid
 import weakref
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar
@@ -66,6 +67,57 @@ if TYPE_CHECKING:
     from cudf_polars.streaming.base import PartitionInfo
     from cudf_polars.streaming.parallel import ConfigOptions
     from cudf_polars.utils.config import StreamingExecutor
+
+# Process-level singleton IoContextRegistry.  Created on first use when
+# SIRIUS_DATASOURCE=1, kept alive for the entire process.  Per the design,
+# reset_caches() is only called between benchmark iterations (not between
+# queries), so this must NOT be destroyed after each query.
+_sirius_registry: Any = None
+
+# Persistent thread pool for proactive background S3 prefetch.  Submits
+# full-file fadvise for known dataset paths NOT in the current query so that
+# cross-query data is cached during the previous query's execution, reducing
+# Q+1 cache miss rate.  Only active when SIRIUS_PROACTIVE_PREFETCH=1.
+_sirius_proactive_pool: Any = None  # concurrent.futures.ThreadPoolExecutor
+
+
+def _get_proactive_pool() -> Any:
+    """Return (creating if needed) the process-level proactive prefetch pool."""
+    global _sirius_proactive_pool
+    if _sirius_proactive_pool is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _sirius_proactive_pool = ThreadPoolExecutor(
+            max_workers=16, thread_name_prefix="sirius-proactive"
+        )
+    return _sirius_proactive_pool
+
+
+def _submit_proactive_prefetch(
+    registry: Any,
+    all_known: dict[str, Any],
+    skip_paths: set[str],
+) -> None:
+    """Submit background full-file fadvise for paths known but not in the current query.
+
+    Runs concurrently with the NEXT query's planning and execution, giving the
+    Sirius cache download time for data needed by future queries.  Matches the
+    cross-query lookahead prefetch that Sirius native does via prepare_for_query().
+    """
+    pool = _get_proactive_pool()
+    for path, info in list(all_known.items()):
+        if path in skip_paths or info.size is None:
+            continue
+        file_size = info.size
+
+        def _do(p: str = path, s: int = file_size, reg: Any = registry) -> None:
+            try:
+                ds = reg.open_datasource(p)
+                ds.fadvise([(0, s)])
+            except Exception:
+                pass
+
+        pool.submit(_do)
 
 
 T = TypeVar("T")
@@ -853,6 +905,440 @@ def allgather_stats(
     return StatsCollector.deserialize(json.loads(all_data[0]), ir)
 
 
+_query_reset_t: float | None = None
+
+# Process-level datasource cache: reuses SiriusDatasource base objects across queries.
+# open_datasource() takes ~10-14ms per S3 path; caching here avoids re-paying that cost
+# for files already opened in a prior query. Safe across reset_caches() calls because
+# reset_caches() only evicts pinned block data, not the HTTP client/file handle state.
+_global_datasource_cache: dict[str, Any] = {}
+
+
+def get_query_reset_t() -> float | None:
+    """Return the timestamp of the last reset_sirius_caches() call completion.
+
+    Used by ReadaheadScanManager.start() to measure Python query setup delay
+    (dead time between cache reset and first GET being issued).
+    """
+    return _query_reset_t
+
+
+# Fine-grained timing for setup_delay decomposition (set each query, read by setup_breakdown).
+_evaluate_on_rank_t: float | None = None  # start of evaluate_on_rank
+_after_allgather_t: float | None = None   # after allgather_stats completes
+
+
+def reset_sirius_caches() -> None:
+    """Evict all prefetch-cached blocks from the process-level IoContextRegistry.
+
+    Call this between benchmark iterations to start each iteration cold.
+    Has no effect if SIRIUS_DATASOURCE=1 has never been used in this process.
+    """
+    global _query_reset_t
+    if _sirius_registry is not None:
+        from sirius_cache import reset_caches
+        reset_caches()
+    _query_reset_t = time.perf_counter()
+
+
+def mark_query_start() -> None:
+    """Record the current time as _query_reset_t without resetting caches.
+
+    Call this just before q.collect() so setup_delay is measured in warm mode
+    (where reset_sirius_caches() is not called between queries).
+    """
+    global _query_reset_t
+    _query_reset_t = time.perf_counter()
+
+
+def _get_or_create_sirius_registry(config_options: Any) -> Any:
+    """Return the process-level IoContextRegistry singleton, creating it on first call.
+
+    The registry owns the pinned memory pool and libcurl reactor threads.  It must
+    live across all queries in a process (warm-mode semantics: cache accumulates
+    across queries).  reset_caches() is only called between benchmark iterations by
+    the benchmark runner, never here.
+
+    All ScanManagerConfig fields are tunable via environment variables.  Defaults
+    match the Sirius production config (sirius/config.yaml):
+
+      REST_N_REACTORS                  — libcurl S3 reactor threads (default 16)
+      SIRIUS_NUM_THREADS               — scan-manager worker threads (default 20)
+      SIRIUS_HOST_CAPACITY_BYTES       — pinned-RAM pool size in bytes (default 200 GiB)
+      SIRIUS_HOST_POOL_SIZE_MIB        — per-pool slab size in MiB (default 512)
+      SIRIUS_HOST_INITIAL_NUMBER_POOLS — number of preallocated slabs (default 300)
+      SIRIUS_EVICTION_THRESHOLD_FRACTION — LRU eviction trigger fraction (default 0.8)
+      SIRIUS_ENDPOINT                  — S3 endpoint URL
+      AWS_DEFAULT_REGION               — S3 region (default us-east-2)
+      AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN — credentials
+    """
+    global _sirius_registry
+    if _sirius_registry is None:
+        from sirius_cache import IoContextRegistry, ScanManagerConfig
+
+        _sirius_registry = IoContextRegistry(
+            ScanManagerConfig(
+                rest_n_reactors=int(os.environ.get("REST_N_REACTORS", "16")),
+                num_threads=int(os.environ.get("SIRIUS_NUM_THREADS", "20")),
+                host_capacity_bytes=int(
+                    os.environ.get("SIRIUS_HOST_CAPACITY_BYTES", str(200 * 1024**3))
+                ),
+                host_pool_size_mib=int(os.environ.get("SIRIUS_HOST_POOL_SIZE_MIB", "512")),
+                host_initial_number_pools=int(
+                    os.environ.get("SIRIUS_HOST_INITIAL_NUMBER_POOLS", "300")
+                ),
+                eviction_threshold_fraction=float(
+                    os.environ.get("SIRIUS_EVICTION_THRESHOLD_FRACTION", "0.8")
+                ),
+                object_store_endpoint=os.environ.get(
+                    "SIRIUS_ENDPOINT", "https://s3.us-east-2.amazonaws.com"
+                ),
+                object_store_region=os.environ.get("AWS_DEFAULT_REGION", "us-east-2"),
+                access_key=os.environ.get("AWS_ACCESS_KEY_ID", ""),
+                secret_key=os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+                session_token=os.environ.get("AWS_SESSION_TOKEN", ""),
+            )
+        )
+    return _sirius_registry
+
+
+def _extract_first_parquet_path(ir: IR) -> str | None:
+    """Return the first parquet file path found in the IR, or None.
+
+    Used to start warmup (libcurl connection pool) before footer metadata is
+    fetched, so warmup and footer fetch run concurrently.
+    """
+    from cudf_polars.dsl.traversal import traversal
+    from cudf_polars.streaming.io import StreamingScan
+
+    for node in traversal([ir]):
+        if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
+            for task in node.tasks:
+                if task.paths:
+                    return task.paths[0]
+    return None
+
+
+def _attach_sirius_datasources(
+    ir: IR,
+    config_options: Any,
+    warmup_thread: threading.Thread | None = None,
+) -> Any | None:
+    """Set up SiriusDatasource objects and a ReadaheadScanManager for all parquet scan tasks.
+
+    Called after attach_cached_parquet_metadata, before execute_ir_on_rank.
+    Stores datasources in base_scan._sirius_datasources keyed by (tuple(paths), split_index).
+    Each value is [datasources, stage_list] where datasources is list[SiriusDatasource] (one
+    per file-slice) and stage_list=[0] is a shared mutable container so do_evaluate can signal
+    reading/disposed back to the readahead worker.
+
+    Returns readahead (ReadaheadScanManager) which the caller must stop() after query execution.
+    Returns None only when no parquet scan nodes are found.
+    The IoContextRegistry is a process-level singleton — it is NOT returned or destroyed here.
+    sirius_cache import errors propagate — a missing library is a deployment error.
+    """
+    from cudf_polars.streaming.io import ParquetScanTask, StreamingScan
+    from cudf_polars.streaming.readahead import PrefetchStrategy, ReadaheadScanManager
+
+    registry = _get_or_create_sirius_registry(config_options)
+
+    # Reset per-cycle stats counters without evicting cached blocks.
+    # This gives per-query last_cycle numbers in cache_summary().
+    registry.prepare_for_query()
+
+    from cudf_polars.dsl.traversal import traversal
+
+    scan_nodes = [
+        node
+        for node in traversal([ir])
+        if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet"
+    ]
+
+    if not scan_nodes:
+        return None, set()
+
+    if warmup_thread is not None:
+        # Early warmup was started concurrently with footer fetch; join it now.
+        # By this point footer fetch (meta phase) has already run, so warmup
+        # is almost certainly complete. Timeout is a safety net only.
+        warmup_thread.join(timeout=1.0)
+    else:
+        # Synchronous warmup: pre-establish libcurl connection pool to S3 endpoint.
+        first_path = next(
+            (t.paths[0] for node in scan_nodes for t in node.tasks if t.paths),
+            None,
+        )
+        if first_path:
+            registry.warmup(first_path)
+
+    rest_n_reactors = int(os.environ.get("REST_N_REACTORS", "16"))
+    readahead = ReadaheadScanManager(budget=rest_n_reactors)
+    cache_datasources = os.environ.get("SIRIUS_CACHE_PARQUET_FOOTERS", "0") == "1"
+    early_fadvise = os.environ.get("SIRIUS_EARLY_FADVISE", "0") == "1"
+    query_paths: set[str] = set()
+
+    # SIRIUS_EARLY_FADVISE: start the readahead worker before the registration loop so
+    # GETs begin during task enumeration (matching Sirius's scan_manager background
+    # threads that issue fadvise file-by-file as metadata arrives). Each task notifies
+    # the worker immediately after registration instead of waiting for the full batch.
+    if early_fadvise:
+        readahead.start(PrefetchStrategy.eager, streaming=True)
+
+    for operator_id, scan_node in enumerate(scan_nodes):
+        base_scan = scan_node.base_scan
+
+        if base_scan._sirius_datasources is None:
+            base_scan._sirius_datasources = {}
+
+        for task in scan_node.tasks:
+            if not isinstance(task, ParquetScanTask):
+                continue
+
+            # One datasource per file-slice, matching Sirius scan_info._datasources.
+            # Fadvise ranges are also per-path (per file-slice).
+            per_path_ranges = _compute_fadvise_ranges_per_path(task)
+            datasources: list[Any] = []
+            for i, path in enumerate(task.paths):
+                query_paths.add(path)
+                if cache_datasources and path in _global_datasource_cache:
+                    base_ds = _global_datasource_cache[path]
+                else:
+                    base_ds = registry.open_datasource(path)
+                    if cache_datasources:
+                        _global_datasource_cache[path] = base_ds
+                ds = base_ds.duplicate()
+                ranges = per_path_ranges[i] if i < len(per_path_ranges) else []
+                if ranges:
+                    ds.fadvise([(r.offset, r.size) for r in ranges])
+                datasources.append(ds)
+
+            stage_list: list[int] = [0]
+            key = (tuple(task.paths), task.split_index)
+            base_scan._sirius_datasources[key] = [datasources, stage_list]
+
+            readahead.register_scan_task(task, operator_id)
+            if early_fadvise:
+                readahead.notify_new_task()
+
+        readahead.mark_operator_closed(operator_id)
+
+    if early_fadvise:
+        readahead.finish_registration()
+    else:
+        readahead.start(PrefetchStrategy.eager)
+    return readahead, query_paths
+
+
+class _FullFileRange:
+    """Simple byte-range descriptor for a whole-file fadvise fallback."""
+
+    __slots__ = ("offset", "size")
+
+    def __init__(self, size: int) -> None:
+        self.offset = 0
+        self.size = size
+
+
+def _compute_fadvise_ranges_per_path(task: Any) -> list[list]:
+    """Compute payload column-chunk byte ranges for each file-slice in a task.
+
+    Returns a list of byte-range lists, one per path in task.paths, matching
+    Sirius parquet_fadvise_entries() which computes per-file-slice ranges.
+    When precise row-group byte ranges are unavailable, falls back to full-file
+    fadvise so the prefetch cache still gets a chance to prefetch the file.
+    """
+    return _compute_fadvise_ranges_with_infos(task, task._get_cached_parquet_info())
+
+
+def _compute_fadvise_ranges_with_infos(task: Any, cached_infos: list | None) -> list[list]:
+    """Like _compute_fadvise_ranges_per_path but takes infos directly.
+
+    Used by per-file streaming where infos are available before being attached
+    to base_scan.cached_parquet_info.
+    """
+    if not cached_infos:
+        return [[] for _ in task.paths]
+    bounds = task._get_task_bounds(cached_infos)
+    result: list[list] = []
+    for i, info in enumerate(cached_infos):
+        if bounds.row_groups is None or i >= len(bounds.row_groups):
+            if info.size:
+                result.append([_FullFileRange(info.size)])
+            else:
+                result.append([])
+            continue
+        if info._hybrid_scan_metadata is None:
+            if info.size:
+                result.append([_FullFileRange(info.size)])
+            else:
+                result.append([])
+            continue
+        rg_indices = bounds.row_groups[i]
+        if not rg_indices:
+            result.append([])
+            continue
+        options = info.default_reader_options()
+        if task.base_scan.with_columns is not None:
+            options.set_column_names(task.base_scan.with_columns)
+        reader = info.hybrid_scan_reader(options)
+        result.append(reader.payload_column_chunks_byte_ranges(rg_indices, options))
+    return result
+
+
+def _attach_sirius_datasources_streaming(
+    ir: IR,
+    config_options: Any,
+) -> tuple[Any, set[str], dict[str, Any]]:
+    """Per-file streaming variant of _attach_sirius_datasources.
+
+    Matches Sirius scan_manager: as each file's footer is fetched, immediately
+    compute byte ranges, create its datasource, fadvise, and register with the
+    readahead worker. The worker starts S3 GETs for each file as soon as its
+    footer is ready — without waiting for all files' footers.
+
+    Returns (readahead, query_paths, all_cached_infos). Caller must still call
+    attach_cached_parquet_metadata(ir, all_cached_infos) for the reader to use.
+    """
+    import concurrent.futures
+
+    from cudf_polars.dsl.traversal import traversal
+    from cudf_polars.dsl.utils.io import (
+        _global_parquet_footer_cache,
+        _prefetch_parquet_footers_for_paths,
+    )
+    from cudf_polars.streaming.io import ParquetScanTask, StreamingScan
+    from cudf_polars.streaming.readahead import PrefetchStrategy, ReadaheadScanManager
+
+    registry = _get_or_create_sirius_registry(config_options)
+    registry.prepare_for_query()
+
+    scan_nodes = [
+        node
+        for node in traversal([ir])
+        if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet"
+    ]
+    if not scan_nodes:
+        return None, set(), {}
+
+    rest_n_reactors = int(os.environ.get("REST_N_REACTORS", "16"))
+    n_meta_threads = int(os.environ.get("SIRIUS_EARLY_FADVISE_THREADS", "16"))
+    cache_datasources = os.environ.get("SIRIUS_CACHE_PARQUET_FOOTERS", "0") == "1"
+    parse_hybrid = True  # always needed for fadvise ranges
+
+    # --- Build task inventory ---
+    # task_pending[task_key] = number of paths whose footers haven't arrived yet.
+    # task_infos[task_key]   = {path: CachedParquetInfo} accumulated as footers arrive.
+    # path_to_tasks[path]    = [(task, op_id)] so each footer result updates the right tasks.
+    task_pending: dict[int, int] = {}
+    task_infos: dict[int, dict[str, Any]] = {}
+    path_to_tasks: dict[str, list[tuple[Any, int]]] = {}
+    operator_remaining: dict[int, int] = {}  # op_id → tasks not yet registered
+
+    for op_id, scan_node in enumerate(scan_nodes):
+        if scan_node.base_scan._sirius_datasources is None:
+            scan_node.base_scan._sirius_datasources = {}
+        task_count = 0
+        for task in scan_node.tasks:
+            if not isinstance(task, ParquetScanTask):
+                continue
+            key = id(task)
+            task_pending[key] = len(task.paths)
+            task_infos[key] = {}
+            for path in task.paths:
+                path_to_tasks.setdefault(path, []).append((task, op_id))
+            task_count += 1
+        operator_remaining[op_id] = task_count
+
+    readahead = ReadaheadScanManager(budget=rest_n_reactors)
+    readahead.start(PrefetchStrategy.eager, streaming=True)
+
+    all_cached_infos: dict[str, Any] = {}
+    query_paths: set[str] = set()
+
+    def _register_task(task: Any, op_id: int) -> None:
+        """Process one fully-resolved task: ranges → datasource → fadvise → register."""
+        infos = task_infos[id(task)]
+        cached_info_list = [infos[p] for p in task.paths if p in infos]
+        per_path_ranges = _compute_fadvise_ranges_with_infos(task, cached_info_list)
+
+        datasources: list[Any] = []
+        for i, path in enumerate(task.paths):
+            query_paths.add(path)
+            if cache_datasources and path in _global_datasource_cache:
+                base_ds = _global_datasource_cache[path]
+            else:
+                base_ds = registry.open_datasource(path)
+                if cache_datasources:
+                    _global_datasource_cache[path] = base_ds
+            ds = base_ds.duplicate()
+            ranges = per_path_ranges[i] if i < len(per_path_ranges) else []
+            if ranges:
+                ds.fadvise([(r.offset, r.size) for r in ranges])
+            datasources.append(ds)
+
+        stage_list: list[int] = [0]
+        key_ds = (tuple(task.paths), task.split_index)
+        task.base_scan._sirius_datasources[key_ds] = [datasources, stage_list]
+
+        readahead.register_scan_task(task, op_id)
+        readahead.notify_new_task()
+
+        operator_remaining[op_id] -= 1
+        if operator_remaining[op_id] == 0:
+            readahead.mark_operator_closed(op_id)
+
+    def _resolve_path(path: str, info: Any) -> None:
+        """Apply a fetched footer to all tasks that need it."""
+        all_cached_infos[path] = info
+        if cache_datasources:
+            _global_parquet_footer_cache[path] = info
+        for task, op_id in path_to_tasks.get(path, []):
+            key = id(task)
+            task_infos[key][path] = info
+            task_pending[key] -= 1
+            if task_pending[key] == 0:
+                _register_task(task, op_id)
+
+    # --- Warmup: start libcurl connection pool init in background ---
+    # Runs concurrently with Phase 1 (cached footer registration) and the start
+    # of Phase 2 (footer fetch). C++ warmup() has a built-in staleness check so
+    # Q2+ calls are no-ops (µs). Only Q1 iter0 pays the ~490ms pool init cost.
+    first_path = next(iter(path_to_tasks), None)
+    _warmup_thread: threading.Thread | None = None
+    if first_path:
+        _warmup_thread = threading.Thread(
+            target=registry.warmup, args=(first_path,), daemon=True, name="sirius-warmup"
+        )
+        _warmup_thread.start()
+
+    # --- Phase 1: paths already in footer cache — register tasks immediately ---
+    missing_paths: set[str] = set()
+    for path in path_to_tasks:
+        if cache_datasources and path in _global_parquet_footer_cache:
+            _resolve_path(path, _global_parquet_footer_cache[path])
+        else:
+            missing_paths.add(path)
+
+    # --- Phase 2: stream missing footers, registering each task as its paths resolve ---
+    # Warmup runs concurrently with Phase 2 — no join needed here. The warmup daemon
+    # thread will complete within ~490ms (Q1 iter0 only; Q2+ are µs no-ops), well before
+    # data GETs are issued (which only start after footers are fetched and registered).
+    if missing_paths:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=n_meta_threads, thread_name_prefix="sirius-meta"
+        ) as pool:
+            future_to_path = {
+                pool.submit(_prefetch_parquet_footers_for_paths, [path], parse_hybrid_metadata=parse_hybrid): path
+                for path in missing_paths
+            }
+            for future in concurrent.futures.as_completed(future_to_path):
+                for info in future.result():
+                    _resolve_path(info.path, info)
+
+    readahead.finish_registration()
+    return readahead, query_paths, all_cached_infos
+
+
 def evaluate_on_rank(
     ctx: Context,
     comm: Communicator,
@@ -902,7 +1388,10 @@ def evaluate_on_rank(
     metadata
         Collected channel metadata.
     """
+    global _evaluate_on_rank_t, _after_allgather_t
+    _evaluate_on_rank_t = time.perf_counter()
     stats = allgather_stats(comm, ctx.br(), ir, config_options, py_executor)
+    _after_allgather_t = time.perf_counter()
     # ``get_stable_plan_id`` is a deterministic function of the IR
     # structure, so every rank derives the same logical plan ID for a
     # given query (only rank 0 emits the declaration, but physical plans
@@ -917,9 +1406,11 @@ def evaluate_on_rank(
     physical_op_by_id: dict[str, cudf_polars.quent._types.Operator] | None = None
     quent_operator_map: dict[IR, cudf_polars.quent._types.Operator] | None = None
 
+    _t_lower0 = time.perf_counter()
     lowering, node_map = lower_ir_graph_with_node_map(
         ir, config_options, stats, rank=comm.rank, nranks=comm.nranks
     )
+    _t_lower1 = time.perf_counter()
     optimized = lowering.optimized
     ir = lowering.lowered
     partition_info = lowering.partition_info
@@ -962,29 +1453,127 @@ def evaluate_on_rank(
         py_executor, get_cuda_stream=ctx.br().stream_pool.get_stream, query_id=query_id
     )
 
+    sirius_datasource_enabled = os.environ.get("SIRIUS_DATASOURCE", "0") == "1"
+    early_fadvise_enabled = os.environ.get("SIRIUS_EARLY_FADVISE", "0") == "1"
     prefetch_file_metadata = config_options.parquet_options.prefetch_file_metadata
-    if prefetch_file_metadata is not False:
-        cached_parquet_info_map = prefetch_parquet_file_metadata_for_ir(
-            ir,
-            ir_context.py_executor,
-            stats=stats,
-            parse_hybrid_metadata=config_options.parquet_options.use_hybrid_scan,
-        )
-        attach_cached_parquet_metadata(ir, cached_parquet_info_map)
+    # SIRIUS_DATASOURCE=1 requires hybrid scan metadata to compute fadvise byte ranges,
+    # regardless of whether the read itself uses the hybrid scan reader.
+    parse_hybrid_metadata = (
+        config_options.parquet_options.use_hybrid_scan or sirius_datasource_enabled
+    )
 
-    with ReserveOpIDs(ir, config_options) as collective_id_map:
-        return execute_ir_on_rank(
-            ctx,
-            comm,
-            ir,
-            ir_context,
-            partition_info,
-            config_options,
-            stats,
-            collective_id_map,
-            quent_operator_map=quent_operator_map,
-            local_quent_context=local_quent_context,
+    _sirius_readahead = None
+    _sirius_fadvised_paths: set[str] = set()
+
+    if sirius_datasource_enabled and early_fadvise_enabled:
+        # Per-file streaming path: warmup + footer fetch + fadvise + readahead start
+        # all happen concurrently in _attach_sirius_datasources_streaming. Each file's
+        # GET starts as soon as its footer is fetched — matches Sirius scan_manager.
+        if os.environ.get("SIRIUS_CACHE_PRINT_STATS", "0") == "1" and _sirius_registry is not None:
+            print("pre_query: " + _sirius_registry.cache_summary(), flush=True)
+        _t_meta0 = time.perf_counter()
+        _sirius_readahead, _sirius_fadvised_paths, _streaming_infos = (
+            _attach_sirius_datasources_streaming(ir, config_options)
         )
+        _t_meta1 = time.perf_counter()
+        # Attach infos to IR nodes so the parquet reader can use them.
+        if _streaming_infos:
+            attach_cached_parquet_metadata(ir, _streaming_infos)
+        elif prefetch_file_metadata is not False:
+            cached_parquet_info_map = prefetch_parquet_file_metadata_for_ir(
+                ir,
+                ir_context.py_executor,
+                stats=stats,
+                parse_hybrid_metadata=parse_hybrid_metadata,
+            )
+            attach_cached_parquet_metadata(ir, cached_parquet_info_map)
+        if os.environ.get("SIRIUS_CACHE_PRINT_STATS", "0") == "1":
+            from cudf_polars.callback import get_callback_entry_t, get_nt_entry_t
+            _nt_t = get_nt_entry_t()
+            _cb_t = get_callback_entry_t()
+            _lower_ms = (_t_lower1 - _t_lower0) * 1000
+            _meta_ms = (_t_meta1 - _t_meta0) * 1000
+            # Decompose nt_to_start into phases:
+            #   translate = IR translation + Polars UDF dispatch (nt_entry → callback_entry)
+            #   spmd      = callback → evaluate_on_rank entry (SPMD/quent setup)
+            #   allgather = allgather_stats across ranks
+            #   post_lower= after lowering → streaming start (quent build_plan, IRExecutionContext)
+            _translate_ms = ((_cb_t - _nt_t) * 1000) if (_cb_t and _nt_t) else 0.0
+            _spmd_ms = ((_evaluate_on_rank_t - _cb_t) * 1000) if (_evaluate_on_rank_t and _cb_t) else 0.0
+            _allgather_ms = ((_after_allgather_t - _evaluate_on_rank_t) * 1000) if (_after_allgather_t and _evaluate_on_rank_t) else 0.0
+            _post_lower_ms = ((_t_meta0 - _t_lower1) * 1000) if _t_lower1 else 0.0
+            print(
+                f"[sirius] setup_breakdown lower={_lower_ms:.1f}ms "
+                f"meta+attach={_meta_ms:.1f}ms (streaming) "
+                f"| translate={_translate_ms:.1f}ms spmd={_spmd_ms:.1f}ms "
+                f"allgather={_allgather_ms:.1f}ms post_lower={_post_lower_ms:.1f}ms",
+                flush=True,
+            )
+    else:
+        _t_meta0 = time.perf_counter()
+        if prefetch_file_metadata is not False or sirius_datasource_enabled:
+            cached_parquet_info_map = prefetch_parquet_file_metadata_for_ir(
+                ir,
+                ir_context.py_executor,
+                stats=stats,
+                parse_hybrid_metadata=parse_hybrid_metadata,
+            )
+            attach_cached_parquet_metadata(ir, cached_parquet_info_map)
+        _t_meta1 = time.perf_counter()
+
+        if sirius_datasource_enabled:
+            # Log cache state before prepare_for_query() resets last_cycle counters.
+            if os.environ.get("SIRIUS_CACHE_PRINT_STATS", "0") == "1" and _sirius_registry is not None:
+                print("pre_query: " + _sirius_registry.cache_summary(), flush=True)
+            _t_attach0 = time.perf_counter()
+            _sirius_readahead, _sirius_fadvised_paths = _attach_sirius_datasources(
+                ir, config_options
+            )
+            _t_attach1 = time.perf_counter()
+            if os.environ.get("SIRIUS_CACHE_PRINT_STATS", "0") == "1":
+                _lower_ms = (_t_lower1 - _t_lower0) * 1000
+                _meta_ms = (_t_meta1 - _t_meta0) * 1000
+                _attach_ms = (_t_attach1 - _t_attach0) * 1000
+                print(
+                    f"[sirius] setup_breakdown lower={_lower_ms:.1f}ms "
+                    f"meta={_meta_ms:.1f}ms attach={_attach_ms:.1f}ms",
+                    flush=True,
+                )
+
+    try:
+        with ReserveOpIDs(ir, config_options) as collective_id_map:
+            return execute_ir_on_rank(
+                ctx,
+                comm,
+                ir,
+                ir_context,
+                partition_info,
+                config_options,
+                stats,
+                collective_id_map,
+                quent_operator_map=quent_operator_map,
+                local_quent_context=local_quent_context,
+            )
+    finally:
+        if _sirius_readahead is not None:
+            _sirius_readahead.stop()
+        if sirius_datasource_enabled and os.environ.get("SIRIUS_CACHE_PRINT_STATS", "0") == "1":
+            if _sirius_registry is not None:
+                print(_sirius_registry.cache_summary(), flush=True)
+        # After query finishes, proactively prefetch all known paths NOT in this query.
+        # These downloads run concurrently with the next query's planning and early execution,
+        # giving the cache a head-start on cross-query data (matches Sirius's prepare_for_query
+        # lookahead that begins downloading future query data while current query is still live).
+        if (
+            sirius_datasource_enabled
+            and os.environ.get("SIRIUS_PROACTIVE_PREFETCH", "0") == "1"
+            and _sirius_registry is not None
+        ):
+            from cudf_polars.dsl.utils.io import _global_parquet_footer_cache
+
+            _submit_proactive_prefetch(
+                _sirius_registry, _global_parquet_footer_cache, _sirius_fadvised_paths
+            )
 
 
 def is_duplicated_output(metadata: list[ChannelMetadata] | None) -> bool:

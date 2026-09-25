@@ -676,6 +676,7 @@ class Scan(IR):
     """Input from files."""
 
     __slots__ = (
+        "_sirius_datasources",
         "cached_parquet_info",
         "cloud_options",
         "hive_parts",
@@ -785,6 +786,7 @@ class Scan(IR):
         self.parquet_options = parquet_options
         self.hive_parts = hive_parts
         self.cached_parquet_info = cached_parquet_info
+        self._sirius_datasources = None
 
         Scan._validate_cached_parquet_info(self.paths, self.cached_parquet_info)
         Scan._validate_hive_parts_info(self.paths, self.hive_parts)
@@ -1130,6 +1132,7 @@ class Scan(IR):
         cached_parquet_info: list[CachedParquetInfo] | None,
         *,
         context: IRExecutionContext,
+        datasource: list[Any] | None = None,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
         stream = context.get_cuda_stream()
@@ -1256,7 +1259,14 @@ class Scan(IR):
                     rows_per_path=[t.num_rows() for t in tables],
                 )
         elif typ == "parquet":
-            if cached_parquet_info is not None:
+            if datasource is not None:
+                # datasource is a list[SiriusDatasource], one per path (file-slice).
+                source_info = plc.io.SourceInfo(datasource)
+                parquet_metadatas = None
+                if cached_parquet_info is not None:
+                    Scan._validate_cached_parquet_info(paths, cached_parquet_info)
+                    parquet_metadatas = [info.file_metadata for info in cached_parquet_info]
+            elif cached_parquet_info is not None:
                 Scan._validate_cached_parquet_info(paths, cached_parquet_info)
                 filepath_sources = []
                 parquet_metadatas = []

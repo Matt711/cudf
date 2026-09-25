@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -22,8 +23,22 @@ from cudf_polars.streaming.io import (
 )
 
 if TYPE_CHECKING:
+    from typing import Any
+
     from cudf_polars.dsl.ir import IR
     from cudf_polars.streaming.base import StatsCollector
+
+# Cross-query parquet footer metadata cache. Populated when parse_hybrid_metadata=True
+# (i.e., SIRIUS_DATASOURCE=1 / use_hybrid_scan=True). Keyed by S3 path.
+# Matches Sirius's ioctx metadata store: block data is evicted between cold-mode queries
+# but footer metadata persists. Cleared between benchmark iterations via
+# clear_parquet_footer_cache(). Guarded by SIRIUS_CACHE_PARQUET_FOOTERS env var.
+_global_parquet_footer_cache: dict[str, Any] = {}
+
+
+def clear_parquet_footer_cache() -> None:
+    """Clear cross-query parquet footer cache (call between benchmark iterations)."""
+    _global_parquet_footer_cache.clear()
 
 
 @dataclass(frozen=True)
@@ -207,6 +222,15 @@ def prefetch_parquet_file_metadata_for_ir(
                 for info in datasource_info.cached_parquet_info:
                     cached_parquet_info[info.path] = info
 
+    # Cross-query footer cache: reuse footer metadata from prior queries to skip
+    # S3 re-fetches. Matches Sirius's ioctx metadata store — reset_sirius_cache()
+    # evicts block data but retains footer metadata across queries.
+    # Only active when parse_hybrid_metadata=True (SIRIUS_DATASOURCE=1 path).
+    if parse_hybrid_metadata and os.environ.get("SIRIUS_CACHE_PARQUET_FOOTERS", "0") == "1":
+        for path in all_paths:
+            if path in _global_parquet_footer_cache and path not in cached_parquet_info:
+                cached_parquet_info[path] = _global_parquet_footer_cache[path]
+
     missing_paths = all_paths - set(cached_parquet_info.keys())
     if remote_only:
         missing_paths = {
@@ -235,6 +259,11 @@ def prefetch_parquet_file_metadata_for_ir(
         for future in concurrent.futures.as_completed(futures):
             for info in future.result():
                 cached_parquet_info[info.path] = info
+
+    # Update global cross-query cache with newly fetched metadata.
+    if parse_hybrid_metadata and os.environ.get("SIRIUS_CACHE_PARQUET_FOOTERS", "0") == "1":
+        _global_parquet_footer_cache.update(cached_parquet_info)
+
     return cached_parquet_info
 
 

@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 import itertools
 import math
 import statistics
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, overload
@@ -264,15 +266,19 @@ def _read_with_hybrid_scan(
     split_index: int = 0,
     total_splits: int = 1,
     stats_pruning: bool = True,
+    datasource: Any = None,
 ) -> DataFrame:
     """Two-pass parquet read via HybridScanReader for a row-group-aligned task."""
     assert len(paths) == 1, "hybrid scan only supports tasks with one physical file"
     with nvtx_annotate_cudf_polars(
         message="HybridScan", payload=(split_index + 1, total_splits)
     ):
-        source_info = plc.io.SourceInfo(
-            [plc.io.types.FilepathSource(cached_info.path, cached_info.size)]
-        )
+        if datasource is not None:
+            source_info = plc.io.SourceInfo([datasource])
+        else:
+            source_info = plc.io.SourceInfo(
+                [plc.io.types.FilepathSource(cached_info.path, cached_info.size)]
+            )
         options = cached_info.default_reader_options()
         if with_columns is not None:
             options.set_column_names(with_columns)
@@ -527,6 +533,92 @@ class ParquetScanTask(ScanTask):
             hive_parts,
         )
 
+    def _sirius_entry(self) -> tuple[list[Any], list[int]] | None:
+        """Return (datasources, stage_list) from base_scan._sirius_datasources, or None.
+
+        datasources is a list with one SiriusDatasource per path in self.paths,
+        matching Sirius scan_info._datasources (one per file-slice).
+        """
+        ds_map = self.base_scan._sirius_datasources
+        if ds_map is None:
+            return None
+        return ds_map.get((tuple(self.paths), self.split_index))
+
+    def has_fallen_behind(self) -> bool:
+        """Return True if the executor started reading this task before prefetch completed.
+
+        Matches Sirius scan_info::has_fallen_behind(). Checks stage >= reading (4).
+        The stage is shared across all file-slice datasources via the stage_list.
+        """
+        entry = self._sirius_entry()
+        if entry is None:
+            return False
+        return entry[1][0] >= 4  # ScanStage.reading
+
+    def prepare_for_prefetching(self, evict_on_failure: bool = False) -> Any:
+        """Allocate staging buffers in the pinned host pool for all file-slices.
+
+        Matches Sirius scan_info::prepare_for_prefetching() which loops over all
+        _datasources. Returns a PrepareOutcome aggregated across all datasources:
+        fallen_behind (3) > allocation_failed (1) > prepared (0).
+        Only called from the readahead worker on registered tasks (always have entries).
+        """
+        from cudf_polars.streaming.readahead import PrepareOutcome
+
+        entry = self._sirius_entry()
+        if entry is None:
+            raise RuntimeError(
+                f"prepare_for_prefetching called on task with no sirius datasource: {self.paths}"
+            )
+        datasources = entry[0]
+        has_allocation_failed = False
+        has_nothing_to_prepare = False
+        for ds in datasources:
+            result = ds.prepare_prefetch(evict_on_failure)
+            if result == 3:  # fallen_behind — abort immediately
+                return PrepareOutcome(3)
+            if result == 2:  # nothing_to_prepare — no fadvise or already cached
+                has_nothing_to_prepare = True
+            elif result == 1:  # allocation_failed — note and continue
+                has_allocation_failed = True
+        if has_nothing_to_prepare:
+            return PrepareOutcome(2)
+        return PrepareOutcome(1 if has_allocation_failed else 0)
+
+    def prefetch(self, on_done: Any = None) -> None:
+        """Fire S3 → host-pool reads for all file-slices.
+
+        Matches Sirius scan_info::prefetch() which uses a fan-in counter: all
+        datasources must complete before the gatekeeper ticket is released.
+        Callbacks from C++ reactor threads acquire the GIL before calling Python,
+        so the GIL serializes all _one_done invocations — no explicit lock needed.
+        Only called from the readahead worker on registered tasks (always have entries).
+        """
+        entry = self._sirius_entry()
+        if entry is None:
+            raise RuntimeError(
+                f"prefetch called on task with no sirius datasource: {self.paths}"
+            )
+        datasources = entry[0]
+        if not datasources:
+            if on_done is not None:
+                on_done(True)
+            return
+
+        # pending[0] and all_ok[0] are mutated only from GIL-holding callbacks.
+        pending = [len(datasources)]
+        all_ok = [True]
+
+        def _one_done(ok: bool) -> None:
+            if not ok:
+                all_ok[0] = False
+            pending[0] -= 1
+            if pending[0] == 0 and on_done is not None:
+                on_done(all_ok[0])
+
+        for ds in datasources:
+            ds.prefetch_async(callback=_one_done)
+
     def get_hashable(self) -> Hashable:
         """Hashable representation of the node."""
         return (
@@ -649,81 +741,115 @@ class ParquetScanTask(ScanTask):
         )
         base_scan = task.base_scan
         paths = task.paths
-        cached_parquet_info = task._get_cached_parquet_info()
-        should_try_hybrid_scan = (
-            len(paths) == 1
-            and base_scan.skip_rows == 0
-            and base_scan.n_rows == -1
-            and hybrid_scan_eligible(
-                parquet_options,
-                row_index=base_scan.row_index,
-                include_file_paths=base_scan.include_file_paths,
-                predicate=base_scan.predicate,
-                hive_parts=hive_parts,
-            )
-        )
-        if cached_parquet_info is None and should_try_hybrid_scan:
-            # read_parquet_metadata is faster (for now),
-            # but hybrid scan needs FileMetaData.
-            cached_parquet_info = task._fetch_parquet_info_for_hybrid_scan()
-        bounds = task._get_task_bounds(cached_parquet_info)
-        # Hybrid scan reads through cached parquet metadata, so it is only used
-        # when the metadata is available to this task.
-        # TODO: Investigate re-enabling for some of the excluded paths
-        # (row_index / include_file_paths). Needs performance investigation.
-        if (
-            should_try_hybrid_scan
-            and bounds.row_groups is not None
-            and len(bounds.row_groups) == 1
-            and cached_parquet_info is not None
-        ):
-            assert base_scan.predicate is not None
-            assert cached_parquet_info is not None
-            stream = context.get_cuda_stream()
-            plc_filter, residual = to_parquet_filter(
-                _prepare_parquet_predicate(
-                    base_scan.predicate.value,
-                    paths,
-                    base_scan.schema,
-                    base_scan.with_columns,
-                ),
-                stream=stream,
-            )
-            if plc_filter is not None and residual is None:
-                return _read_with_hybrid_scan(
-                    base_scan.schema,
-                    paths,
-                    base_scan.with_columns,
-                    plc_filter,
-                    bounds.row_groups[0],
-                    stream,
-                    cached_parquet_info[0],
-                    split_index=split_index,
-                    total_splits=total_splits,
-                    stats_pruning=parquet_options._hybrid_scan_stats_pruning,
-                )
 
-        nvtx_message = (
-            f"{type(task).__name__}: {', '.join(paths)} "
-            f"[{split_index + 1}/{total_splits}]"
-        )
-        with nvtx_annotate_cudf_polars(message=nvtx_message):
-            return Scan.do_evaluate(
-                base_scan.schema,
-                base_scan.typ,
-                base_scan.reader_options,
-                paths,
-                base_scan.with_columns,
-                bounds.skip_rows,
-                bounds.n_rows,
-                base_scan.row_index,
-                base_scan.include_file_paths,
-                base_scan.predicate,
-                parquet_options,
-                hive_parts=hive_parts,
-                cached_parquet_info=cached_parquet_info,
-                context=context,
+        # Sirius datasource lifecycle: signal reading start, then disposed on exit.
+        # Matches Sirius scan_operator_input: update(reading) on all file-slice datasources.
+        sirius_entry = task._sirius_entry()
+        if sirius_entry is None and os.environ.get("SIRIUS_DATASOURCE", "0") == "1":
+            raise RuntimeError(
+                f"SIRIUS_DATASOURCE=1 but no datasource assigned for task paths={task.paths}"
             )
+        _print_task_stats = (
+            sirius_entry is not None
+            and os.environ.get("SIRIUS_CACHE_PRINT_STATS", "0") == "1"
+        )
+        _task_t0 = time.perf_counter() if _print_task_stats else 0.0
+
+        if sirius_entry is not None:
+            sirius_entry[1][0] = 4  # ScanStage.reading — updates shared stage_list
+            for _ds in sirius_entry[0]:
+                _ds.update(4)  # ScanStage.reading
+
+        try:
+            cached_parquet_info = task._get_cached_parquet_info()
+            should_try_hybrid_scan = (
+                len(paths) == 1
+                and base_scan.skip_rows == 0
+                and base_scan.n_rows == -1
+                and hybrid_scan_eligible(
+                    parquet_options,
+                    row_index=base_scan.row_index,
+                    include_file_paths=base_scan.include_file_paths,
+                    predicate=base_scan.predicate,
+                    hive_parts=hive_parts,
+                )
+            )
+            if cached_parquet_info is None and should_try_hybrid_scan:
+                # read_parquet_metadata is faster (for now),
+                # but hybrid scan needs FileMetaData.
+                cached_parquet_info = task._fetch_parquet_info_for_hybrid_scan()
+            bounds = task._get_task_bounds(cached_parquet_info)
+            # Hybrid scan reads through cached parquet metadata, so it is only used
+            # when the metadata is available to this task.
+            # TODO: Investigate re-enabling for some of the excluded paths
+            # (row_index / include_file_paths). Needs performance investigation.
+            if (
+                should_try_hybrid_scan
+                and bounds.row_groups is not None
+                and len(bounds.row_groups) == 1
+                and cached_parquet_info is not None
+            ):
+                assert base_scan.predicate is not None
+                assert cached_parquet_info is not None
+                stream = context.get_cuda_stream()
+                plc_filter, residual = to_parquet_filter(
+                    _prepare_parquet_predicate(
+                        base_scan.predicate.value,
+                        paths,
+                        base_scan.schema,
+                        base_scan.with_columns,
+                    ),
+                    stream=stream,
+                )
+                if plc_filter is not None and residual is None:
+                    return _read_with_hybrid_scan(
+                        base_scan.schema,
+                        paths,
+                        base_scan.with_columns,
+                        plc_filter,
+                        bounds.row_groups[0],
+                        stream,
+                        cached_parquet_info[0],
+                        split_index=split_index,
+                        total_splits=total_splits,
+                        stats_pruning=parquet_options._hybrid_scan_stats_pruning,
+                        datasource=sirius_entry[0][0] if sirius_entry is not None else None,
+                    )
+
+            nvtx_message = (
+                f"{type(task).__name__}: {', '.join(paths)} "
+                f"[{split_index + 1}/{total_splits}]"
+            )
+            with nvtx_annotate_cudf_polars(message=nvtx_message):
+                return Scan.do_evaluate(
+                    base_scan.schema,
+                    base_scan.typ,
+                    base_scan.reader_options,
+                    paths,
+                    base_scan.with_columns,
+                    bounds.skip_rows,
+                    bounds.n_rows,
+                    base_scan.row_index,
+                    base_scan.include_file_paths,
+                    base_scan.predicate,
+                    parquet_options,
+                    hive_parts=hive_parts,
+                    cached_parquet_info=cached_parquet_info,
+                    context=context,
+                    datasource=sirius_entry[0] if sirius_entry is not None else None,
+                )  # sirius_entry[0] is a list of datasources (one per path)
+        finally:
+            if sirius_entry is not None:
+                for _ds in sirius_entry[0]:
+                    _ds.update(5)  # ScanStage.disposed
+            if _print_task_stats:
+                _elapsed_ms = (time.perf_counter() - _task_t0) * 1000.0
+                _short_path = paths[0].rsplit("/", 1)[-1] if paths else "?"
+                print(
+                    f"[task] {_short_path} [{split_index}/{total_splits}]"
+                    f" {_elapsed_ms:.0f}ms",
+                    flush=True,
+                )
 
 
 @lower_ir_node.register(Empty)

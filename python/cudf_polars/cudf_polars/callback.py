@@ -49,6 +49,24 @@ if TYPE_CHECKING:
 
 __all__: list[str] = ["execute_with_cudf"]
 
+# Timestamp of the most recent NodeTraverser entry (when Polars first hands us the plan).
+# Set at the top of execute_with_cudf(); read by ReadaheadScanManager.start() to measure
+# the total lead time from plan receipt to first fadvise/GET issued.
+_nt_entry_t: float | None = None
+# Timestamp when _callback (the compute UDF) is actually invoked by Polars.
+# The gap (nt_entry → callback_entry) = IR translation + Polars UDF dispatch.
+_callback_entry_t: float | None = None
+
+
+def get_nt_entry_t() -> float | None:
+    """Return the timestamp of the most recent NodeTraverser entry."""
+    return _nt_entry_t
+
+
+def get_callback_entry_t() -> float | None:
+    """Return the timestamp of the most recent _callback invocation."""
+    return _callback_entry_t
+
 
 def _is_concurrent_managed_access_supported() -> bool:
     """
@@ -285,6 +303,8 @@ def _callback(
     config_options: ConfigOptions,
     timer: Timer | None,
 ) -> pl.DataFrame | tuple[pl.DataFrame, list[tuple[int, int, str]]]:
+    global _callback_entry_t
+    _callback_entry_t = time.perf_counter()
     assert with_columns is None
     assert pyarrow_predicate is None
     assert n_rows is None
@@ -352,6 +372,9 @@ def execute_with_cudf(
     -----
     The NodeTraverser is mutated if the libcudf executor can handle the plan.
     """
+    global _nt_entry_t
+    _nt_entry_t = time.perf_counter()
+
     if duration_since_start is None:
         timer = None
     else:

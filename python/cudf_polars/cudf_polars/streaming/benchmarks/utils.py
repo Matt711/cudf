@@ -972,6 +972,12 @@ def execute_query(
                         f"--debug is not supported with --frontend {run_config.frontend}"
                     )
             else:
+                if os.environ.get("SIRIUS_DATASOURCE", "0") == "1":
+                    try:
+                        from cudf_polars.engine.core import mark_query_start
+                        mark_query_start()
+                    except ImportError:
+                        pass
                 t0 = time.monotonic()
                 result = q.collect(engine=engine)
                 t1 = time.monotonic()
@@ -1213,6 +1219,15 @@ def run_polars_query(
             )
             time.sleep(args.sleep_between_iterations)
 
+        if i > 0 and os.environ.get("SIRIUS_CACHE_MODE", "cold") == "cold":
+            # Default: evict prefetch-cached blocks so each iteration starts cold.
+            # Set SIRIUS_CACHE_MODE=warm to keep the cache across iterations so
+            # later iterations benefit from data already in pinned RAM.
+            # No-op when SIRIUS_DATASOURCE is not active.
+            from cudf_polars.engine.core import reset_sirius_caches
+
+            reset_sirius_caches()
+
         if _HAS_STRUCTLOG and run_config.collect_traces:
             setup_logging(q_id, i)
             if isinstance(engine, StreamingEngine):
@@ -1266,6 +1281,8 @@ def run_polars_query(
                     f"{prefix}Query {q_id} - Iteration {i} finished in {record.duration:0.4f}s",
                     flush=True,
                 )
+                if os.environ.get("SIRIUS_CACHE_PRINT_STATS", "0") == "1":
+                    print(f"[sirius] q{q_id} iter{i}: {record.duration:.4f}s", flush=True)
 
         query_records.append(record)
 
@@ -1324,6 +1341,21 @@ def _run_query_loop(
                 # so ignore exceptions here.
                 with contextlib.suppress(Exception):
                     plan = serialize_query(query_result.frame, engine)
+
+            if os.environ.get("SIRIUS_CACHE_COLD_QUERIES", "0") == "1":
+                # Match Sirius "cold" methodology: reset the prefetch cache before
+                # every individual query so each query measures a truly cold read
+                # with no cross-query cache reuse. Without this, Q2-Q22 benefit from
+                # data Q1 left in the 200 GiB pool, making our numbers warmer than
+                # Sirius cold.
+                import time as _time
+                from cudf_polars.engine.core import reset_sirius_caches
+
+                _t_reset0 = _time.perf_counter()
+                reset_sirius_caches()
+                _reset_ms = (_time.perf_counter() - _t_reset0) * 1000.0
+                if os.environ.get("SIRIUS_CACHE_PRINT_STATS", "0") == "1":
+                    print(f"[sirius] Q{q_id} reset_caches took {_reset_ms:.1f}ms", flush=True)
 
             result = run_polars_query(
                 q_id=q_id,
