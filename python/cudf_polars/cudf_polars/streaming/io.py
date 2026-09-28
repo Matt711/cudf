@@ -254,6 +254,9 @@ def hybrid_scan_eligible(
     )
 
 
+_PRINT_READ_STATS: bool = os.environ.get("SIRIUS_CACHE_PRINT_STATS", "0") == "1"
+
+
 def _read_with_hybrid_scan(
     schema: Schema,
     paths: list[str],
@@ -270,6 +273,7 @@ def _read_with_hybrid_scan(
 ) -> DataFrame:
     """Two-pass parquet read via HybridScanReader for a row-group-aligned task."""
     assert len(paths) == 1, "hybrid scan only supports tasks with one physical file"
+    _t0 = time.perf_counter() if _PRINT_READ_STATS else 0.0
     with nvtx_annotate_cudf_polars(
         message="HybridScan", payload=(split_index + 1, total_splits)
     ):
@@ -377,7 +381,17 @@ def _read_with_hybrid_scan(
             )
             columns = [*columns, *payload_df.columns]
 
-        return DataFrame(columns, stream=stream).select(list(schema.keys()))
+        result = DataFrame(columns, stream=stream).select(list(schema.keys()))
+        if _PRINT_READ_STATS:
+            _elapsed_ms = (time.perf_counter() - _t0) * 1000.0
+            _fname = paths[0].rsplit("/", 1)[-1]
+            _rgs = len(row_group_indices) if row_group_indices else 0
+            print(
+                f"[read] {_fname} rgs={_rgs} split={split_index}/{total_splits}"
+                f" read_ms={_elapsed_ms:.1f}",
+                flush=True,
+            )
+        return result
 
 
 class ParquetScanTaskBounds(NamedTuple):
@@ -618,6 +632,19 @@ class ParquetScanTask(ScanTask):
 
         for ds in datasources:
             ds.prefetch_async(callback=_one_done)
+
+    def wait_for_sirius_prefetch(self) -> None:
+        """Block until all sirius prefetch downloads for this task complete.
+
+        Designed to run in a dedicated prefetch-wait thread pool so that
+        py_executor threads are never stalled on S3 IO.  Each datasource's
+        wait_for_prefetch() releases the GIL while blocking on the C++ side.
+        """
+        entry = self._sirius_entry()
+        if entry is None:
+            return
+        for ds in entry[0]:
+            ds.wait_for_prefetch()
 
     def get_hashable(self) -> Hashable:
         """Hashable representation of the node."""

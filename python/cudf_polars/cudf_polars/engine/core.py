@@ -1167,12 +1167,6 @@ def _compute_fadvise_ranges_with_infos(task: Any, cached_infos: list | None) -> 
             else:
                 result.append([])
             continue
-        if info._hybrid_scan_metadata is None:
-            if info.size:
-                result.append([_FullFileRange(info.size)])
-            else:
-                result.append([])
-            continue
         rg_indices = bounds.row_groups[i]
         if not rg_indices:
             result.append([])
@@ -1180,6 +1174,31 @@ def _compute_fadvise_ranges_with_infos(task: Any, cached_infos: list | None) -> 
         options = info.default_reader_options()
         if task.base_scan.with_columns is not None:
             options.set_column_names(task.base_scan.with_columns)
+        # Mirror _read_with_hybrid_scan: apply stats-based row group pruning at
+        # fadvise time so we only prefetch byte ranges that survive predicate
+        # pushdown, avoiding over-prefetching for selective predicates.
+        predicate = task.base_scan.predicate
+        if predicate is not None:
+            from cudf_polars.dsl.ir import _prepare_parquet_predicate
+            from cudf_polars.dsl.to_ast import to_parquet_filter
+            from cudf_polars.utils.cuda_stream import get_cuda_stream
+            _stream = get_cuda_stream()
+            prep = _prepare_parquet_predicate(
+                predicate.value,
+                [info.path],
+                task.base_scan.schema,
+                task.base_scan.with_columns,
+            )
+            plc_filter, _ = to_parquet_filter(prep, _stream)
+            if plc_filter is not None:
+                options.set_filter(plc_filter)
+                reader = info.hybrid_scan_reader(options)
+                rg_indices = reader.filter_row_groups_with_stats(rg_indices, options)
+                if not rg_indices:
+                    result.append([])
+                    continue
+                result.append(reader.payload_column_chunks_byte_ranges(rg_indices, options))
+                continue
         reader = info.hybrid_scan_reader(options)
         result.append(reader.payload_column_chunks_byte_ranges(rg_indices, options))
     return result
@@ -1223,6 +1242,7 @@ def _attach_sirius_datasources_streaming(
     rest_n_reactors = int(os.environ.get("REST_N_REACTORS", "16"))
     n_meta_threads = int(os.environ.get("SIRIUS_EARLY_FADVISE_THREADS", "16"))
     cache_datasources = os.environ.get("SIRIUS_CACHE_PARQUET_FOOTERS", "0") == "1"
+    parallel_open = os.environ.get("SIRIUS_PARALLEL_OPEN", "0") == "1"
     parse_hybrid = True  # always needed for fadvise ranges
 
     # --- Build task inventory ---
@@ -1254,6 +1274,9 @@ def _attach_sirius_datasources_streaming(
 
     all_cached_infos: dict[str, Any] = {}
     query_paths: set[str] = set()
+    # Populated by footer threads when SIRIUS_PARALLEL_OPEN=1: path → base datasource.
+    # Allows _register_task to skip the serial open_datasource call.
+    path_datasources: dict[str, Any] = {}
 
     def _register_task(task: Any, op_id: int) -> None:
         """Process one fully-resolved task: ranges → datasource → fadvise → register."""
@@ -1264,7 +1287,10 @@ def _attach_sirius_datasources_streaming(
         datasources: list[Any] = []
         for i, path in enumerate(task.paths):
             query_paths.add(path)
-            if cache_datasources and path in _global_datasource_cache:
+            if path in path_datasources:
+                # Pre-opened by footer thread (SIRIUS_PARALLEL_OPEN=1).
+                base_ds = path_datasources[path]
+            elif cache_datasources and path in _global_datasource_cache:
                 base_ds = _global_datasource_cache[path]
             else:
                 base_ds = registry.open_datasource(path)
@@ -1324,11 +1350,20 @@ def _attach_sirius_datasources_streaming(
     # thread will complete within ~490ms (Q1 iter0 only; Q2+ are µs no-ops), well before
     # data GETs are issued (which only start after footers are fetched and registered).
     if missing_paths:
+        def _fetch_and_open(path: str) -> list:
+            infos = _prefetch_parquet_footers_for_paths([path], parse_hybrid_metadata=parse_hybrid)
+            if parallel_open and not (cache_datasources and path in _global_datasource_cache):
+                ds = registry.open_datasource(path)
+                path_datasources[path] = ds
+                if cache_datasources:
+                    _global_datasource_cache[path] = ds
+            return infos
+
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=n_meta_threads, thread_name_prefix="sirius-meta"
         ) as pool:
             future_to_path = {
-                pool.submit(_prefetch_parquet_footers_for_paths, [path], parse_hybrid_metadata=parse_hybrid): path
+                pool.submit(_fetch_and_open, path): path
                 for path in missing_paths
             }
             for future in concurrent.futures.as_completed(future_to_path):
@@ -1449,8 +1484,14 @@ def evaluate_on_rank(
             logical_op_by_id=logical_op_by_id,
         )
         quent_operator_map = build_quent_operator_map(ir, physical_op_by_id)
+    prefetch_wait_executor = getattr(
+        config_options.executor.spmd_context, "prefetch_wait_executor", None
+    )
     ir_context = IRExecutionContext(
-        py_executor, get_cuda_stream=ctx.br().stream_pool.get_stream, query_id=query_id
+        py_executor,
+        prefetch_wait_executor=prefetch_wait_executor,
+        get_cuda_stream=ctx.br().stream_pool.get_stream,
+        query_id=query_id,
     )
 
     sirius_datasource_enabled = os.environ.get("SIRIUS_DATASOURCE", "0") == "1"

@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import json
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
@@ -429,6 +430,7 @@ class SPMDEngine(StreamingEngine):
         executor_options: dict[str, Any] | None = None,
         engine_options: dict[str, Any] | None = None,
     ) -> None:
+        _t0_engine_init = time.perf_counter()
         executor_options = resolve_kvikio_executor_options(executor_options or {})
         engine_options = engine_options or {}
 
@@ -447,9 +449,12 @@ class SPMDEngine(StreamingEngine):
         )
         bind_to_gpu(hw_binding)
 
+        _t_sirius_reg_ms = 0.0
         if os.environ.get("SIRIUS_DATASOURCE", "0") == "1":
             from cudf_polars.engine.core import _get_or_create_sirius_registry
+            _t_sr0 = time.perf_counter()
             _get_or_create_sirius_registry(None)
+            _t_sirius_reg_ms = (time.perf_counter() - _t_sr0) * 1000
 
         configure_kvikio(
             executor_options["kvikio_nthreads"],
@@ -466,6 +471,7 @@ class SPMDEngine(StreamingEngine):
             "memory_resource_config", MemoryResourceConfig.default()
         )
         base_mr = mr_config.create_memory_resource()
+        _t_comm0 = time.perf_counter()
         if comm is None:
             statistics = Statistics.from_options(self.rapidsmpf_options)
             if bootstrap.is_running_with_rrun():
@@ -484,6 +490,7 @@ class SPMDEngine(StreamingEngine):
                 comm.progress_thread.statistics, self.rapidsmpf_options
             )
         # else: caller-provided comm; the caller retains ownership
+        _t_comm_ms = (time.perf_counter() - _t_comm0) * 1000
 
         self._base_mr: rmm.mr.DeviceMemoryResource = base_mr
         self._mr: RmmResourceAdaptor  # set after `Context` is built (below).
@@ -502,9 +509,11 @@ class SPMDEngine(StreamingEngine):
         try:
             # Register `_cleanup_ctx`, which shuts down whatever `self._ctx` points
             # to at engine shutdown time, i.e. the `Context` from the latest reset.
+            _t_ctx0 = time.perf_counter()
             self._ctx = Context.from_options(
                 comm.logger, base_mr, self.rapidsmpf_options, statistics
             )
+            _t_ctx_ms = (time.perf_counter() - _t_ctx0) * 1000
             # `Context` wraps `base_mr` in its `BufferResource`'s internal
             # tracking `RmmResourceAdaptor`. Capture it as `self._mr` and
             # install it as the current device resource so libcudf temporary
@@ -556,6 +565,26 @@ class SPMDEngine(StreamingEngine):
                 self._py_executor.shutdown, wait=True, cancel_futures=True
             )
 
+            # Dedicated thread pool for waiting on sirius prefetch completions.
+            # Threads here only block on S3 condition variables; py_executor
+            # threads are reserved for actual GPU reads.  Only created when the
+            # sirius datasource is active (SIRIUS_DATASOURCE=1).
+            self._prefetch_wait_executor: ThreadPoolExecutor | None = None
+            if os.environ.get("SIRIUS_DATASOURCE", "0") == "1":
+                self._prefetch_wait_executor = ThreadPoolExecutor(
+                    max_workers=cast(
+                        "int",
+                        executor_options.get(
+                            "num_prefetch_wait_threads",
+                            int(os.environ.get("SIRIUS_PREFETCH_WAIT_THREADS", "64")),
+                        ),
+                    ),
+                    thread_name_prefix="sirius-prefetch-wait",
+                )
+                exit_stack.callback(
+                    self._prefetch_wait_executor.shutdown, wait=True, cancel_futures=True
+                )
+
             super().__init__(
                 nranks=comm.nranks,
                 executor_options={
@@ -569,6 +598,7 @@ class SPMDEngine(StreamingEngine):
                         context=self._ctx,
                         py_executor=self._py_executor,
                         worker_resources=self._worker_resources,
+                        prefetch_wait_executor=self._prefetch_wait_executor,
                     ),
                 },
                 engine_options={
@@ -576,6 +606,14 @@ class SPMDEngine(StreamingEngine):
                     "memory_resource": self._ctx.br().device_mr,
                 },
                 exit_stack=exit_stack,
+            )
+            _t_total_ms = (time.perf_counter() - _t0_engine_init) * 1000
+            print(
+                f"[engine_init] total={_t_total_ms:.1f}ms"
+                f" sirius_registry={_t_sirius_reg_ms:.1f}ms"
+                f" comm={_t_comm_ms:.1f}ms"
+                f" context={_t_ctx_ms:.1f}ms",
+                flush=True,
             )
         except Exception:
             exit_stack.close()
