@@ -251,6 +251,19 @@ cdef extern from * namespace "sirius_cache_impl" nogil:
       ds.await_inflight_prefetch();
     }
 
+    // Non-blocking check: true if the S3 download for this datasource is still running.
+    inline bool call_is_prefetch_in_flight(const cudf_streaming::io::sirius_datasource& ds) noexcept
+    {
+      return ds.is_prefetch_in_flight();
+    }
+
+    // Block until the in-flight S3 download completes.  No-op if nothing in flight.
+    // Designed for use in a dedicated wait-thread pool (GIL released by caller).
+    inline void call_wait_for_prefetch(cudf_streaming::io::sirius_datasource& ds) noexcept
+    {
+      ds.wait_for_prefetch();
+    }
+
     // Advance the consumer stage on the datasource's prefetching handle.
     inline void call_update(cudf_streaming::io::sirius_datasource& ds, int stage) noexcept
     {
@@ -324,6 +337,10 @@ cdef extern from * namespace "sirius_cache_impl" nogil:
     void call_prefetch_async_cb(sirius_datasource& ds, void* py_cb) noexcept
 
     void call_await_inflight_prefetch(sirius_datasource& ds) noexcept
+
+    bool call_is_prefetch_in_flight(const sirius_datasource& ds) noexcept
+
+    void call_wait_for_prefetch(sirius_datasource& ds) noexcept
 
     void call_update(sirius_datasource& ds, int stage) noexcept
 

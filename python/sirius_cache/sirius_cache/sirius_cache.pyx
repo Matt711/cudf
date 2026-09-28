@@ -397,6 +397,31 @@ cdef class SiriusDatasource(PlcDatasource):
         with nogil:
             call_await_inflight_prefetch(deref(self._ds))
 
+    def is_prefetch_in_flight(self) -> bool:
+        """Return True if the background S3 download is still running.
+
+        Non-blocking.  Use this to check whether :meth:`wait_for_prefetch`
+        would block before dispatching to the wait-executor.
+        """
+        if not self._ds:
+            return False
+        cdef bool result
+        with nogil:
+            result = call_is_prefetch_in_flight(deref(self._ds))
+        return result
+
+    def wait_for_prefetch(self) -> None:
+        """Block until the in-flight S3 download completes.  No-op if nothing
+        is in flight.  Releases the GIL while waiting.
+
+        Designed to run in a dedicated prefetch-wait thread pool so that
+        py_executor threads are never stalled on S3 IO.
+        """
+        if not self._ds:
+            return
+        with nogil:
+            call_wait_for_prefetch(deref(self._ds))
+
     def fetch_byte_ranges_vectored(
         self, list byte_ranges, object stream=None
     ) -> list:

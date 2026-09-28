@@ -24,6 +24,13 @@ from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.core.memory_reserve_or_wait import reserve_memory
 from rapidsmpf.streaming.core.message import Message
 
+import os as _os
+
+# Cache env var at import time — read_chunk is on the hot path.
+_SIRIUS_PREFETCH_WAIT_BEFORE_RESERVE = (
+    _os.environ.get("SIRIUS_PREFETCH_WAIT_BEFORE_RESERVE", "1") == "1"
+)
+
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, DataFrameScan, PythonScan, Sink
 from cudf_polars.dsl.tracing import Scope, log
@@ -588,12 +595,32 @@ async def read_chunk(
         else 2 * estimated_chunk_bytes
     )
     start = time.monotonic_ns()
+
+    # Phase 1 (optional): wait for sirius prefetch in a dedicated wait-executor so
+    # py_executor threads are only used for actual GPU work.
+    # SIRIUS_PREFETCH_WAIT_BEFORE_RESERVE=1 (default): wait before reserving memory
+    # to avoid holding a reservation during the S3 download.
+    # Set to "0" to wait after reserve_memory instead.
+    _prefetch_wait_executor = ir_context.prefetch_wait_executor
+    if _prefetch_wait_executor is not None and hasattr(task, "wait_for_sirius_prefetch"):
+        if _SIRIUS_PREFETCH_WAIT_BEFORE_RESERVE:
+            await asyncio.get_running_loop().run_in_executor(
+                _prefetch_wait_executor, task.wait_for_sirius_prefetch
+            )
+
     reservation = await reserve_memory(
         context,
         size=reservation_bytes,
         net_memory_delta=estimated_chunk_bytes,
     )
     admitted = time.monotonic_ns()
+
+    if _prefetch_wait_executor is not None and hasattr(task, "wait_for_sirius_prefetch"):
+        if not _SIRIUS_PREFETCH_WAIT_BEFORE_RESERVE:
+            await asyncio.get_running_loop().run_in_executor(
+                _prefetch_wait_executor, task.wait_for_sirius_prefetch
+            )
+
     with opaque_memory_usage(reservation):
         df = await ir_context.to_thread(
             task.do_evaluate,

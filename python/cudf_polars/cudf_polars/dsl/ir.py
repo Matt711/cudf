@@ -150,6 +150,7 @@ class IRExecutionContext:
     """
 
     py_executor: concurrent.futures.ThreadPoolExecutor | None = field(default=None)
+    prefetch_wait_executor: concurrent.futures.ThreadPoolExecutor | None = field(default=None)
     get_cuda_stream: Callable[[], Stream] = field(default=get_cuda_stream)
     query_id: uuid.UUID = field(default_factory=uuid.uuid4)
     quent_ir_execution_context: QuentIRExecutionContext | None = None

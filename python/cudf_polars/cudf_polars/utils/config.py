@@ -983,6 +983,7 @@ class SPMDContext:
     worker_id: uuid.UUID
     quent_logger: QuentLogger | None
     worker_resources: WorkerResources | None = None
+    prefetch_wait_executor: ThreadPoolExecutor | None = None
 
 
 @dataclasses.dataclass(frozen=True)
