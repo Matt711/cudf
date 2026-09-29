@@ -35,9 +35,9 @@ tips_df['tip_percentage'] = tips_df['tip'] / tips_df['total_bill'] * 100
 print(tips_df.groupby('size').tip_percentage.mean())
 ```
 
-A "hello world" of using cuStreamz with python streamz can be found [here](https://github.com/rapidsai-community/notebooks-contrib/blob/release/26.10/getting_started_materials/hello_worlds/hello_streamz.ipynb)
+A "hello world" of using cuStreamz with python streamz can be found [here](https://github.com/rapidsai-community/notebooks-contrib/blob/main/getting_started_materials/hello_worlds/hello_streamz.ipynb)
 
-A more detailed example of [parsing haproxy logs](https://github.com/rapidsai-community/notebooks-contrib/blob/release/26.10/the_archive/archived_rapids_demos/custreamz/parsing_haproxy_logs.ipynb) is also available.
+A more detailed example of [parsing haproxy logs](https://github.com/rapidsai-community/notebooks-contrib/blob/main/the_archive/archived_rapids_demos/custreamz/parsing_haproxy_logs.ipynb) is also available.
 
 ## Quick Start
 
@@ -65,4 +65,4 @@ Nightly:
 conda install -c rapidsai-nightly cudf_kafka custreamz
 ```
 
-See the [Get RAPIDS version picker](https://docs.rapids.ai/install/) for more OS and version info.
+See the [Get RAPIDS version picker](https://docs.nvidia.com/datascience/install/) for more OS and version info.
