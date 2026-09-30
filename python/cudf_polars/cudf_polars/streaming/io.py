@@ -558,14 +558,39 @@ class ParquetScanTask(ScanTask):
             return None
         return [cached_parquet_info_map[path] for path in self.paths]
 
-    def _fetch_parquet_info_for_hybrid_scan(self) -> list[CachedParquetInfo]:
-        """Fetch parquet metadata for hybrid scan."""
-        from cudf_polars.dsl.utils.io import _prefetch_parquet_footers_for_paths
+    def _fetch_parquet_info(
+        self, context: IRExecutionContext, *, parse_hybrid_metadata: bool
+    ) -> list[CachedParquetInfo]:
+        """
+        Fetch parquet metadata for this task's paths.
 
-        return _prefetch_parquet_footers_for_paths(
-            self.paths,
-            parse_hybrid_metadata=True,
+        Uses the persistent metadata cache when available, falling back to a
+        direct fetch otherwise.
+        """
+        from cudf_polars.dsl.utils.io import (
+            _prefetch_parquet_footers_for_paths,
+            _prefetch_single_parquet_footer,
         )
+
+        cache = context.metadata_cache
+        if cache is None:
+            return _prefetch_parquet_footers_for_paths(
+                self.paths, parse_hybrid_metadata=parse_hybrid_metadata
+            )
+        # Submit (or find already in flight/cached) every path before waiting
+        # on any of them, so paths of a fused task fetch concurrently.
+        futures = [
+            cache.get_or_submit(
+                path,
+                functools.partial(
+                    _prefetch_single_parquet_footer,
+                    path,
+                    parse_hybrid_metadata=parse_hybrid_metadata,
+                ),
+            )
+            for path in self.paths
+        ]
+        return [future.result() for future in futures]
 
     def _split_task_bounds_from_row_group_counts(
         self, row_group_num_rows: list[int]
@@ -696,10 +721,16 @@ class ParquetScanTask(ScanTask):
                 hive_parts=hive_parts,
             )
         )
-        if task_parquet_info is None and should_try_hybrid_scan:
-            # read_parquet_metadata is faster (for now),
-            # but hybrid scan needs FileMetaData.
-            task_parquet_info = task._fetch_parquet_info_for_hybrid_scan()
+        if task_parquet_info is None and (
+            should_try_hybrid_scan or context.metadata_cache is not None
+        ):
+            # read_parquet_metadata is faster for an uncached, one-off fetch,
+            # but hybrid scan needs FileMetaData regardless, and with the
+            # persistent cache enabled the legacy path benefits too (skips
+            # libcudf's own internal footer read, see Scan.do_evaluate).
+            task_parquet_info = task._fetch_parquet_info(
+                context, parse_hybrid_metadata=should_try_hybrid_scan
+            )
         bounds = task._get_task_bounds(task_parquet_info)
         # Hybrid scan reads through cached parquet metadata, so it is only used
         # when the metadata is available to this task.

@@ -34,7 +34,7 @@ from rapidsmpf.streaming.core.context import Context
 import cudf_polars.quent
 import cudf_polars.quent._logging
 from cudf_polars.containers import DataFrame, DataType
-from cudf_polars.engine import persisted_result, rank_local_store
+from cudf_polars.engine import metadata_cache, persisted_result, rank_local_store
 from cudf_polars.engine.core import (
     ClusterInfo,
     StreamingEngine,
@@ -166,6 +166,9 @@ def evaluate_pipeline_spmd_mode(
         config_options,
         local_quent_context=local_quent_context,
         query_id=query_id,
+        metadata_cache=metadata_cache.resolve_cache(
+            spmd_context.store_uid, config_options.parquet_options, ir
+        ),
     )
     if quent_context is not None:
         assert config_options.executor.spmd_context.quent_logger is not None
@@ -563,6 +566,7 @@ class SPMDEngine(StreamingEngine):
                         quent_logger=self._quent_logger,
                         context=self._ctx,
                         py_executor=self._py_executor,
+                        store_uid=self._store_uid,
                         worker_resources=self._worker_resources,
                     ),
                 },
@@ -734,6 +738,7 @@ class SPMDEngine(StreamingEngine):
                     engine_id=engine_id,
                     worker_id=self._quent_worker.id,
                     quent_logger=self._quent_logger,
+                    store_uid=self._store_uid,
                     worker_resources=self._worker_resources,
                 ),
             },
@@ -893,6 +898,9 @@ class SPMDEngine(StreamingEngine):
 
         # Free persisted partitions before _cleanup_ctx tears down the Context.
         self._drop_persisted()
+        # Unlike persisted partitions, cached parquet metadata is host-only
+        # and outlives a Context reset; only close it here, at engine shutdown.
+        metadata_cache.close_cache(self._store_uid)
 
         # Order matters: ``super().shutdown()`` closes ``self._exit_stack``,
         # which invokes ``self._cleanup_ctx``. That requires ``self._ctx`` to

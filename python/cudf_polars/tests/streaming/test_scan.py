@@ -832,6 +832,7 @@ def _make_cached_parquet_info(
             path=path,
             size=size,
             file_metadata=cast("plc.io.parquet_metadata.FileMetaData", path),
+            etag=None,
         )
         for path in paths
     ]

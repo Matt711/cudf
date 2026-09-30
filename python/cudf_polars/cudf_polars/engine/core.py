@@ -35,6 +35,7 @@ from cudf_polars.dsl.ir import IRExecutionContext
 from cudf_polars.dsl.utils.io import (
     attach_cached_parquet_metadata,
     prefetch_parquet_file_metadata_for_ir,
+    warm_metadata_cache_for_ir,
 )
 from cudf_polars.quent._plan import build_plan, build_quent_operator_map
 from cudf_polars.streaming.actor_graph.collectives import ReserveOpIDs
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
     import cudf_polars.quent._types
     from cudf_polars.dsl.ir import IR
     from cudf_polars.dsl.translate import Translator
+    from cudf_polars.engine.metadata_cache import MetadataCache
     from cudf_polars.quent._context import LocalQuentContext
     from cudf_polars.streaming.base import PartitionInfo
     from cudf_polars.streaming.parallel import ConfigOptions
@@ -487,6 +489,17 @@ class StreamingEngine(pl.GPUEngine):
         """
         return Statistics.merge(self.gather_statistics(clear=clear))
 
+    def clear_metadata_cache(self) -> None:
+        """
+        Drop every entry from the persistent parquet metadata cache, on every rank.
+
+        No-op on any rank where ``ParquetOptions.persistent_metadata_cache``
+        is disabled.
+        """
+        from cudf_polars.engine.metadata_cache import clear_all
+
+        self._run(clear_all)
+
     def _reset(
         self,
         *,
@@ -863,6 +876,7 @@ def evaluate_on_rank(
     collect_metadata: bool = False,
     local_quent_context: LocalQuentContext | None = None,
     query_id: uuid.UUID,
+    metadata_cache: MetadataCache | None = None,
 ) -> tuple[DataFrame, list[ChannelMetadata]]:
     """
     Evaluate a polars IR plan on a single rank.
@@ -894,6 +908,9 @@ def evaluate_on_rank(
         disabled.
     query_id
         A unique identifier for the query.
+    metadata_cache
+        This engine's persistent parquet metadata cache, or ``None`` when
+        ``ParquetOptions.persistent_metadata_cache`` is disabled.
 
     Returns
     -------
@@ -959,11 +976,23 @@ def evaluate_on_rank(
         )
         quent_operator_map = build_quent_operator_map(ir, physical_op_by_id)
     ir_context = IRExecutionContext(
-        py_executor, get_cuda_stream=ctx.br().stream_pool.get_stream, query_id=query_id
+        py_executor,
+        get_cuda_stream=ctx.br().stream_pool.get_stream,
+        query_id=query_id,
+        metadata_cache=metadata_cache,
     )
 
-    prefetch_file_metadata = config_options.parquet_options.prefetch_file_metadata
-    if prefetch_file_metadata is not False:
+    if metadata_cache is not None:
+        # Superseded by the persistent cache: submit every path without
+        # blocking on it, and let scan tasks resolve their own paths lazily
+        # instead of waiting here for every file in the query up front.
+        warm_metadata_cache_for_ir(
+            ir,
+            metadata_cache,
+            stats=stats,
+            parse_hybrid_metadata=config_options.parquet_options.use_hybrid_scan,
+        )
+    elif config_options.parquet_options.prefetch_file_metadata is not False:
         cached_parquet_info_map = prefetch_parquet_file_metadata_for_ir(
             ir,
             ir_context.py_executor,

@@ -43,7 +43,7 @@ import polars as pl
 from polars.io.plugins import register_io_source
 
 from cudf_polars.dsl.translate import Translator
-from cudf_polars.engine import rank_local_store
+from cudf_polars.engine import metadata_cache, rank_local_store
 from cudf_polars.engine.core import (
     drop_if_replicated,
     evaluate_on_rank,
@@ -115,7 +115,15 @@ def evaluate_and_persist(
     This rank's index within the cluster (``comm.rank``).
     """
     gpu_df, metadata = evaluate_on_rank(
-        ctx, comm, py_executor, ir, config_options, query_id=query_id
+        ctx,
+        comm,
+        py_executor,
+        ir,
+        config_options,
+        query_id=query_id,
+        metadata_cache=metadata_cache.resolve_cache(
+            uid, config_options.parquet_options, ir
+        ),
     )
     if deduplicate_replicated:
         gpu_df = drop_if_replicated(gpu_df, comm.rank, metadata)

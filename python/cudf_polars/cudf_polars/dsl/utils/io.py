@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import functools
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -23,7 +25,27 @@ from cudf_polars.streaming.io import (
 
 if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IR
+    from cudf_polars.engine.metadata_cache import MetadataCache
     from cudf_polars.streaming.base import StatsCollector
+
+
+def _local_file_etag_from_stat(
+    stat_result: os.stat_result,
+) -> tuple[int, int, int, float]:
+    """Pack a stat result into a dev/ino/size/mtime staleness tag."""
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime,
+    )
+
+
+def _local_file_etag(path: str) -> tuple[int, int, int, float] | None:
+    """Return a local file's current staleness tag, or None for a remote path."""
+    if plc.io.SourceInfo._is_remote_uri(path):
+        return None
+    return _local_file_etag_from_stat(os.stat(path))
 
 
 @dataclass(frozen=True)
@@ -31,9 +53,10 @@ class CachedParquetInfo:
     """
     Metadata for a parquet file.
 
-    File metadata is only cached when the setting
-    ``ParquetOptions.prefetch_file_metadata`` is ``True``. Metadata is cached
-    for the duration of the query.
+    File metadata is cached when ``ParquetOptions.prefetch_file_metadata`` or
+    ``ParquetOptions.persistent_metadata_cache`` is enabled: for the
+    duration of the query in the former case, or across queries in the
+    latter.
 
     Parameters
     ----------
@@ -47,6 +70,12 @@ class CachedParquetInfo:
     file_metadata
         The ``FileMetaData`` object for the parquet file returned from
         ``read_parquet_footers``.
+    etag
+        A staleness tag for local files: ``st_dev``/``st_ino``/``st_size``/
+        ``st_mtime`` from the same ``stat()`` call used for ``size``,
+        ``None`` for remote paths. Used by
+        ``ParquetOptions.validate_cached_metadata_etag`` to detect a file
+        overwritten since it was cached.
     parse_hybrid_metadata
         Whether to eagerly parse ``HybridScanMetadata`` for this file.
         Otherwise it's parsed lazily, on first use.
@@ -55,6 +84,7 @@ class CachedParquetInfo:
     path: str
     size: int | None
     file_metadata: plc.io.parquet_metadata.FileMetaData
+    etag: tuple[int, int, int, float] | None
     parse_hybrid_metadata: bool = field(default=False, compare=False, repr=False)
     # For splits of the same file, the metadata is parsed once and shared.
     _hybrid_scan_metadata: plc.io.experimental.HybridScanMetadata | None = field(
@@ -122,6 +152,7 @@ def _prefetch_parquet_footers_for_paths(
     # TODO: https://github.com/NVIDIA/cudf/issues/22734, use object metadata from polars
     # For now, we'll just use kvikio to explicitly get the size.
     sizes: list[int | None] = []
+    etags: list[tuple[int, int, int, float] | None] = []
 
     for path in paths:
         if paths and plc.io.SourceInfo._is_remote_uri(path):
@@ -131,8 +162,11 @@ def _prefetch_parquet_footers_for_paths(
             # to inferring the endpoint type.
             with kvikio.RemoteFile.open(path) as remote_file:  # pragma: no cover
                 sizes.append(remote_file.nbytes())
+            etags.append(None)
         else:
-            sizes.append(None)
+            stat = os.stat(path)
+            sizes.append(stat.st_size)
+            etags.append(_local_file_etag_from_stat(stat))
 
     metadata = plc.io.parquet_metadata.read_parquet_footers(
         plc.io.types.SourceInfo(
@@ -145,10 +179,25 @@ def _prefetch_parquet_footers_for_paths(
 
     return [
         CachedParquetInfo(
-            path, size, file_metadata, parse_hybrid_metadata=parse_hybrid_metadata
+            path,
+            size,
+            file_metadata,
+            etag,
+            parse_hybrid_metadata=parse_hybrid_metadata,
         )
-        for path, size, file_metadata in zip(paths, sizes, metadata, strict=True)
+        for path, size, file_metadata, etag in zip(
+            paths, sizes, metadata, etags, strict=True
+        )
     ]
+
+
+def _prefetch_single_parquet_footer(
+    path: str, *, parse_hybrid_metadata: bool = False
+) -> CachedParquetInfo:
+    """Prefetch the parquet footer for a single path."""
+    return _prefetch_parquet_footers_for_paths(
+        [path], parse_hybrid_metadata=parse_hybrid_metadata
+    )[0]
 
 
 @nvtx_annotate_cudf_polars(message="prefetch_parquet_file_metadata_for_ir")
@@ -268,3 +317,69 @@ def attach_cached_parquet_metadata(
                 continue
             Scan._validate_cached_parquet_info(cached_paths, cached)
             base_scan.cached_parquet_info = cached
+
+
+@nvtx_annotate_cudf_polars(message="warm_metadata_cache_for_ir")
+def warm_metadata_cache_for_ir(
+    root: IR,
+    cache: MetadataCache,
+    stats: StatsCollector | None = None,
+    *,
+    parse_hybrid_metadata: bool = False,
+) -> None:
+    """
+    Warm the persistent metadata cache for every parquet scan in an IR graph.
+
+    Unlike :func:`prefetch_parquet_file_metadata_for_ir`, this does not
+    block on the fetches it starts: paths already resolved by statistics
+    collection are attached directly, and every other path is submitted to
+    ``cache`` without waiting for it, to be picked up lazily by the scan
+    tasks that need it.
+
+    Parameters
+    ----------
+    root
+        The root of the IR graph, which will be traversed.
+    cache
+        The persistent metadata cache to warm.
+    stats
+        The stats collector. The file metadata might have already been
+        prefetched during statistics collection, when the number of files
+        sampled equals the total number of files. Those paths are attached
+        directly instead of resubmitted.
+    parse_hybrid_metadata
+        Whether to eagerly parse ``HybridScanMetadata`` for newly-submitted
+        paths. Only useful when ``ParquetOptions.use_hybrid_scan`` is enabled.
+    """
+    all_paths: set[str] = set()
+    for node in traversal([root]):
+        if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
+            for task in node.tasks:
+                all_paths.update(task.paths)
+        elif isinstance(node, Scan) and node.typ == "parquet":  # pragma: no cover
+            raise RuntimeError("Unexpected parquet 'Scan' node in lowered IR graph.")
+
+    cached_parquet_info_map: dict[str, CachedParquetInfo] = {}
+    if stats is not None:
+        for node, datasource_info in stats.scan_stats.items():
+            if (
+                isinstance(node, Scan)
+                and node.typ == "parquet"
+                and isinstance(datasource_info, ParquetSourceInfo)
+                and datasource_info.cached_parquet_info is not None
+            ):
+                for info in datasource_info.cached_parquet_info:
+                    cached_parquet_info_map[info.path] = info
+
+    if cached_parquet_info_map:
+        attach_cached_parquet_metadata(root, cached_parquet_info_map)
+
+    for path in all_paths - set(cached_parquet_info_map):
+        cache.get_or_submit(
+            path,
+            functools.partial(
+                _prefetch_single_parquet_footer,
+                path,
+                parse_hybrid_metadata=parse_hybrid_metadata,
+            ),
+        )

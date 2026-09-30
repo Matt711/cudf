@@ -606,6 +606,20 @@ class ParquetOptions:
         Whether to use the two-pass ``HybridScanReader`` for split parquet
         tasks when a predicate can be pushed down to a parquet filter.
         Default is False.
+    persistent_metadata_cache
+        Whether to cache parquet file metadata across queries on this
+        engine, rather than only for the duration of a single query.
+        Default is False.
+    metadata_fetch_pool_size
+        Number of threads in the persistent metadata cache's dedicated
+        fetch pool. Only used when ``persistent_metadata_cache`` is
+        enabled. Defaults to a size chosen from whether the first query to
+        use the cache touches any remote paths.
+    validate_cached_metadata_etag
+        Whether to validate a local file's persistently cached metadata
+        against a fresh ``stat()`` on every lookup, treating a mismatch as
+        a cache miss. Only used when ``persistent_metadata_cache`` is
+        enabled. Default is False.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -673,6 +687,25 @@ class ParquetOptions:
             default=False,
         )
     )
+    persistent_metadata_cache: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PERSISTENT_METADATA_CACHE",
+            _bool_converter,
+            default=False,
+        )
+    )
+    metadata_fetch_pool_size: int | None = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__METADATA_FETCH_POOL_SIZE", int, default=None
+        )
+    )
+    validate_cached_metadata_etag: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__VALIDATE_CACHED_METADATA_ETAG",
+            _bool_converter,
+            default=False,
+        )
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         if not isinstance(self.chunked, bool):
@@ -699,6 +732,12 @@ class ParquetOptions:
             )
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
+        if not isinstance(self.persistent_metadata_cache, bool):
+            raise TypeError("persistent_metadata_cache must be a bool")
+        if not isinstance(self.metadata_fetch_pool_size, (int, type(None))):
+            raise TypeError("metadata_fetch_pool_size must be an int or None")
+        if not isinstance(self.validate_cached_metadata_etag, bool):
+            raise TypeError("validate_cached_metadata_etag must be a bool")
 
 
 def default_target_partition_size(min_device_size: int | None) -> int:
@@ -983,6 +1022,9 @@ class SPMDContext:
         The active RapidsMPF context.
     py_executor
         Thread-pool executor used to drive the actor network on each rank.
+    store_uid
+        Identifier of this engine's process-local stores (persisted
+        partitions, cached parquet metadata).
     worker_resources
         Engine/worker-scoped Quent resources (device memory, channels, thread
         pool, processor registry, network topology). ``None`` when Quent is
@@ -995,6 +1037,7 @@ class SPMDContext:
     engine_id: uuid.UUID
     worker_id: uuid.UUID
     quent_logger: QuentLogger | None
+    store_uid: str
     worker_resources: WorkerResources | None = None
 
 
