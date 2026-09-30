@@ -620,6 +620,11 @@ class ParquetOptions:
         against a fresh ``stat()`` on every lookup, treating a mismatch as
         a cache miss. Only used when ``persistent_metadata_cache`` is
         enabled. Default is False.
+    use_cache_first_row_estimate
+        Whether to estimate row counts and column sizes from the
+        persistent metadata cache's current contents instead of sampling a
+        fixed number of footers. Only used when ``persistent_metadata_cache``
+        is enabled. Default is False.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -706,6 +711,25 @@ class ParquetOptions:
             default=False,
         )
     )
+    use_cache_first_row_estimate: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__USE_CACHE_FIRST_ROW_ESTIMATE",
+            _bool_converter,
+            default=False,
+        )
+    )
+    # Internal benchmarking flag: when the persistent metadata cache is enabled,
+    # record every column-size estimate and compare it against the real decoded
+    # bytes observed once a read resolves the same (path, column).
+    _track_column_size_estimates: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__TRACK_COLUMN_SIZE_ESTIMATES",
+            _bool_converter,
+            default=False,
+        ),
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         if not isinstance(self.chunked, bool):
@@ -738,6 +762,8 @@ class ParquetOptions:
             raise TypeError("metadata_fetch_pool_size must be an int or None")
         if not isinstance(self.validate_cached_metadata_etag, bool):
             raise TypeError("validate_cached_metadata_etag must be a bool")
+        if not isinstance(self.use_cache_first_row_estimate, bool):
+            raise TypeError("use_cache_first_row_estimate must be a bool")
 
 
 def default_target_partition_size(min_device_size: int | None) -> int:

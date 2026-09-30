@@ -824,6 +824,7 @@ def allgather_stats(
     ir: IR,
     config_options: ConfigOptions[StreamingExecutor],
     executor: Executor,
+    metadata_cache: MetadataCache | None = None,
 ) -> StatsCollector:
     """
     Collect scan statistics on rank 0 and distribute to all ranks.
@@ -844,16 +845,19 @@ def allgather_stats(
     executor: concurrent.futures.Executor
         Executor to use for IO operations. This function does not start
         or shutdown the executor.
+    metadata_cache
+        This engine's persistent parquet metadata cache, used when
+        ``ParquetOptions.use_cache_first_row_estimate`` is enabled.
 
     Returns
     -------
     A :class:`StatsCollector` valid for the local rank's IR node objects.
     """
     if comm.nranks == 1:
-        return collect_statistics(ir, config_options, executor)
+        return collect_statistics(ir, config_options, executor, metadata_cache)
 
     if comm.rank == 0:
-        stats = collect_statistics(ir, config_options, executor)
+        stats = collect_statistics(ir, config_options, executor, metadata_cache)
         data = json.dumps(stats.serialize(ir)).encode()
     else:
         data = b""
@@ -919,7 +923,9 @@ def evaluate_on_rank(
     metadata
         Collected channel metadata.
     """
-    stats = allgather_stats(comm, ctx.br(), ir, config_options, py_executor)
+    stats = allgather_stats(
+        comm, ctx.br(), ir, config_options, py_executor, metadata_cache
+    )
     # ``get_stable_plan_id`` is a deterministic function of the IR
     # structure, so every rank derives the same logical plan ID for a
     # given query (only rank 0 emits the declaration, but physical plans
