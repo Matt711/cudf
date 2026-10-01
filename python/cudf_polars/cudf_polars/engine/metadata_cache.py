@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -27,6 +28,19 @@ def default_num_threads(*, remote: bool) -> int:
     if remote:
         return _DEFAULT_REMOTE_NUM_THREADS
     return max(1, (os.cpu_count() or 4) // 4)
+
+
+class FetchStats(NamedTuple):
+    """A point-in-time snapshot of a :class:`MetadataCache`'s cumulative fetch cost."""
+
+    count: int
+    """Number of completed fetches (HEAD, if any, plus footer read) since the cache opened."""
+    seconds: float
+    """
+    Sum of each fetch's own wall-clock duration. Fetches run concurrently on the
+    pool, so this is cumulative thread-time, not elapsed time for the phase as a
+    whole — it can exceed the wall-clock span it was measured over.
+    """
 
 
 def _any_remote_parquet_path(ir: IR) -> bool:
@@ -79,6 +93,8 @@ class MetadataCache:
         self._track_estimates = track_estimates
         self._pending_estimates: dict[str, dict[str, tuple[float, str]]] = {}
         self._estimate_validations: list[dict[str, Any]] = []
+        self._fetch_count = 0
+        self._fetch_seconds = 0.0
         self._executor = ThreadPoolExecutor(
             max_workers=num_threads, thread_name_prefix="cudf-polars-metadata-fetch"
         )
@@ -97,6 +113,17 @@ class MetadataCache:
         cached = future.result().etag
         return current is not None and cached is not None and current != cached
 
+    def _timed_fetch(self, fetch: Callable[[], CachedParquetInfo]) -> CachedParquetInfo:
+        """Run ``fetch``, recording its wall-clock duration regardless of outcome."""
+        start = time.monotonic()
+        try:
+            return fetch()
+        finally:
+            elapsed = time.monotonic() - start
+            with self._lock:
+                self._fetch_count += 1
+                self._fetch_seconds += elapsed
+
     def get_or_submit(
         self, path: str, fetch: Callable[[], CachedParquetInfo]
     ) -> Future[CachedParquetInfo]:
@@ -106,9 +133,14 @@ class MetadataCache:
             if future is not None and self._is_stale(path, future):
                 future = None
             if future is None:
-                future = self._executor.submit(fetch)
+                future = self._executor.submit(self._timed_fetch, fetch)
                 self._entries[path] = future
         return future
+
+    def fetch_stats(self) -> FetchStats:
+        """Return a snapshot of cumulative fetch count and thread-time so far."""
+        with self._lock:
+            return FetchStats(self._fetch_count, self._fetch_seconds)
 
     def peek(self, path: str) -> CachedParquetInfo | None:
         """Return ``path``'s cached metadata if already resolved, without fetching."""

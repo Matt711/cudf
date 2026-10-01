@@ -988,6 +988,9 @@ def evaluate_on_rank(
         metadata_cache=metadata_cache,
     )
 
+    fetch_stats_before = (
+        metadata_cache.fetch_stats() if metadata_cache is not None else None
+    )
     if metadata_cache is not None:
         # Superseded by the persistent cache: submit every path without
         # blocking on it, and let scan tasks resolve their own paths lazily
@@ -1008,7 +1011,7 @@ def evaluate_on_rank(
         attach_cached_parquet_metadata(ir, cached_parquet_info_map)
 
     with ReserveOpIDs(ir, config_options) as collective_id_map:
-        return execute_ir_on_rank(
+        result = execute_ir_on_rank(
             ctx,
             comm,
             ir,
@@ -1020,6 +1023,15 @@ def evaluate_on_rank(
             quent_operator_map=quent_operator_map,
             local_quent_context=local_quent_context,
         )
+    if metadata_cache is not None and fetch_stats_before is not None:
+        after = metadata_cache.fetch_stats()
+        print(
+            f"==> metadata-fetch: {after.count - fetch_stats_before.count} fetch(es), "
+            f"{after.seconds - fetch_stats_before.seconds:.4f}s cumulative thread-time "
+            f"(query_id={query_id})",
+            flush=True,
+        )
+    return result
 
 
 def is_duplicated_output(metadata: list[ChannelMetadata] | None) -> bool:
