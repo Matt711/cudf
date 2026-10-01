@@ -3,6 +3,7 @@
 import io
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from utils import (
     extract_parquet_footer,
