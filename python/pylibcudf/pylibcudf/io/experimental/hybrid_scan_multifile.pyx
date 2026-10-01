@@ -750,7 +750,7 @@ cdef class HybridScanMultiFile:
                     columns_mode,
                     std_span[const_vector_size_type](
                         <const_vector_size_type*>row_group_indices.c_obj.data(),
-                    row_group_indices.c_obj.size()
+                        row_group_indices.c_obj.size()
                     ),
                     pass_read_limit,
                     options.c_obj
