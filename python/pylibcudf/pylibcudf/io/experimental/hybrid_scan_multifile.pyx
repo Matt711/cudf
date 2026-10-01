@@ -63,18 +63,29 @@ cdef class RowGroupIndices:
     is done once at construction. Instances are accepted and returned by the
     :class:`HybridScanMultiFile` methods so that the conversion is not repeated on
     every call.
-
-    Parameters
-    ----------
-    row_group_indices : Sequence[Sequence[int]]
-        Row group indices, one inner sequence per source
     """
 
-    def __init__(self, object row_group_indices):
-        cdef vector[size_type] source_indices
-        for source in row_group_indices:
-            source_indices = source
-            self.c_obj.push_back(source_indices)
+    def __init__(self):
+        raise ValueError(
+            "RowGroupIndices cannot be constructed directly. "
+            "Use from_lists()."
+        )
+
+    @staticmethod
+    def from_lists(object row_group_indices) -> RowGroupIndices:
+        """Create RowGroupIndices from per-source row group indices.
+
+        Parameters
+        ----------
+        row_group_indices : Sequence[Sequence[int]]
+            Row group indices, one inner sequence per source
+
+        Returns
+        -------
+        RowGroupIndices
+        """
+        cdef vector[vector[size_type]] indices = row_group_indices
+        return RowGroupIndices.from_libcudf(move(indices))
 
     @staticmethod
     cdef RowGroupIndices from_libcudf(vector[vector[size_type]] indices):

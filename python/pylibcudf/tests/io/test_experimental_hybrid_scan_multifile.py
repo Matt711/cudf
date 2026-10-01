@@ -109,7 +109,7 @@ def parquet_options() -> plc.io.parquet.ParquetReaderOptions:
 @pytest.fixture
 def row_groups(num_row_groups: int) -> RowGroupIndices:
     """Row group indices of both parquet sources."""
-    return RowGroupIndices([list(range(num_row_groups))] * 2)
+    return RowGroupIndices.from_lists([list(range(num_row_groups))] * 2)
 
 
 @pytest.fixture
@@ -436,7 +436,7 @@ def test_hybrid_scan_multifile_total_rows_in_row_groups(
     )
     assert total_rows == num_sources * num_rows_per_source
 
-    subset = RowGroupIndices([[0, 1]] * num_sources)
+    subset = RowGroupIndices.from_lists([[0, 1]] * num_sources)
     subset_rows = multifile_hybrid_scan_reader.total_rows_in_row_groups(subset)
     assert subset_rows == num_sources * row_group_size * 2
 
@@ -770,4 +770,4 @@ def test_hybrid_scan_multifile_row_group_indices_object(
         multifile_parquet_options
     )
     as_list = all_row_groups.tolist()
-    assert RowGroupIndices(as_list).tolist() == as_list
+    assert RowGroupIndices.from_lists(as_list).tolist() == as_list

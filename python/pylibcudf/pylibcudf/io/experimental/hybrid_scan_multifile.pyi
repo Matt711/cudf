@@ -20,7 +20,10 @@ except ImportError:
     from typing_extensions import Buffer
 
 class RowGroupIndices:
-    def __init__(self, row_group_indices: Sequence[Sequence[int]]) -> None: ...
+    @staticmethod
+    def from_lists(
+        row_group_indices: Sequence[Sequence[int]],
+    ) -> RowGroupIndices: ...
     def tolist(self) -> list[list[int]]: ...
 
 class HybridScanMultiFile:
