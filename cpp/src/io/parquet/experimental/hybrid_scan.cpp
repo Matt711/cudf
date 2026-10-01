@@ -18,7 +18,7 @@ hybrid_scan_metadata::hybrid_scan_metadata(cudf::host_span<uint8_t const> footer
   : _metadata{std::make_shared<detail::aggregate_reader_metadata>(
       std::vector<cudf::host_span<uint8_t const>>{footer_bytes},
       options.is_enabled_use_arrow_schema(),
-      options.get_column_names().has_value() and options.is_enabled_allow_mismatched_pq_schemas())}
+      options.is_enabled_allow_mismatched_pq_schemas())}
 {
 }
 
@@ -27,7 +27,7 @@ hybrid_scan_metadata::hybrid_scan_metadata(FileMetaData const& parquet_metadata,
   : _metadata{std::make_shared<detail::aggregate_reader_metadata>(
       std::vector<FileMetaData>{parquet_metadata},
       options.is_enabled_use_arrow_schema(),
-      options.get_column_names().has_value() and options.is_enabled_allow_mismatched_pq_schemas())}
+      options.is_enabled_allow_mismatched_pq_schemas())}
 {
 }
 
@@ -404,20 +404,20 @@ table_with_metadata hybrid_scan_reader::materialize_all_columns_chunk() const
 }
 
 std::vector<std::vector<cudf::size_type>> hybrid_scan_reader::construct_row_group_passes(
-  std::span<cudf::size_type const> row_group_indices, std::size_t pass_read_limit) const
+  read_columns_mode columns_mode,
+  std::span<cudf::size_type const> row_group_indices,
+  std::size_t pass_read_limit,
+  parquet_reader_options const& options) const
 {
   CUDF_FUNC_RANGE();
 
   auto const total_row_groups = row_group_indices.size();
-
-  CUDF_EXPECTS(
-    total_row_groups > 0, "Empty input row group indices encountered", std::invalid_argument);
-
   auto const input_row_group_indices =
     std::vector<std::vector<size_type>>{{row_group_indices.begin(), row_group_indices.end()}};
 
   return _impl
-    ->construct_row_group_passes(input_row_group_indices, total_row_groups, pass_read_limit)
+    ->construct_row_group_passes(
+      columns_mode, input_row_group_indices, total_row_groups, pass_read_limit, options)
     .first;
 }
 
