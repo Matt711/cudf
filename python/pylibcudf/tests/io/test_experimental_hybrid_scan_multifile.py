@@ -21,7 +21,11 @@ from pylibcudf.expressions import (
     Literal,
     Operation,
 )
-from pylibcudf.io.experimental import HybridScanMultiFile, ReadColumnsMode
+from pylibcudf.io.experimental import (
+    HybridScanMultiFile,
+    ReadColumnsMode,
+    RowGroupIndices,
+)
 
 
 @pytest.fixture(scope="module")
@@ -103,9 +107,9 @@ def parquet_options() -> plc.io.parquet.ParquetReaderOptions:
 
 
 @pytest.fixture
-def row_groups(num_row_groups: int) -> list[list[int]]:
+def row_groups(num_row_groups: int) -> RowGroupIndices:
     """Row group indices of both parquet sources."""
-    return [list(range(num_row_groups))] * 2
+    return RowGroupIndices([list(range(num_row_groups))] * 2)
 
 
 @pytest.fixture
@@ -155,7 +159,7 @@ def test_hybrid_scan_multifile_construct_directly_raises() -> None:
 
 def test_hybrid_scan_multifile_metadata(
     hybrid_scan_multifile_reader_without_page_index: HybridScanMultiFile,
-    row_groups: list[list[int]],
+    row_groups: RowGroupIndices,
     num_rows: int,
 ) -> None:
     """Test the metadata of a reader built from pre-populated metadata."""
@@ -187,13 +191,14 @@ def test_hybrid_scan_multifile_metadata(
 def test_hybrid_scan_multifile_construct_row_group_passes(
     hybrid_scan_multifile_reader: HybridScanMultiFile,
     parquet_options: plc.io.parquet.ParquetReaderOptions,
-    row_groups: list[list[int]],
+    row_groups: RowGroupIndices,
 ) -> None:
     """Test partitioning the input row groups into passes."""
     # No read limit yields a single pass spanning all sources
-    assert hybrid_scan_multifile_reader.construct_row_group_passes(
+    passes = hybrid_scan_multifile_reader.construct_row_group_passes(
         ReadColumnsMode.ALL_COLUMNS, row_groups, 0, parquet_options
-    ) == [row_groups]
+    )
+    assert [p.tolist() for p in passes] == [row_groups.tolist()]
 
     # A tiny read limit splits the row groups across multiple passes
     assert (
@@ -211,7 +216,7 @@ def test_hybrid_scan_multifile_materialize_payload_pages(
     parquet_bytes: list[bytes],
     hybrid_scan_multifile_reader: HybridScanMultiFile,
     parquet_options: plc.io.parquet.ParquetReaderOptions,
-    row_groups: list[list[int]],
+    row_groups: RowGroupIndices,
     parquet_table: pa.Table,
     num_rows: int,
     stream: Stream | None,
@@ -409,8 +414,8 @@ def test_hybrid_scan_multifile_all_row_groups(
         multifile_parquet_options
     )
 
-    assert len(row_groups) == num_sources
-    for src_groups in row_groups:
+    assert len(row_groups.tolist()) == num_sources
+    for src_groups in row_groups.tolist():
         assert src_groups == list(range(num_row_groups_per_source))
 
 
@@ -431,7 +436,7 @@ def test_hybrid_scan_multifile_total_rows_in_row_groups(
     )
     assert total_rows == num_sources * num_rows_per_source
 
-    subset = [[0, 1]] * num_sources
+    subset = RowGroupIndices([[0, 1]] * num_sources)
     subset_rows = multifile_hybrid_scan_reader.total_rows_in_row_groups(subset)
     assert subset_rows == num_sources * row_group_size * 2
 
@@ -456,8 +461,8 @@ def test_hybrid_scan_multifile_filter_row_groups_with_byte_range(
     )
 
     # Without a byte range restriction, all row groups should be retained
-    assert len(filtered) == num_sources
-    assert filtered == all_row_groups
+    assert len(filtered.tolist()) == num_sources
+    assert filtered.tolist() == all_row_groups.tolist()
 
 
 @pytest.mark.parametrize("stream", [None, Stream()])
@@ -493,6 +498,7 @@ def test_hybrid_scan_multifile_filter_row_groups_with_stats(
         all_row_groups, multifile_parquet_options, stream
     )
 
+    filtered = filtered.tolist()
     assert len(filtered) == num_sources
     # Source 0: first half filtered out, second half retained
     assert filtered[0] == list(
@@ -717,7 +723,7 @@ def test_hybrid_scan_multifile_setup_page_indexes(
     all_row_groups = multifile_hybrid_scan_reader.all_row_groups(
         multifile_parquet_options
     )
-    assert all(len(src) > 0 for src in all_row_groups)
+    assert all(len(src) > 0 for src in all_row_groups.tolist())
 
     # Before setup_page_indexes, page-index-dependent ops should error
     with pytest.raises(RuntimeError):
@@ -753,3 +759,15 @@ def test_hybrid_scan_multifile_setup_page_indexes(
     assert row_mask is not None
     assert row_mask.size() > 0
     assert row_mask.type().id() == plc.types.TypeId.BOOL8
+
+
+def test_hybrid_scan_multifile_row_group_indices_object(
+    multifile_hybrid_scan_reader,
+    multifile_parquet_options,
+):
+    """RowGroupIndices round-trips through tolist()."""
+    all_row_groups = multifile_hybrid_scan_reader.all_row_groups(
+        multifile_parquet_options
+    )
+    as_list = all_row_groups.tolist()
+    assert RowGroupIndices(as_list).tolist() == as_list

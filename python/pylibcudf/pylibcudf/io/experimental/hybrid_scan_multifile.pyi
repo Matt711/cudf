@@ -19,6 +19,10 @@ try:
 except ImportError:
     from typing_extensions import Buffer
 
+class RowGroupIndices:
+    def __init__(self, row_group_indices: Sequence[Sequence[int]]) -> None: ...
+    def tolist(self) -> list[list[int]]: ...
+
 class HybridScanMultiFile:
     @staticmethod
     def from_parquet_metadatas(
@@ -32,53 +36,53 @@ class HybridScanMultiFile:
     ) -> None: ...
     def all_row_groups(
         self, options: ParquetReaderOptions
-    ) -> list[list[int]]: ...
+    ) -> RowGroupIndices: ...
     def total_rows_in_row_groups(
-        self, row_group_indices: list[list[int]]
+        self, row_group_indices: RowGroupIndices
     ) -> int: ...
     def reset_column_selection(self) -> None: ...
     def filter_row_groups_with_byte_range(
         self,
-        row_group_indices: list[list[int]],
+        row_group_indices: RowGroupIndices,
         options: ParquetReaderOptions,
-    ) -> list[list[int]]: ...
+    ) -> RowGroupIndices: ...
     def filter_row_groups_with_stats(
         self,
-        row_group_indices: list[list[int]],
+        row_group_indices: RowGroupIndices,
         options: ParquetReaderOptions,
         stream: CudaStreamLike | None = None,
-    ) -> list[list[int]]: ...
+    ) -> RowGroupIndices: ...
     def bloom_filters_byte_ranges(
         self,
-        row_group_indices: list[list[int]],
+        row_group_indices: RowGroupIndices,
         options: ParquetReaderOptions,
     ) -> tuple[list[ByteRangeInfo], list[int]]: ...
     def dictionary_pages_byte_ranges(
         self,
-        row_group_indices: list[list[int]],
+        row_group_indices: RowGroupIndices,
         options: ParquetReaderOptions,
     ) -> tuple[list[ByteRangeInfo], list[int]]: ...
     def build_all_true_row_mask(
         self,
-        row_group_indices: list[list[int]],
+        row_group_indices: RowGroupIndices,
         stream: CudaStreamLike | None = None,
         mr: DeviceMemoryResource | None = None,
     ) -> Column: ...
     def build_row_mask_with_page_index_stats(
         self,
-        row_group_indices: list[list[int]],
+        row_group_indices: RowGroupIndices,
         options: ParquetReaderOptions,
         stream: CudaStreamLike | None = None,
         mr: DeviceMemoryResource | None = None,
     ) -> Column: ...
     def all_column_chunks_byte_ranges(
         self,
-        row_group_indices: list[list[int]],
+        row_group_indices: RowGroupIndices,
         options: ParquetReaderOptions,
     ) -> tuple[list[ByteRangeInfo], list[int]]: ...
     def materialize_all_columns(
         self,
-        row_group_indices: list[list[int]],
+        row_group_indices: RowGroupIndices,
         column_chunk_data: list[Span],
         options: ParquetReaderOptions,
         stream: CudaStreamLike | None = None,
@@ -86,7 +90,7 @@ class HybridScanMultiFile:
     ) -> TableWithMetadata: ...
     def payload_pages_byte_ranges(
         self,
-        row_group_indices: list[list[int]],
+        row_group_indices: RowGroupIndices,
         row_mask: Column,
         options: ParquetReaderOptions,
         stream: CudaStreamLike | None = None,
@@ -95,7 +99,7 @@ class HybridScanMultiFile:
         self,
         chunk_read_limit: int,
         pass_read_limit: int,
-        row_group_indices: list[list[int]],
+        row_group_indices: RowGroupIndices,
         row_mask: Column,
         page_data: Sequence[Span | None],
         options: ParquetReaderOptions,
@@ -109,8 +113,8 @@ class HybridScanMultiFile:
     def construct_row_group_passes(
         self,
         columns_mode: ReadColumnsMode,
-        row_group_indices: list[list[int]],
+        row_group_indices: RowGroupIndices,
         pass_read_limit: int,
         options: ParquetReaderOptions,
-    ) -> list[list[list[int]]]: ...
+    ) -> list[RowGroupIndices]: ...
     def has_next_table_chunk(self) -> bool: ...
