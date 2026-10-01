@@ -329,7 +329,7 @@ cdef class HybridScanMultiFile:
                     row_group_indices.c_obj.size()
                 ),
                 options.c_obj,
-                _stream.view().value()
+                _stream.view().get()
             )
         return RowGroupIndices.from_libcudf(move(filtered))
 
@@ -431,7 +431,7 @@ cdef class HybridScanMultiFile:
                     <const_vector_size_type*>row_group_indices.c_obj.data(),
                     row_group_indices.c_obj.size()
                 ),
-                _stream.view().value(),
+                _stream.view().get(),
                 mr.get_mr()
             )
         return Column.from_libcudf(move(c_result), _stream, mr)
@@ -471,7 +471,7 @@ cdef class HybridScanMultiFile:
                     row_group_indices.c_obj.size()
                 ),
                 options.c_obj,
-                _stream.view().value(),
+                _stream.view().get(),
                 mr.get_mr()
             )
         return Column.from_libcudf(move(c_result), _stream, mr)
@@ -556,7 +556,7 @@ cdef class HybridScanMultiFile:
                     spans_vec.size()
                 ),
                 options.c_obj,
-                _stream.view().value(),
+                _stream.view().get(),
                 mr.get_mr()
             )
         return TableWithMetadata.from_libcudf(c_result, _stream, mr)
