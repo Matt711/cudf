@@ -18,6 +18,7 @@ import polars as pl
 import pylibcudf as plc
 
 from cudf_polars.containers import Column, DataFrame
+from cudf_polars.dsl.expr import NamedExpr
 from cudf_polars.dsl.ir import (
     IR,
     DataFrameScan,
@@ -26,6 +27,7 @@ from cudf_polars.dsl.ir import (
     Scan,
     Sink,
     _prepare_parquet_predicate,
+    apply_predicate,
 )
 from cudf_polars.dsl.to_ast import to_parquet_filter
 from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
@@ -48,7 +50,6 @@ if TYPE_CHECKING:
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.containers import DataType
-    from cudf_polars.dsl.expr import NamedExpr
     from cudf_polars.dsl.ir import CachedParquetInfo, IRExecutionContext
     from cudf_polars.dsl.utils.per_path import PerPathValues
     from cudf_polars.engine.metadata_cache import MetadataCache
@@ -241,7 +242,6 @@ def hybrid_scan_eligible(
     row_index: tuple[str, int] | None,
     include_file_paths: str | None,
     predicate: NamedExpr | None,
-    hive_parts: PerPathValues | None,
 ) -> bool:
     """Whether scan options allow hybrid scan if metadata is available."""
     return (
@@ -249,8 +249,6 @@ def hybrid_scan_eligible(
         and row_index is None
         and include_file_paths is None
         and predicate is not None
-        # TODO: Support hive partitioning
-        and hive_parts is None
     )
 
 
@@ -719,7 +717,6 @@ class ParquetScanTask(ScanTask):
                 row_index=base_scan.row_index,
                 include_file_paths=base_scan.include_file_paths,
                 predicate=base_scan.predicate,
-                hive_parts=hive_parts,
             )
         )
         if task_parquet_info is None and (
@@ -746,20 +743,34 @@ class ParquetScanTask(ScanTask):
             assert base_scan.predicate is not None
             assert task_parquet_info is not None
             stream = context.get_cuda_stream()
+            hive_names = (
+                frozenset(hive_parts.names) if hive_parts is not None else frozenset()
+            )
+            file_schema = {
+                name: dtype
+                for name, dtype in base_scan.schema.items()
+                if name not in hive_names
+            }
+            file_columns = (
+                None
+                if base_scan.with_columns is None
+                else [name for name in base_scan.with_columns if name not in hive_names]
+            )
             plc_filter, residual = to_parquet_filter(
                 _prepare_parquet_predicate(
                     base_scan.predicate.value,
                     paths,
                     base_scan.schema,
-                    base_scan.with_columns,
+                    file_columns,
                 ),
                 stream=stream,
+                unreadable_columns=hive_names,
             )
-            if plc_filter is not None and residual is None:
-                return _read_with_hybrid_scan(
-                    base_scan.schema,
+            if plc_filter is not None:
+                df = _read_with_hybrid_scan(
+                    file_schema,
                     paths,
-                    base_scan.with_columns,
+                    file_columns,
                     plc_filter,
                     bounds.row_groups[0],
                     stream,
@@ -767,6 +778,19 @@ class ParquetScanTask(ScanTask):
                     split_index=split_index,
                     total_splits=total_splits,
                     stats_pruning=parquet_options._hybrid_scan_stats_pruning,
+                )
+                if hive_parts is not None:
+                    df = df.with_columns(
+                        hive_parts.broadcast(df.num_rows, stream=stream),
+                        stream=stream,
+                    ).select(list(base_scan.schema))
+                # TODO: Evaluate conjuncts that only reference hive columns once
+                # per file, skipping the read when they are false.
+                return apply_predicate(
+                    df,
+                    NamedExpr(base_scan.predicate.name, residual)
+                    if residual is not None
+                    else None,
                 )
 
         nvtx_message = (
@@ -1096,7 +1120,8 @@ def _column_size_stats_from_footers(
         ).items()
     }
     mean_size_per_file = {
-        name: int(statistics.mean(sizes)) for name, sizes in column_sizes_per_file.items()
+        name: int(statistics.mean(sizes))
+        for name, sizes in column_sizes_per_file.items()
     }
     return (
         tuple(column_sizes_per_file),
@@ -1519,7 +1544,9 @@ class ParquetSourceInfo:
                 if metadata_cache is not None:
                     bytes_per_row = per_file_means[col] / rows_per_file
                     for path in paths:
-                        metadata_cache.record_estimate(path, col, bytes_per_row, "sampled")
+                        metadata_cache.record_estimate(
+                            path, col, bytes_per_row, "sampled"
+                        )
                         # Seed the observation store so later queries for
                         # this table skip sampling entirely: it's a
                         # once-per-column-per-table bootstrap, not a
