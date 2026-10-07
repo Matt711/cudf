@@ -2388,17 +2388,6 @@ def build_parser(num_queries: int = 22) -> argparse.ArgumentParser:
         help="Sleep this many seconds between iterations (default: 0).",
     )
     parser.add_argument(
-        "--io-mode",
-        dest="io_mode",
-        default="lukewarm",
-        choices=["cold", "lukewarm", "hot"],
-        help=textwrap.dedent("""\
-            Cache state control for each timed iteration:
-                - cold     : Drop Linux page cache before each iteration (requires kvikio)
-                - lukewarm : No cache manipulation; OS cache state unchanged (default)
-                - hot      : One untimed warmup iteration to populate cache before measured runs"""),
-    )
-    parser.add_argument(
         "--collect-traces",
         action=argparse.BooleanOptionalAction,
         default=False,
