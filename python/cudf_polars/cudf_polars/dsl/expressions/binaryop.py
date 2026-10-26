@@ -22,6 +22,22 @@ if TYPE_CHECKING:
 
 __all__ = ["BinOp"]
 
+_DECIMAL128_MAX_PRECISION = 38
+
+
+def _decimal_rescale_may_overflow(left: DataType, right: DataType) -> bool:
+    """Whether rescaling two Decimals to their finer scale can exceed 38 digits."""
+    if not (
+        plc.traits.is_fixed_point(left.plc_type)
+        and plc.traits.is_fixed_point(right.plc_type)
+    ):
+        return False
+    lt, rt = left.polars_type, right.polars_type
+    lp = lt.precision or _DECIMAL128_MAX_PRECISION
+    rp = rt.precision or _DECIMAL128_MAX_PRECISION
+    scale = max(lt.scale, rt.scale)
+    return max(lp - lt.scale, rp - rt.scale) + scale > _DECIMAL128_MAX_PRECISION
+
 
 class BinOp(Expr):
     __slots__ = ("op",)
@@ -43,6 +59,14 @@ class BinOp(Expr):
         self.op = op
         self.children = (left, right)
         self.is_pointwise = True
+        if op in BinOp._COMPARISONS and _decimal_rescale_may_overflow(
+            left.dtype, right.dtype
+        ):
+            # Polars 2.1 compares decimals of different scales exactly, but
+            # libcudf rescales to the finer scale in 128 bits and wraps.
+            raise NotImplementedError(
+                "Comparing Decimals whose common scale does not fit in 38 digits"
+            )
         if not plc.binaryop.is_supported_operation(
             self.dtype.plc_type, left.dtype.plc_type, right.dtype.plc_type, op
         ):
@@ -51,6 +75,19 @@ class BinOp(Expr):
                 f"for types {left.dtype.id().name} and {right.dtype.id().name} "
                 f"with output type {self.dtype.id().name}"
             )
+
+    _COMPARISONS: ClassVar[frozenset[plc.binaryop.BinaryOperator]] = frozenset(
+        {
+            plc.binaryop.BinaryOperator.EQUAL,
+            plc.binaryop.BinaryOperator.NULL_EQUALS,
+            plc.binaryop.BinaryOperator.NOT_EQUAL,
+            plc.binaryop.BinaryOperator.NULL_NOT_EQUALS,
+            plc.binaryop.BinaryOperator.LESS,
+            plc.binaryop.BinaryOperator.LESS_EQUAL,
+            plc.binaryop.BinaryOperator.GREATER,
+            plc.binaryop.BinaryOperator.GREATER_EQUAL,
+        }
+    )
 
     _BOOL_KLEENE_MAPPING: ClassVar[
         dict[plc.binaryop.BinaryOperator, plc.binaryop.BinaryOperator]

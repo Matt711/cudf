@@ -24,6 +24,26 @@ if TYPE_CHECKING:
 __all__ = ["Cast", "Len", "UnaryFunction"]
 
 
+_INTEGER_BITS = {
+    plc.TypeId.INT8: (8, True),
+    plc.TypeId.INT16: (16, True),
+    plc.TypeId.INT32: (32, True),
+    plc.TypeId.INT64: (64, True),
+    plc.TypeId.UINT8: (8, False),
+    plc.TypeId.UINT16: (16, False),
+    plc.TypeId.UINT32: (32, False),
+    plc.TypeId.UINT64: (64, False),
+}
+
+
+def _integer_range(dtype: plc.DataType) -> tuple[int, int]:
+    """Inclusive (min, max) of a pylibcudf integer type."""
+    bits, signed = _INTEGER_BITS[dtype.id()]
+    if signed:
+        return -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    return 0, (1 << bits) - 1
+
+
 class Cast(Expr):
     """Class representing a cast of an expression."""
 
@@ -46,7 +66,53 @@ class Cast(Expr):
         """Evaluate this expression given a dataframe for context."""
         (child,) = self.children
         column = child.evaluate(df, context=context)
-        return column.astype(self.dtype, stream=df.stream, strict=self.strict)
+        result = column.astype(self.dtype, stream=df.stream, strict=self.strict)
+        if (
+            not self.strict
+            and plc.traits.is_integral_not_bool(column.obj.type())
+            and plc.traits.is_integral_not_bool(self.dtype.plc_type)
+        ):
+            # libcudf wraps out-of-range integers; a non-strict Polars cast
+            # produces null instead.
+            lo, hi = _integer_range(self.dtype.plc_type)
+            src_lo, src_hi = _integer_range(column.obj.type())
+            in_range: plc.Column | None = None
+            for bound, needed, op in (
+                (lo, lo > src_lo, plc.binaryop.BinaryOperator.GREATER_EQUAL),
+                (hi, hi < src_hi, plc.binaryop.BinaryOperator.LESS_EQUAL),
+            ):
+                if needed:
+                    check = plc.binaryop.binary_operation(
+                        column.obj,
+                        plc.Scalar.from_py(bound, column.obj.type(), stream=df.stream),
+                        op,
+                        plc.DataType(plc.TypeId.BOOL8),
+                        stream=df.stream,
+                    )
+                    in_range = (
+                        check
+                        if in_range is None
+                        else plc.binaryop.binary_operation(
+                            in_range,
+                            check,
+                            plc.binaryop.BinaryOperator.NULL_LOGICAL_AND,
+                            plc.DataType(plc.TypeId.BOOL8),
+                            stream=df.stream,
+                        )
+                    )
+            if in_range is not None:
+                result = Column(
+                    plc.copying.copy_if_else(
+                        result.obj,
+                        plc.Scalar.from_py(
+                            None, self.dtype.plc_type, stream=df.stream
+                        ),
+                        in_range,
+                        stream=df.stream,
+                    ),
+                    dtype=self.dtype,
+                )
+        return result
 
 
 class Len(Expr):
