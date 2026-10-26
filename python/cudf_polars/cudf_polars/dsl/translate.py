@@ -1417,9 +1417,7 @@ def _translate_function(
                     DataType(pl.Decimal(38, out_scale + 1)),
                     plc.binaryop.BinaryOperator.DIV,
                     expr.Cast(
-                        DataType(
-                            pl.Decimal(38, out_scale + 1 + right_type.scale)
-                        ),
+                        DataType(pl.Decimal(38, out_scale + 1 + right_type.scale)),
                         True,  # noqa: FBT003
                         left,
                     ),
