@@ -423,12 +423,7 @@ class UnaryFunction(Expr):
             k = k_col.obj_scalar(stream=df.stream).to_py(stream=df.stream)
         # Mirror polars: any numeric is truncated to an integer; null, NaN
         # and negative values are errors.
-        if (
-            k is None
-            or not isinstance(k, (int, float))
-            or math.isnan(k)
-            or k < 0
-        ):
+        if k is None or not isinstance(k, (int, float)) or math.isnan(k) or k < 0:
             raise ComputeError(f"invalid value of 'k' in top_k: {k!r}")
         return int(k)
 

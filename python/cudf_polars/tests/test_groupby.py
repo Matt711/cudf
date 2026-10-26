@@ -412,6 +412,10 @@ def test_groupby_null_keys(engine: pl.GPUEngine, maintain_order):
     assert_gpu_result_equal(q, engine=engine)
 
 
+# NB: polars >= 2.1 rewrites ``x.sort_by(y).first()/last()`` into ``min_by`` /
+# ``max_by`` with a total order unless ``maintain_order=True``; the visitor cannot
+# express that order, so those queries fall back to CPU. The tests below use
+# ``maintain_order=True`` to keep exercising the GPU ``SortedAgg`` path.
 def test_groupby_sort_by_first_last_in_memory(in_memory_engine: pl.GPUEngine) -> None:
     df = pl.LazyFrame(
         {
@@ -423,8 +427,8 @@ def test_groupby_sort_by_first_last_in_memory(in_memory_engine: pl.GPUEngine) ->
 
     q = df.group_by("g", maintain_order=True).agg(
         pl.col("val").sum().alias("volume"),
-        pl.col("val").sort_by("idx").first().alias("open"),
-        pl.col("val").sort_by("idx").last().alias("close"),
+        pl.col("val").sort_by("idx", maintain_order=True).first().alias("open"),
+        pl.col("val").sort_by("idx", maintain_order=True).last().alias("close"),
     )
     assert_gpu_result_equal(q, engine=in_memory_engine, check_row_order=True)
 
@@ -442,8 +446,11 @@ def test_groupby_sort_by_multiple_order_keys_in_memory(
     )
 
     q = df.group_by("g", maintain_order=True).agg(
-        pl.col("val").sort_by("idx").first().alias("first_by_idx"),
-        pl.col("val").sort_by("seq", descending=True).first().alias("first_by_seq"),
+        pl.col("val").sort_by("idx", maintain_order=True).first().alias("first_by_idx"),
+        pl.col("val")
+        .sort_by("seq", descending=True, maintain_order=True)
+        .first()
+        .alias("first_by_seq"),
     )
     assert_gpu_result_equal(q, engine=in_memory_engine, check_row_order=True)
 
@@ -469,6 +476,7 @@ def test_groupby_sort_by_first_pointwise_in_memory(
                 pl.col("seq"),
                 descending=[False, True],
                 nulls_last=[False, False],
+                maintain_order=True,
             )
             .first()
             .alias("picked")
@@ -511,8 +519,8 @@ def test_groupby_sort_by_preserves_sorted_key_order_in_memory(
         df.sort("g", descending=True)
         .group_by("g", maintain_order=True)
         .agg(
-            pl.col("val").sort_by("idx").first().alias("open"),
-            pl.col("val").sort_by("idx").last().alias("close"),
+            pl.col("val").sort_by("idx", maintain_order=True).first().alias("open"),
+            pl.col("val").sort_by("idx", maintain_order=True).last().alias("close"),
         )
     )
     assert_gpu_result_equal(q, engine=in_memory_engine, check_row_order=True)
@@ -529,7 +537,9 @@ def test_groupby_sort_by_drop_nulls_first_raises(
         }
     )
 
-    q = df.group_by("g").agg(pl.col("val").sort_by("idx").drop_nulls().first())
+    q = df.group_by("g").agg(
+        pl.col("val").sort_by("idx", maintain_order=True).drop_nulls().first()
+    )
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
@@ -544,7 +554,21 @@ def test_groupby_sort_by_nested_agg_order_by_raises(
         }
     )
 
-    q = df.group_by("g").agg(pl.col("val").sort_by(pl.col("idx").max()).first())
+    q = df.group_by("g").agg(
+        pl.col("val")
+        .sort_by(pl.col("idx") - pl.col("idx").max(), maintain_order=True)
+        .first()
+    )
+    assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
+
+
+def test_groupby_sort_by_first_total_order_min_by_unsupported(
+    in_memory_engine: pl.GPUEngine,
+) -> None:
+    # polars >= 2.1 lowers this to a total-order ``min_by``, which the Python
+    # visitor does not expose ("total order min_by/max_by").
+    df = pl.LazyFrame({"g": ["A", "A", "B"], "idx": [2, 1, 1], "val": [30, 10, 20]})
+    q = df.group_by("g").agg(pl.col("val").sort_by("idx").first())
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
