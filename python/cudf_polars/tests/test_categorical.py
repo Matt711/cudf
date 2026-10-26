@@ -23,6 +23,7 @@ from cudf_polars.testing.asserts import (
 )
 from cudf_polars.utils.config import Cluster
 from cudf_polars.utils.cuda_stream import get_cuda_stream
+from cudf_polars.utils.versions import POLARS_VERSION_LT_21
 
 if TYPE_CHECKING:
     from typing import Any
@@ -357,6 +358,10 @@ def test_enum_literal_raises(in_memory_engine):
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
+@pytest.mark.skipif(
+    POLARS_VERSION_LT_21,
+    reason="Polars 2.0 does not fold a constant literal into a scan",
+)
 def test_enum_literal_select_folded_to_scan(in_memory_engine):
     # Polars folds a constant literal into a DataFrameScan.
     q = pl.LazyFrame({"a": [1, 2]}).select(pl.lit("a", dtype=pl.Enum(["a"])))

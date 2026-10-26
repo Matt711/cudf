@@ -17,6 +17,7 @@ from cudf_polars.testing.asserts import (
     assert_ir_translation_raises,
 )
 from cudf_polars.testing.engine_utils import is_streaming_engine
+from cudf_polars.utils.versions import POLARS_VERSION_LT_21
 
 
 @pytest.fixture(
@@ -194,6 +195,10 @@ def test_struct_literal_not_supported(engine: pl.GPUEngine):
     assert_ir_translation_raises(q, engine, NotImplementedError)
 
 
+@pytest.mark.skipif(
+    POLARS_VERSION_LT_21,
+    reason="Polars 2.0 does not fold a constant literal into a scan",
+)
 def test_struct_literal_select_folded_to_scan(engine: pl.GPUEngine):
     # Polars folds a constant struct literal into a DataFrameScan.
     df = pl.LazyFrame({"a": [1, 2, 3]})

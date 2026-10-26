@@ -28,6 +28,7 @@ from cudf_polars.streaming.explain import (
 )
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 from cudf_polars.testing.io import make_lazy_frame, make_partitioned_source
+from cudf_polars.utils.versions import POLARS_VERSION_LT_21
 
 
 @pytest.fixture(scope="module")
@@ -462,11 +463,14 @@ def test_explain_logical_io_then_concat_then_groupby(explain_engine, tmp_path, k
     repr = explain_query(q_1, explain_engine, physical=False)
     assert "SORT" in repr
     assert "GROUPBY" in repr
-    if kind == "frame":
+    if POLARS_VERSION_LT_21 or kind == "frame":
         assert "UNION" in repr
-        assert re.search(r"DATAFRAMESCAN.*row_count='~3'", repr)
+        if kind == "parquet":
+            assert re.search(r"SCAN PARQUET.*row_count='~3'", repr)
+        elif kind == "frame":
+            assert re.search(r"DATAFRAMESCAN.*row_count='~3'", repr)
     else:
-        # Polars merges the concatenated file scans into a single scan.
+        # Polars 2.1 merges the concatenated file scans into a single scan.
         assert "UNION" not in repr
         if kind == "parquet":
             assert re.search(r"SCAN PARQUET.*row_count='~6'", repr)

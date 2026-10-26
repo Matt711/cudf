@@ -16,8 +16,9 @@ the Polars 2.0 upgrade (rapidsai/cudf#24549). A bump is done when all of these p
    skill covers (it requires all three to pass).
 4. `pre-commit` (including mypy and `ci/check_cudf_polars_ir.py`).
 
-Do all of the work against the **newest** polars you support. Coverage and upstream tests only
-run against the latest supported version in CI.
+Do the main work against the **newest** polars you support: coverage and the upstream polars tests only run on it in CI. Then run the
+cudf-polars unit tests on the **oldest** supported polars too (Step 4). CI's wheel job (`wheel-tests-cudf-polars`, `POLARS_VERSIONS=earliest`
+in `ci/test_python_cudf_polars.sh`) does exactly that, and a test, xfail or assertion changed for the new version often breaks there.
 
 ## Prerequisites
 
@@ -264,6 +265,30 @@ directory.) Notes:
 - Delete tests that no longer assert anything, and rewrite legacy canary tests (for example "unsupported feature" tests) when the
   feature becomes supported. Do not relax `check_exact`/`check_row_order` unless unavoidable.
 
+### Run the unit tests on the oldest supported polars too
+
+The supported range spans two minors, and CI tests both ends. Without this check, a PR that is green on the newest polars can fail the
+wheel job on the oldest, as the Polars 2.1 upgrade did (4 failures in CI, 71 in a full local run). Overlay the old polars on the same
+environment so nothing else changes (no `ray`/`dask` extras are lost, and the environment stays intact):
+
+```bash
+pip install --no-deps --target <tmp>/polars-old "polars==X.Y.Z" "polars-runtime-32==X.Y.Z"
+PYTHONPATH=<tmp>/polars-old:$PWD python -m pytest tests --maxfail=300 ...   # from python/cudf_polars
+python -c "import sys; sys.path.insert(0, '<tmp>/polars-old'); import polars; print(polars.__version__)"   # confirm
+```
+
+What usually breaks, and the fix:
+
+- **A test that asserts new behaviour** (a plan shape, a message, a broadcast rule): `pytest.mark.skipif(POLARS_VERSION_LT_NN, reason=...)`,
+  or assert per version when both versions matter (an explain test that expects merged scans on 2.1 and a `UNION` on 2.0).
+- **An xfail you deleted because it XPASSes on the new version** still fails on the old one. Keep it, conditional on the old version:
+  `pytest.mark.xfail(POLARS_VERSION_LT_NN, reason=...)`. Strict xfail only fires when the condition is true.
+- **A new xfail for new behaviour** needs `not POLARS_VERSION_LT_NN` in its condition, or it XPASSes (and fails) on the old version.
+- Define the flag next to the others in `cudf_polars/utils/versions.py` (`POLARS_VERSION_LT_NN = POLARS_VERSION < parse("X.Y")`) and delete it
+  when the lower bound passes it. Ruff 0.16 flags that form as a Yoda comparison; the repo's pinned ruff does not, so keep the repo's form.
+- Failures that mention a libcudf feature newer than the nightly in your environment (for example a test from a just-merged C++ change) are
+  an environment limit, not a regression. CI builds libcudf from the branch.
+
 ### Coverage
 
 - `cudf_polars` must stay at 100%, except the files in `[tool.coverage.report] omit` of `python/cudf_polars/pyproject.toml`.
@@ -352,6 +377,7 @@ cudf and cudf.pandas variants test cudf and pandas, not polars. If Narwhals itse
   its own polars from `.pre-commit-config.yaml`, so confirm that pin was updated.
 - `git diff --stat` after any merge (an earlier PR accidentally pulled in unrelated Java changes).
 - Run the sync check from "Resuming work on an open PR" before every push.
+- Run the cudf-polars unit tests on the oldest supported polars (Step 4) and confirm the upstream suites ran on the newest.
 - Grep again for stale version guards and for `TODO`s that mention the old version.
 - Write the PR description: old and new range, the user-visible behaviour changes, every new fallback, every new xfail/skip with its
   issue, the commands you ran and their results, and the follow-up issues drafted.

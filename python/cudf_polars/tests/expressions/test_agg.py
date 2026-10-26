@@ -15,6 +15,7 @@ from cudf_polars.testing.asserts import (
     assert_ir_translation_raises,
 )
 from cudf_polars.testing.engine_utils import is_streaming_engine
+from cudf_polars.utils.versions import POLARS_VERSION_LT_21
 
 
 @pytest.fixture(
@@ -196,6 +197,10 @@ def test_max_min_by_mismatched_length_raises(
             q.collect(engine=engine)
 
 
+@pytest.mark.skipif(
+    POLARS_VERSION_LT_21,
+    reason="Polars 2.0 raises ShapeError for a length-1 value or key",
+)
 @pytest.mark.parametrize("expr", ["max_by", "min_by"])
 @pytest.mark.parametrize("value", [pl.lit(99), pl.col("b").max()])
 def test_max_min_by_scalar_value(engine: pl.GPUEngine, expr: str, value) -> None:
@@ -207,6 +212,10 @@ def test_max_min_by_scalar_value(engine: pl.GPUEngine, expr: str, value) -> None
     assert_gpu_result_equal(empty, engine=engine)
 
 
+@pytest.mark.skipif(
+    POLARS_VERSION_LT_21,
+    reason="Polars 2.0 raises ShapeError for a length-1 value or key",
+)
 @pytest.mark.parametrize("expr", ["max_by", "min_by"])
 def test_max_min_by_scalar_key(engine: pl.GPUEngine, expr: str) -> None:
     # A scalar `by` ties every row, so any row of the input may be returned.

@@ -21,6 +21,7 @@ from cudf_polars.testing.asserts import (
     assert_ir_translation_raises,
 )
 from cudf_polars.testing.engine_utils import is_streaming_engine
+from cudf_polars.utils.versions import POLARS_VERSION_LT_21
 
 
 @pytest.fixture
@@ -562,6 +563,10 @@ def test_groupby_sort_by_nested_agg_order_by_raises(
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
 
 
+@pytest.mark.skipif(
+    POLARS_VERSION_LT_21,
+    reason="Polars 2.0 does not rewrite sort_by(...).first() to min_by",
+)
 def test_groupby_sort_by_first_total_order_min_by_unsupported(
     in_memory_engine: pl.GPUEngine,
 ) -> None:
@@ -792,7 +797,12 @@ def test_groupby_aggs_keep_unsupported_as_null(
 ) -> None:
     request.applymarker(
         pytest.mark.xfail(
-            condition=any(name in str(agg_expr) for name in ("sum", "mean", "median")),
+            # Polars 2.0 only raises for sum; 2.1 also raises for mean and median.
+            condition="sum" in str(agg_expr)
+            or (
+                not POLARS_VERSION_LT_21
+                and any(name in str(agg_expr) for name in ("mean", "median"))
+            ),
             reason="polars raises now",
         )
     )
