@@ -816,6 +816,7 @@ class Scan(IR):
             # libcudf's decimal_width option only widens top-level columns, so
             # nested Decimal(p <= 18) children come back as DECIMAL32/64 and
             # break the conversion to polars.
+            # See https://github.com/NVIDIA/cudf/issues/24838
             raise NotImplementedError(
                 "Nested Decimal with precision <= 18 in parquet scan"
             )

@@ -11,7 +11,9 @@ the Polars 2.0 upgrade (rapidsai/cudf#24549). A bump is done when all of these p
 
 1. The cudf-polars unit tests, with **100% coverage** (CI uses `--cov-fail-under=100`).
 2. The upstream polars test suite with the injected GPU engine (`in-memory` and `spmd`).
-3. The three narwhals plugin runs of `ci/test_narwhals.sh`.
+3. The narwhals run for cudf-polars (`narwhals_cudf_polars_test_plugin`, the second block of `ci/test_narwhals.sh`). The cudf and
+   cudf.pandas runs do not exercise polars. They only matter if Narwhals itself is bumped, which the `update-narwhals-testing`
+   skill covers (it requires all three to pass).
 4. `pre-commit` (including mypy and `ci/check_cudf_polars_ir.py`).
 
 Do all of the work against the **newest** polars you support. Coverage and upstream tests only
@@ -20,7 +22,8 @@ run against the latest supported version in CI.
 ## Prerequisites
 
 Ask the user for:
-- a development environment with cudf-polars, pylibcudf and a working GPU (check `nvidia-smi`);
+- a working GPU (check `nvidia-smi`). Build the environment yourself in Step 2 the way CI does; only ask the user for one if that is
+  not possible;
 - the target Polars version (default: the newest release, `pip index versions polars`);
 - the target Narwhals version, only if narwhals must change.
 
@@ -38,7 +41,6 @@ Ground rules:
 
 ## Practical notes
 
-- Never `pkill -f <pattern>`; the pattern can match your own shell's command line. Use `pgrep`, then kill by pid.
 - Run long suites in the background with output to a log file, and check them later rather than waiting inline.
 - The narwhals pin lives in `dependencies.yaml` (`depends_on_narwhals`); read it there instead of assuming a version.
 - **CI under-reports failures.** Every test job stops at its first failure (`-x`, or xdist "stopping after N failures"), so a red PR
@@ -68,16 +70,26 @@ Ground rules:
 
 ## Step 1. Survey what changed upstream
 
-Before editing, read the Polars release notes for every version between the old and new pin
+Start by shallow-cloning Polars at the target tag into a temporary directory and keep it for the whole upgrade. It is the
+reference for this survey, for the exact logic behind a behaviour change, and for the upstream test suite in Step 5:
+
+```bash
+git clone --depth 1 --branch py-X.Y.Z https://github.com/pola-rs/polars.git <tmp>/polars
+git -C <tmp>/polars fetch --depth 1 origin tag py-OLD   # only needed to diff against the old version
+git -C <tmp>/polars diff py-OLD py-X.Y.Z -- crates/polars-python/src/lazyframe/visitor py-polars/src/polars/_plr.pyi
+```
+
+Read the Polars release notes for every version between the old and new pin
 (`gh api repos/pola-rs/polars/releases/tags/py-X.Y.Z -q .body`; they are long and mostly irrelevant to cudf-polars, so skim for
-the items below) and list: removed or renamed
+the items below) and, when a note is unclear, read the code in the clone (the visitor in `crates/polars-python`, optimizer rules in
+`crates/polars-plan`). List: removed or renamed
 APIs, new IR nodes or `Function`/`BooleanFunction`/`StringFunction`/`StructFunction`/
 `TemporalFunction` enum members, changed option payloads, changed error types/messages,
 changed dtype semantics, and new deprecation warnings (the test suite runs with
 `filterwarnings = error`). Keep the list; it drives steps 3 to 5.
 
 Beyond release notes, the most reliable signals are the tests themselves: `test_from_polars_all_names` for enum drift, and
-the diffs of `crates/polars-python/src/lazyframe/visit.rs` and `py-polars/src/polars/_plr.pyi` between the two tags for IR changes.
+the diffs of `crates/polars-python/src/lazyframe/visit.rs` and `py-polars/src/polars/_plr.pyi` between the two tags (in the clone) for IR changes.
 
 Also run `git log` and grep the tree for stale guards that a merge may have reintroduced:
 `grep -rn "POLARS_VERSION_LT\|POLARS_LOWER_BOUND\|polars_compat" python ci dependencies.yaml`.
@@ -90,19 +102,21 @@ All the places that carry the range (edit the exact same string everywhere):
 | --- | --- |
 | `dependencies.yaml` | `run_cudf_polars` list: `polars>=X,<Y` |
 | `dependencies.yaml` | `test_cudf_polars_compat`: the `polars_compat_version` list under `files:` and the matching `polars==X.*` entries under `dependencies:` (one block per supported minor, plus the fallback entry). CI scripts read this matrix, so they usually do not need edits |
-| `python/cudf_polars/pyproject.toml` | `"polars>=X,<Y"` |
+| `python/cudf_polars/pyproject.toml` | **generated** from `dependencies.yaml` by `rapids-dependency-file-generator` (the list carries a "generated" marker); do not hand-edit, confirm it changed after the generator run |
 | `conda/recipes/cudf-polars/recipe.yaml` | `polars >=X,<Y` |
 | `.pre-commit-config.yaml` | mypy hook `additional_dependencies` |
-| `conda/environments/all_cuda-*_arch-*.yaml` | **generated**; run `pre-commit run --all-files rapids-dependency-file-generator` rather than hand-editing |
+| `conda/environments/all_cuda-*_arch-*.yaml` | **generated** by the same hook; run `pre-commit run --all-files rapids-dependency-file-generator` rather than hand-editing |
 | `python/cudf_polars/cudf_polars/utils/versions.py` | `POLARS_LOWER_BOUND` only if the minimum moves |
 
 Default for a new minor: **raise the upper bound only** (`>=2.0,<2.1` becomes `>=2.0,<2.2`) and append the new
 minor to the `test_cudf_polars_compat` matrix (`["2.0", "2.1"]`, plus a `polars==2.1.*` block next to the existing one).
 Do not drop the previous minor in the same PR. Policy for the lower bound: support roughly the last 5 or 6 minor
 versions, but cloud defaults (Colab, AzureML, Kaggle) can justify a lower minimum. Confirm the intended range with the
-user before editing, and ask before raising the minimum.
+user before editing, and ask before raising the minimum. When the upgrade adds support for a new **major** Polars version (for
+example 2.0), the lower bound moves too: raise it to the first minor of that major, update `POLARS_LOWER_BOUND`, and remove the
+guards, code and tests that only supported the older major (see below).
 
-Regenerate the conda environment files with the env's own `pre-commit` (it is usually not on `PATH`):
+Regenerate the generated files (the conda environment files and the `pyproject.toml` dependency list) with the env's own `pre-commit` (it is usually not on `PATH`):
 `export PATH=<env>/bin:$PATH; pre-commit run --all-files rapids-dependency-file-generator`. The first run "fails" because it
 modified files; that is expected. Run it again to confirm it is clean. It needs network access to initialise the hooks.
 When the minimum moves, delete every guard for versions below it (and the code, tests, `request`
@@ -112,6 +126,23 @@ Do **not** reintroduce `POLARS_VERSION_LT_*` flags speculatively. Add one to `ve
 when the code must behave differently on two supported versions, and delete it when the lower
 bound passes it. Parenthesize conditional expressions (`x == (A if cond else B)`); an unparenthesized
 one was a real bug in an earlier upgrade.
+
+### Build the environment the way CI does
+
+Do this right after the pin and the generator run, so the environment matches what CI will use:
+
+1. Edit the polars pin in `dependencies.yaml` (the `run_cudf_polars` list and the `test_cudf_polars_compat` matrix, see the table).
+2. Run `rapids-dependency-file-generator` (the pre-commit hook above) so the generated files pick up the change.
+3. Create an environment from `dependencies.yaml` or from a generated file. CI builds it with
+   `rapids-dependency-file-generator --output conda --file-key <key> --matrix "cuda=<ver>;arch=<arch>;py=<ver>;dependencies=<latest|oldest>"`
+   followed by `mamba env create -f` (`ci/test_python_common.sh`); the cudf-polars job uses the keys `test_python_other` and
+   `test_cudf_polars_compat` (`ci/test_python_cudf_polars.sh`, which also reads the polars version from the matrix). For a local
+   environment, `conda env create -n <name> -f conda/environments/all_cuda-<ver>_arch-<arch>.yaml` is the same set of packages.
+   If the new polars release is not on conda-forge yet, `pip install polars==X.Y.Z` into the environment and run `pip check`.
+4. Build or install cudf-polars and the related libraries into it: `pip install -e python/cudf_polars`, with pylibcudf and libcudf
+   from the nightly channel unless you are changing C++. Confirm `python -c "import polars, cudf_polars; print(polars.__version__)"`.
+
+To reproduce a failing CI job in its own container instead, use the `reproduce-ci` skill.
 
 ## Step 3. Adapt the translator and expressions
 
@@ -163,7 +194,7 @@ Keep comments about polars behaviour short and link the polars issue/PR when the
 
 ## Step 4. Run the cudf-polars unit tests with coverage
 
-Environment first. The unit tests need the test extras (`rich`, `pytest-httpserver`, `zstandard`, `psutil`, `cloudpickle`, `ray`,
+Use the environment from Step 2. If you add packages by hand, the unit tests need the test extras (`rich`, `pytest-httpserver`, `zstandard`, `psutil`, `cloudpickle`, `ray`,
 `rapids-dask-dependency`, `dask-cuda`) or ray/dask-parametrized tests error at import. Installing them can silently move
 `pytest` past the repo's `<9.1.0` pin, `pandas` past its pin, and even `polars`. Freeze the important pins into a constraints
 file and use it for every later `pip install`:
@@ -203,11 +234,10 @@ directory.) Notes:
 ## Step 5. Run the upstream polars test suite
 
 CI (`ci/test_cudf_polars_polars_tests.sh` and `ci/run_cudf_polars_polars_tests.sh`) clones polars at the tag matching the installed
-version and runs its `py-polars/tests` with the cudf-polars plugin injected.
+version and runs its `py-polars/tests` with the cudf-polars plugin injected. Use the shallow clone from Step 1 (it must be at the
+installed version's tag, `python -c 'import polars; print(f"py-{polars.__version__}")'`) as `<dir>/polars`:
 
 ```bash
-TAG=$(python -c 'import polars; print(f"py-{polars.__version__}")')
-git clone https://github.com/pola-rs/polars.git --branch "$TAG" --depth 1 <dir>/polars
 # install the test requirements, applying the sed patches from ci/test_cudf_polars_polars_tests.sh
 # (it removes polars-cloud and pins pyarrow/duckdb; check whether each is still needed)
 pip install -r <dir>/polars/py-polars/requirements-dev.txt -r <dir>/polars/py-polars/requirements-ci.txt
@@ -258,19 +288,20 @@ links the upstream fix so it can be removed later. Tests that cannot run in CI g
 
 ## Step 6. Narwhals
 
-Narwhals runs three plugin variants (`ci/test_narwhals.sh`): cudf, cudf-polars and cudf.pandas. Load and follow the
-`update-narwhals-testing` skill for the mechanics. For a polars upgrade specifically:
+For a polars upgrade only the **cudf-polars** variant has to pass (`narwhals_cudf_polars_test_plugin` in `ci/test_narwhals.sh`). The
+cudf and cudf.pandas variants test cudf and pandas, not polars. If Narwhals itself has to be bumped, load and follow the
+`update-narwhals-testing` skill, which requires all three variants to pass.
 
 1. Check whether the pinned Narwhals (`dependencies.yaml`, `depends_on_narwhals`) supports the new polars. Only bump it if it does not,
    or if the user asks.
-2. Run all three variants with the pinned Narwhals checked out and installed in the environment.
-3. For each failure, root-cause it. Typical causes are a changed polars error message, a removed API or a new deprecation warning.
-   Add an `EXPECTED_FAILURES` entry with a reason to **each plugin the test fails in**. Interchange-protocol tests, for example,
-   had to be added to all three. Link a narwhals or cudf issue where one exists.
+2. Run the cudf-polars variant with the pinned Narwhals checked out and installed in the environment, exactly as `ci/test_narwhals.sh`
+   does (`NARWHALS_POLARS_GPU=1`, `--constructors=polars[lazy]`, `-p narwhals_cudf_polars_test_plugin`). It needs the NUMA pinning from
+   the practical notes.
+3. For each failure, root-cause it. Typical causes are a changed polars error message, a removed API, a new deprecation warning or a
+   polars panic. Add an `EXPECTED_FAILURES` entry with a reason to `ci/narwhals_cudf_polars_test_plugin.py` and link an issue.
 4. Remove entries that now pass (they are strict xfails) or whose tests no longer exist.
-5. The cudf and cudf.pandas variants need `cudf` installed and exercise pandas/cudf, not polars. If the environment has no `cudf`, say
-   so in the PR and rely on CI for those two; the cudf-polars variant is the one a polars upgrade can break. It needs the NUMA pinning from
-   the practical notes. Local-environment noise (a newer duckdb API, the version test) is not a regression; compare with CI.
+5. Local-environment noise (for example a newer duckdb API breaking the duckdb tests, or the version test) is not a regression: compare
+   with CI before touching anything.
 
 ## Step 7. Final checks
 
