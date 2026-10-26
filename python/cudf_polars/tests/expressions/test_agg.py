@@ -582,3 +582,8 @@ def test_temporal_quantile_median_not_supported(engine: pl.GPUEngine, expr):
     df = pl.LazyFrame({"a": [date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 3)]})
     q = df.select(expr)
     assert_ir_translation_raises(q, engine, NotImplementedError)
+
+
+def test_n_unique_null_dtype_unsupported(engine: pl.GPUEngine) -> None:
+    q = pl.LazyFrame({"x": [1, 2, 3]}).select(pl.lit(None).drop_nulls().n_unique())
+    assert_ir_translation_raises(q, engine, NotImplementedError)
