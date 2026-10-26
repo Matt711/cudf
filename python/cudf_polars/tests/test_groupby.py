@@ -567,6 +567,7 @@ def test_groupby_sort_by_first_total_order_min_by_unsupported(
 ) -> None:
     # polars >= 2.1 lowers this to a total-order ``min_by``, which the Python
     # visitor does not expose ("total order min_by/max_by").
+    # Flip this test once https://github.com/NVIDIA/cudf/issues/24842 is done.
     df = pl.LazyFrame({"g": ["A", "A", "B"], "idx": [2, 1, 1], "val": [30, 10, 20]})
     q = df.group_by("g").agg(pl.col("val").sort_by("idx").first())
     assert_ir_translation_raises(q, in_memory_engine, NotImplementedError)
