@@ -85,13 +85,16 @@ class CachedParquetInfo:
             object.__setattr__(self, "_hybrid_scan_metadata", metadata)
         return plc.io.experimental.HybridScanReader.from_metadata(metadata)
 
-    def default_reader_options(self) -> plc.io.parquet.ParquetReaderOptions:
+    def default_reader_options(
+        self, *, use_jit_filter: bool = False
+    ) -> plc.io.parquet.ParquetReaderOptions:
         """Return baseline ``ParquetReaderOptions`` for this cached parquet file."""
         return (
             plc.io.parquet.ParquetReaderOptions.builder(
                 plc.io.SourceInfo([plc.io.types.FilepathSource(self.path, self.size)])
             )
             .decimal_width(plc.TypeId.DECIMAL128)
+            .use_jit_filter(use_jit_filter=use_jit_filter)
             .build()
         )
 

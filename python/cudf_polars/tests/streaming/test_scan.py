@@ -826,6 +826,32 @@ def test_split_scan_hybrid(
     assert_gpu_result_equal(q, engine=streaming_engine)
 
 
+@pytest.mark.parametrize("n_files", [1, 4])
+@pytest.mark.parametrize("pass_mode", list(HybridScanPassMode))
+def test_hybrid_scan_jit_filter(
+    tmp_path: Path,
+    df: pl.DataFrame,
+    n_files: int,
+    pass_mode: HybridScanPassMode,
+    streaming_engine_factory: Callable[..., StreamingEngine],
+) -> None:
+    streaming_engine = streaming_engine_factory(
+        StreamingOptions(
+            target_partition_size=1_000_000,
+            parquet_options={
+                "use_hybrid_scan": True,
+                "pass_mode": pass_mode,
+                "use_jit_filter": True,
+            },
+        ),
+    )
+    make_partitioned_source(
+        df, tmp_path, "parquet", n_files=n_files, row_group_size=100
+    )
+    q = pl.scan_parquet(tmp_path).filter(pl.col("x") < 1_000).select(["x", "z"])
+    assert_gpu_result_equal(q, engine=streaming_engine)
+
+
 @pytest.mark.parametrize(
     "predicate,use_columns",
     [

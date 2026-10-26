@@ -294,12 +294,10 @@ def _read_with_hybrid_scan(
     row_group_indices: list[int],
     stream: Stream,
     cached_info: CachedParquetInfo,
+    parquet_options: ParquetOptions,
     *,
     split_index: int = 0,
     total_splits: int = 1,
-    stats_pruning: bool = True,
-    pass_mode: HybridScanPassMode = HybridScanPassMode.TWO_PASS,
-    interleave_remote_io: bool = True,
 ) -> DataFrame:
     """Parquet read via HybridScanReader for a row-group-aligned task."""
     assert len(paths) == 1, "hybrid scan only supports tasks with one physical file"
@@ -310,16 +308,19 @@ def _read_with_hybrid_scan(
             [plc.io.types.FilepathSource(cached_info.path, cached_info.size)]
         )
         io_submission_policy = _hybrid_scan_io_submission_policy(
-            paths, interleave_remote_io=interleave_remote_io
+            paths,
+            interleave_remote_io=parquet_options.hybrid_scan_interleave_remote_io,
         )
-        options = cached_info.default_reader_options()
+        options = cached_info.default_reader_options(
+            use_jit_filter=parquet_options.use_jit_filter
+        )
         if with_columns is not None:
             options.set_column_names(with_columns)
         options.set_filter(plc_filter)
 
         reader = cached_info.hybrid_scan_reader(options)
 
-        if stats_pruning:
+        if parquet_options._hybrid_scan_stats_pruning:
             row_group_indices = reader.filter_row_groups_with_stats(
                 row_group_indices, options, stream=stream
             )
@@ -342,7 +343,7 @@ def _read_with_hybrid_scan(
         if not row_group_indices:
             return _empty_hybrid_scan_dataframe(schema, with_columns, stream)
 
-        if pass_mode is HybridScanPassMode.SINGLE_PASS:
+        if parquet_options.pass_mode is HybridScanPassMode.SINGLE_PASS:
             all_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                 source_info,
                 reader.all_column_chunks_byte_ranges(row_group_indices, options),
@@ -415,10 +416,8 @@ def _read_with_hybrid_scan_multifile(
     row_group_indices: list[list[int]],
     stream: Stream,
     cached_infos: list[CachedParquetInfo],
+    parquet_options: ParquetOptions,
     *,
-    stats_pruning: bool = True,
-    pass_mode: HybridScanPassMode = HybridScanPassMode.TWO_PASS,
-    interleave_remote_io: bool = True,
     prepend_source_index: bool = False,
 ) -> tuple[DataFrame, plc.Column | None]:
     """
@@ -435,11 +434,12 @@ def _read_with_hybrid_scan_multifile(
         )
         io_submission_policy = _hybrid_scan_io_submission_policy(
             (info.path for info in cached_infos),
-            interleave_remote_io=interleave_remote_io,
+            interleave_remote_io=parquet_options.hybrid_scan_interleave_remote_io,
         )
         options = (
             plc.io.parquet.ParquetReaderOptions.builder(source_info)
             .decimal_width(plc.TypeId.DECIMAL128)
+            .use_jit_filter(use_jit_filter=parquet_options.use_jit_filter)
             .build()
         )
         if with_columns is not None:
@@ -453,7 +453,7 @@ def _read_with_hybrid_scan_multifile(
         )
         row_groups = plc.io.experimental.RowGroupIndices.from_lists(row_group_indices)
 
-        if stats_pruning:
+        if parquet_options._hybrid_scan_stats_pruning:
             row_groups = reader.filter_row_groups_with_stats(
                 row_groups, options, stream=stream
             )
@@ -477,7 +477,7 @@ def _read_with_hybrid_scan_multifile(
         if not reader.total_rows_in_row_groups(row_groups):
             return _empty_hybrid_scan_dataframe(schema, with_columns, stream), None
 
-        if pass_mode is HybridScanPassMode.SINGLE_PASS:
+        if parquet_options.pass_mode is HybridScanPassMode.SINGLE_PASS:
             all_ranges, all_sources = reader.all_column_chunks_byte_ranges(
                 row_groups, options
             )
@@ -917,13 +917,9 @@ class ParquetScanTask(ScanTask):
                         bounds.row_groups[0],
                         stream,
                         task_parquet_info[0],
+                        parquet_options,
                         split_index=split_index,
                         total_splits=total_splits,
-                        stats_pruning=parquet_options._hybrid_scan_stats_pruning,
-                        pass_mode=parquet_options.pass_mode,
-                        interleave_remote_io=(
-                            parquet_options.hybrid_scan_interleave_remote_io
-                        ),
                     )
                 else:
                     df, source_index = _read_with_hybrid_scan_multifile(
@@ -933,11 +929,7 @@ class ParquetScanTask(ScanTask):
                         bounds.row_groups,
                         stream,
                         task_parquet_info,
-                        stats_pruning=parquet_options._hybrid_scan_stats_pruning,
-                        pass_mode=parquet_options.pass_mode,
-                        interleave_remote_io=(
-                            parquet_options.hybrid_scan_interleave_remote_io
-                        ),
+                        parquet_options,
                         prepend_source_index=(
                             hive_parts is not None and not hive_parts.is_uniform
                         ),

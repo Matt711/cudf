@@ -623,7 +623,8 @@ class ParquetOptions:
     use_jit_filter
         Whether to use JIT compilation for post-read filtering in Parquet scans.
         When enabled, filter predicates are JIT-compiled to CUDA kernels for
-        improved performance on large datasets with complex filters.
+        improved performance on large datasets with complex filters. Hybrid
+        scans only apply it in ``HybridScanPassMode.SINGLE_PASS``.
         Default is False.
     use_hybrid_scan
         Whether to use the hybrid scan readers for parquet scan tasks when a
