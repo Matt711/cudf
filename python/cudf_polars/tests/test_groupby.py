@@ -856,10 +856,6 @@ def test_groupby_quantile_nearest_even_length(engine: pl.GPUEngine):
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
 
 
-@pytest.mark.xfail(
-    raises=AssertionError,
-    reason="https://github.com/NVIDIA/cudf/issues/19610",
-)
 def test_groupby_literal_agg(engine: pl.GPUEngine):
     df = pl.LazyFrame({"c0": [True, False]})
     q = df.group_by("c0").agg(pl.lit(1).is_not_null())
@@ -869,4 +865,12 @@ def test_groupby_literal_agg(engine: pl.GPUEngine):
 def test_groupby_empty_keys(engine: pl.GPUEngine):
     df = pl.LazyFrame({"x": [1, 2, 3]})
     q = df.group_by([]).agg(pl.len())
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_groupby_scalar_literal_expression(engine: pl.GPUEngine):
+    # An expression of only literals is a scalar: one value per group.
+    df = pl.LazyFrame({"g": [1, 1, 2], "j": [1, 2, 3]})
+    lit = pl.lit(-1.5).abs()
+    q = df.group_by("g", maintain_order=True).agg(a=lit, b=lit, c=pl.col("j").sum())
     assert_gpu_result_equal(q, engine=engine)
