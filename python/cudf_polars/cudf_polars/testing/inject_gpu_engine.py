@@ -286,8 +286,8 @@ EXPECTED_FAILURES: dict[str, str] = {
     "tests/unit/io/test_parquet.py::test_binary_offset_roundtrip": "binary offset type unsupported",
     "tests/unit/io/test_lazy_csv.py::test_scan_csv_schema_new_columns_dtypes[foods1.csv]": "CSV reader's use_cols_names picks the wrong columns when combined with a column_names_overwrite rename",
     "tests/unit/io/test_lazy_csv.py::test_scan_csv_schema_new_columns_dtypes[foods*.csv]": "CSV reader's use_cols_names picks the wrong columns when combined with a column_names_overwrite rename",
-    "tests/unit/sql/test_table_functions.py::test_read_csv_override_that_does_not_fit": "libcudf CSV/JSON readers turn values that do not parse as the requested dtype into nulls instead of raising (https://github.com/NVIDIA/cudf/issues/TODO)",
-    "tests/unit/sql/test_table_functions.py::test_read_ndjson_option_errors[schema_overrides => {'a': 'INT'}-ComputeError-cannot parse 'oops' \\\\(string\\\\) as Int32]": "libcudf CSV/JSON readers turn values that do not parse as the requested dtype into nulls instead of raising (https://github.com/NVIDIA/cudf/issues/TODO)",
+    "tests/unit/sql/test_table_functions.py::test_read_csv_override_that_does_not_fit": "libcudf CSV/JSON readers turn values that do not parse as the requested dtype into nulls instead of raising (https://github.com/NVIDIA/cudf/issues/24836)",
+    "tests/unit/sql/test_table_functions.py::test_read_ndjson_option_errors[schema_overrides => {'a': 'INT'}-ComputeError-cannot parse 'oops' \\\\(string\\\\) as Int32]": "libcudf CSV/JSON readers turn values that do not parse as the requested dtype into nulls instead of raising (https://github.com/NVIDIA/cudf/issues/24836)",
     "tests/unit/lazyframe/test_engine_selection.py::test_engine_import_error_raises[gpu]": "Expect this to pass because cudf-polars is installed",
     "tests/unit/lazyframe/test_engine_selection.py::test_engine_import_error_raises[engine1]": "Expect this to pass because cudf-polars is installed",
     "tests/unit/lazyframe/test_engine_selection.py::test_default_engine_and_affinity[streaming]": "This plugin forces engine=<injected GPU engine> on LazyFrame.collect via partialmethod, so the default engine and POLARS_ENGINE_AFFINITY are never consulted",
@@ -349,8 +349,8 @@ EXPECTED_FAILURES: dict[str, str] = {
     "tests/unit/io/test_order_keeping_pushdown.py::test_expression_that_raises_is_evaluated[dtype4-expr4]": "Overflowing arithmetic on the GPU does not raise as polars does",
     "tests/unit/io/test_order_keeping_pushdown.py::test_not_order_keeping_stays_above_projection[expr3]": "Overflowing non-strict casts and temporal arithmetic wrap around in libcudf instead of producing null (or raising) as polars does",
     "tests/unit/operations/test_sort.py::test_sort_by_scalar_key_29583_29760": "Error messages for an invalid scalar sort_by key differ from polars ('conversion', 'arithmetic')",
-    "tests/unit/io/test_parquet_encryption.py::test_write_plaintext_footer_readable_without_keys[column_keys0]": "libcudf does not support Parquet modular encryption: the footer parse fails on plaintext-footer encrypted files, and the GPU engine cannot detect encryption at translation",
-    "tests/unit/io/test_parquet_encryption.py::test_write_plaintext_footer_readable_without_keys[column_keys1]": "libcudf does not support Parquet modular encryption: the footer parse fails on plaintext-footer encrypted files, and the GPU engine cannot detect encryption at translation",
+    "tests/unit/io/test_parquet_encryption.py::test_write_plaintext_footer_readable_without_keys[column_keys0]": "libcudf does not support Parquet modular encryption: the footer parse fails on plaintext-footer encrypted files, and the GPU engine cannot detect encryption at translation: https://github.com/NVIDIA/cudf/issues/24837",
+    "tests/unit/io/test_parquet_encryption.py::test_write_plaintext_footer_readable_without_keys[column_keys1]": "libcudf does not support Parquet modular encryption: the footer parse fails on plaintext-footer encrypted files, and the GPU engine cannot detect encryption at translation: https://github.com/NVIDIA/cudf/issues/24837",
 }
 
 
