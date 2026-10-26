@@ -719,6 +719,16 @@ def test_groupby_has_nulls_in_one_group(engine: pl.GPUEngine):
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
 
 
+def test_groupby_has_nulls_literal(engine: pl.GPUEngine):
+    df = pl.LazyFrame({"g": ["a", "a", "b"]})
+    q = df.group_by("g").agg(
+        pl.lit(None).has_nulls().alias("has_nulls"),
+        pl.lit(1).has_nulls().alias("has_no_nulls"),
+    )
+
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
 def test_groupby_count_distinct_sql(engine: pl.GPUEngine):
     df = pl.LazyFrame({"brand": ["a", "a", "b", "b"], "supplier": [1, 1, 2, None]})
     q = df.sql(
