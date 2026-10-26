@@ -1404,7 +1404,11 @@ def _translate_function(
             # libcudf division yields scale s1 - s2 and truncates, so divide
             # with one extra digit of scale and then round to the output scale.
             left, right = children
-            out_scale = dtype.polars_type.scale
+            out_type = dtype.polars_type
+            right_type = right.dtype.polars_type
+            assert isinstance(out_type, pl.Decimal)
+            assert isinstance(right_type, pl.Decimal)
+            out_scale = out_type.scale
             return expr.UnaryFunction(
                 dtype,
                 "round",
@@ -1414,9 +1418,7 @@ def _translate_function(
                     plc.binaryop.BinaryOperator.DIV,
                     expr.Cast(
                         DataType(
-                            pl.Decimal(
-                                38, out_scale + 1 + right.dtype.polars_type.scale
-                            )
+                            pl.Decimal(38, out_scale + 1 + right_type.scale)
                         ),
                         True,  # noqa: FBT003
                         left,
