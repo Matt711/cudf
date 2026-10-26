@@ -12,6 +12,7 @@ cpdef list fetch_byte_ranges_to_device(
     io_submission_policy policy,
     object stream=*,
     DeviceMemoryResource mr=*,
+    list source_indices=*,
 )
 
 cpdef bytes fetch_page_index_to_host(

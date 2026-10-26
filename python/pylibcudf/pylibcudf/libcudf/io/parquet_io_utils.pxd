@@ -5,7 +5,6 @@ from libc.stdint cimport uint8_t
 from cuda.bindings.cyruntime cimport cudaStream_t
 from libcpp.memory cimport unique_ptr
 from libcpp.pair cimport pair
-from libcpp.span cimport span as std_span
 from libcpp.vector cimport vector
 
 from rmm.librmm.device_buffer cimport device_buffer
@@ -17,7 +16,6 @@ from pylibcudf.libcudf.io.text cimport byte_range_info
 from pylibcudf.libcudf.utilities.span cimport device_span
 
 ctypedef const uint8_t const_uint8_t
-ctypedef const byte_range_info const_byte_range_info
 
 cdef extern from "cudf/io/parquet_io_utils.hpp" \
         namespace "cudf::io::parquet" nogil:
@@ -28,23 +26,29 @@ cdef extern from "cudf/io/parquet_io_utils.hpp" \
 
 cdef extern from * nogil:
     """
+    #include <functional>
     #include <future>
     #include <cuda/stream>
     #include <cudf/io/parquet_io_utils.hpp>
 
     static std::pair<std::vector<rmm::device_buffer>,
-                     std::vector<cudf::device_span<uint8_t const>>>
+                     std::vector<std::vector<cudf::device_span<uint8_t const>>>>
     cpp_fetch_byte_ranges_to_device(
-        cudf::io::datasource& datasource,
-        std::span<cudf::io::text::byte_range_info const> byte_ranges,
+        std::vector<std::unique_ptr<cudf::io::datasource>>& datasources,
+        std::vector<std::vector<cudf::io::text::byte_range_info>> const&
+            byte_ranges_per_source,
         cudf::io::parquet::io_submission_policy policy,
         cudaStream_t stream,
         rmm::device_async_resource_ref mr)
     {
+        std::vector<std::reference_wrapper<cudf::io::datasource>> sources;
+        sources.reserve(datasources.size());
+        for (auto& source : datasources) { sources.emplace_back(*source); }
         auto [buffers, spans, fut] =
             cudf::io::parquet::fetch_byte_ranges_to_device_async(
-                datasource,
-                byte_ranges,
+                std::span<std::reference_wrapper<cudf::io::datasource> const>{sources},
+                std::span<std::vector<cudf::io::text::byte_range_info> const>{
+                    byte_ranges_per_source},
                 policy,
                 cuda::stream_ref{stream},
                 mr);
@@ -54,10 +58,10 @@ cdef extern from * nogil:
         return {std::move(buffers), std::move(spans)};
     }
     """
-    pair[vector[device_buffer], vector[device_span[const_uint8_t]]] \
+    pair[vector[device_buffer], vector[vector[device_span[const_uint8_t]]]] \
         cpp_fetch_byte_ranges_to_device(
-            datasource& source,
-            std_span[const_byte_range_info] byte_ranges,
+            vector[unique_ptr[datasource]]& sources,
+            const vector[vector[byte_range_info]]& byte_ranges_per_source,
             io_submission_policy policy,
             cudaStream_t stream,
             device_async_resource_ref mr,
