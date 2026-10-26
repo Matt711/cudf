@@ -63,6 +63,7 @@ __all__ = [
     "ConfigOptions",
     "DaskContext",
     "DynamicPlanningOptions",
+    "HybridScanPassMode",
     "InMemoryExecutor",
     "JoinFilterPushdownOptions",
     "MaxConcurrentIOTasks",
@@ -217,6 +218,20 @@ class StreamingFallbackMode(enum.StrEnum):
     WARN = "warn"
     RAISE = "raise"
     SILENT = "silent"
+
+
+class HybridScanPassMode(enum.StrEnum):
+    """
+    How a hybrid scan read fetches and materializes its columns.
+
+    * ``HybridScanPassMode.SINGLE_PASS`` : Fetch and materialize all columns
+      in one pass.
+    * ``HybridScanPassMode.TWO_PASS`` : Fetch and materialize the filter
+      columns, then the payload columns of the rows that survive the filter.
+    """
+
+    SINGLE_PASS = "single_pass"
+    TWO_PASS = "two_pass"
 
 
 class Cluster(enum.StrEnum):
@@ -611,9 +626,12 @@ class ParquetOptions:
         improved performance on large datasets with complex filters.
         Default is False.
     use_hybrid_scan
-        Whether to use the two-pass ``HybridScanReader`` for split parquet
-        tasks when a predicate can be pushed down to a parquet filter.
-        Default is False.
+        Whether to use the ``HybridScanReader`` for parquet scan tasks when a
+        predicate can be pushed down to a parquet filter. Default is False.
+    pass_mode
+        How a hybrid scan read fetches and materializes its columns. See
+        :class:`HybridScanPassMode`. Ignored when ``use_hybrid_scan`` is False.
+        Default is ``HybridScanPassMode.TWO_PASS``.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -662,6 +680,13 @@ class ParquetOptions:
             default=False,
         )
     )
+    pass_mode: HybridScanPassMode = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PASS_MODE",
+            HybridScanPassMode.__call__,
+            default=HybridScanPassMode.TWO_PASS,
+        )
+    )
     # Internal benchmarking flag. When False, skips stats and bloom-filter pruning
     # before the first pass of a hybrid scan so you can measure two-pass read
     # overhead in isolation. No reason to set this to False in production.
@@ -699,6 +724,7 @@ class ParquetOptions:
             raise TypeError("prefetch_file_metadata must be a bool when specified")
         if not isinstance(self.use_hybrid_scan, bool):
             raise TypeError("use_hybrid_scan must be a bool")
+        object.__setattr__(self, "pass_mode", HybridScanPassMode(self.pass_mode))
         if isinstance(self.prefetch_file_metadata, Unspecified):
             object.__setattr__(self, "prefetch_file_metadata", self.use_hybrid_scan)
         if self.use_hybrid_scan and self.prefetch_file_metadata is False:

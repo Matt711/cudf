@@ -36,6 +36,7 @@ from cudf_polars.utils.config import (
     Cluster,
     ConfigOptions,
     DynamicPlanningOptions,
+    HybridScanPassMode,
     InMemoryExecutor,
     JoinFilterPushdownOptions,
     MaxConcurrentIOTasks,
@@ -450,6 +451,7 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__HYBRID_SCAN_STATS_PRUNING", "0")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_FILE_METADATA", "1")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__USE_JIT_FILTER", "1")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PASS_MODE", "single_pass")
 
         # Test default
         engine = pl.GPUEngine()
@@ -464,6 +466,7 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         assert config.parquet_options._hybrid_scan_stats_pruning is False
         assert config.parquet_options.prefetch_file_metadata is True
         assert config.parquet_options.use_jit_filter is True
+        assert config.parquet_options.pass_mode is HybridScanPassMode.SINGLE_PASS
 
     with monkeypatch.context() as m:
         # Env must win over the executor-derived default (streaming => True).
@@ -760,6 +763,27 @@ def test_prefetch_file_metadata_default() -> None:
         )
     )
     assert config.parquet_options.prefetch_file_metadata is True
+
+
+def test_pass_mode_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CUDF_POLARS__PARQUET_OPTIONS__PASS_MODE", raising=False)
+    config = ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
+    assert config.parquet_options.pass_mode is HybridScanPassMode.TWO_PASS
+
+    config = ConfigOptions.from_polars_engine(
+        pl.GPUEngine(executor="streaming", parquet_options={"pass_mode": "single_pass"})
+    )
+    assert config.parquet_options.pass_mode is HybridScanPassMode.SINGLE_PASS
+
+    with monkeypatch.context() as m:
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PASS_MODE", "foo")
+        with pytest.raises(ValueError, match="'foo' is not a valid HybridScanPassMode"):
+            ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
+
+    with pytest.raises(ValueError, match="'foo' is not a valid HybridScanPassMode"):
+        ConfigOptions.from_polars_engine(
+            pl.GPUEngine(executor="streaming", parquet_options={"pass_mode": "foo"})
+        )
 
 
 def test_parquet_options_object_passthrough() -> None:

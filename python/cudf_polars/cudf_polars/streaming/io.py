@@ -40,7 +40,7 @@ from cudf_polars.streaming.base import (
 )
 from cudf_polars.streaming.dispatch import lower_ir_node
 from cudf_polars.streaming.utils import partition_range
-from cudf_polars.utils.config import Cluster
+from cudf_polars.utils.config import Cluster, HybridScanPassMode
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 
 if TYPE_CHECKING:
@@ -251,6 +251,15 @@ def hybrid_scan_eligible(
     )
 
 
+def _dataframe_from_hybrid_scan_table(
+    tbl_w_meta: plc.io.types.TableWithMetadata, schema: Schema, stream: Stream
+) -> DataFrame:
+    names = tbl_w_meta.column_names(include_children=False)
+    return DataFrame.from_table(
+        tbl_w_meta.tbl, names, [schema[name] for name in names], stream=stream
+    )
+
+
 def _read_with_hybrid_scan(
     schema: Schema,
     paths: list[str],
@@ -263,8 +272,9 @@ def _read_with_hybrid_scan(
     split_index: int = 0,
     total_splits: int = 1,
     stats_pruning: bool = True,
+    pass_mode: HybridScanPassMode = HybridScanPassMode.TWO_PASS,
 ) -> DataFrame:
-    """Two-pass parquet read via HybridScanReader for a row-group-aligned task."""
+    """Parquet read via HybridScanReader for a row-group-aligned task."""
     assert len(paths) == 1, "hybrid scan only supports tasks with one physical file"
     with nvtx_annotate_cudf_polars(
         message="HybridScan", payload=(split_index + 1, total_splits)
@@ -315,6 +325,21 @@ def _read_with_hybrid_scan(
                 stream=stream,
             )
 
+        if pass_mode is HybridScanPassMode.SINGLE_PASS:
+            all_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                source_info,
+                reader.all_column_chunks_byte_ranges(row_group_indices, options),
+                plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                stream=stream,
+            )
+            return _dataframe_from_hybrid_scan_table(
+                reader.materialize_all_columns(
+                    row_group_indices, all_chunks, options, stream=stream
+                ),
+                schema,
+                stream,
+            ).select(list(schema.keys()))
+
         # TODO: Consider implementing page-index stats pruning. For split tasks, we
         # can reuse the same page index for all splits of the same file, so the
         # overhead of reading the page index can be amortized. For fused tasks, we
@@ -327,46 +352,39 @@ def _read_with_hybrid_scan(
             plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
             stream=stream,
         )
-        filter_tbl_w_meta = reader.materialize_filter_columns(
-            row_group_indices,
-            filter_chunks,
-            row_mask,
-            plc.io.experimental.UseDataPageMask.YES,
-            options,
-            stream=stream,
-        )
-
-        filter_names = filter_tbl_w_meta.column_names(include_children=False)
-        filter_df = DataFrame.from_table(
-            filter_tbl_w_meta.tbl,
-            filter_names,
-            [schema[n] for n in filter_names],
-            stream=stream,
+        filter_df = _dataframe_from_hybrid_scan_table(
+            reader.materialize_filter_columns(
+                row_group_indices,
+                filter_chunks,
+                row_mask,
+                plc.io.experimental.UseDataPageMask.YES,
+                options,
+                stream=stream,
+            ),
+            schema,
+            stream,
         )
 
         requested_columns = with_columns if with_columns is not None else list(schema)
         columns = filter_df.columns
-        if set(requested_columns) - set(filter_names):
+        if set(requested_columns) - filter_df.column_names_set:
             payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                 source_info,
                 reader.payload_column_chunks_byte_ranges(row_group_indices, options),
                 plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
                 stream=stream,
             )
-            payload_tbl_w_meta = reader.materialize_payload_columns(
-                row_group_indices,
-                payload_chunks,
-                row_mask,
-                plc.io.experimental.UseDataPageMask.YES,
-                options,
-                stream=stream,
-            )
-            payload_names = payload_tbl_w_meta.column_names(include_children=False)
-            payload_df = DataFrame.from_table(
-                payload_tbl_w_meta.tbl,
-                payload_names,
-                [schema[n] for n in payload_names],
-                stream=stream,
+            payload_df = _dataframe_from_hybrid_scan_table(
+                reader.materialize_payload_columns(
+                    row_group_indices,
+                    payload_chunks,
+                    row_mask,
+                    plc.io.experimental.UseDataPageMask.YES,
+                    options,
+                    stream=stream,
+                ),
+                schema,
+                stream,
             )
             columns = [*columns, *payload_df.columns]
 
@@ -746,6 +764,7 @@ class ParquetScanTask(ScanTask):
                     split_index=split_index,
                     total_splits=total_splits,
                     stats_pruning=parquet_options._hybrid_scan_stats_pruning,
+                    pass_mode=parquet_options.pass_mode,
                 )
                 if hive_parts is not None:
                     df = df.with_columns(

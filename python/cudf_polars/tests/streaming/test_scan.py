@@ -46,6 +46,7 @@ from cudf_polars.testing.engine_utils import SMALL_MAX_ROWS_PER_PARTITION
 from cudf_polars.testing.io import make_partitioned_source
 from cudf_polars.utils.config import (
     ConfigOptions,
+    HybridScanPassMode,
     MaxConcurrentIOTasks,
     ParquetOptions,
 )
@@ -725,11 +726,13 @@ def test_streaming_scan_raises() -> None:
         (None, None),
     ],
 )
+@pytest.mark.parametrize("pass_mode", list(HybridScanPassMode))
 def test_split_scan_hybrid(
     tmp_path: Path,
     df: pl.DataFrame,
     predicate: pl.Expr | None,
     use_columns: list[str] | None,
+    pass_mode: HybridScanPassMode,
     streaming_engine_factory: Callable[..., StreamingEngine],
 ) -> None:
     streaming_engine = streaming_engine_factory(
@@ -738,6 +741,7 @@ def test_split_scan_hybrid(
             parquet_options={
                 "use_hybrid_scan": True,
                 "prefetch_file_metadata": True,
+                "pass_mode": pass_mode,
             },
         ),
     )
