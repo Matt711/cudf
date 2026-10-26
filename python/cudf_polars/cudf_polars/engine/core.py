@@ -1009,7 +1009,6 @@ def _evaluate_on_rank(
             ir,
             ir_context.py_executor,
             stats=stats,
-            parse_hybrid_metadata=config_options.parquet_options.use_hybrid_scan,
         )
         attach_cached_parquet_metadata(ir, cached_parquet_info_map)
 

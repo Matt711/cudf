@@ -243,6 +243,48 @@ def test_prefetch_parquet_file_metadata_remote_only(tmp_path, df) -> None:
     assert set(result) == {local_path}
 
 
+@pytest.mark.parametrize(
+    "predicate,paths_per_task,expect_parsed",
+    [
+        (pl.col("x") > 1, 1, True),
+        (pl.col("x") > 1, 2, False),
+        (None, 1, False),
+    ],
+)
+def test_prefetch_parses_hybrid_scan_metadata_for_hybrid_scan_tasks(
+    tmp_path,
+    df,
+    predicate: pl.Expr | None,
+    paths_per_task: int,
+    *,
+    expect_parsed: bool,
+) -> None:
+    make_partitioned_source(df, tmp_path, "parquet", n_files=2)
+    engine = pl.GPUEngine(
+        raise_on_fail=True,
+        executor="streaming",
+        parquet_options={"use_hybrid_scan": True},
+    )
+    q = pl.scan_parquet(tmp_path)
+    if predicate is not None:
+        q = q.filter(predicate)
+    scan = cast("Scan", Translator(q._ldf.visit(), engine).translate_ir())
+    streaming_scan = expand_scan_for_rank(
+        scan,
+        IOPartitionPlan(paths_per_task, IOPartitionFlavor.FUSED_FILES),
+        2 // paths_per_task,
+        rank=0,
+        nranks=1,
+        parquet_options=ConfigOptions.from_polars_engine(engine).parquet_options,
+    )
+
+    cached = prefetch_parquet_file_metadata_for_ir(streaming_scan, py_executor=None)
+
+    assert len(cached) == 2
+    for info in cached.values():
+        assert (info._hybrid_scan_metadata is not None) is expect_parsed
+
+
 def test_cached_parquet_info_hybrid_scan_reader_lazy(tmp_path, df) -> None:
     make_partitioned_source(df, tmp_path, "parquet", n_files=1)
     local_path = str(next(tmp_path.glob("*.parquet")))

@@ -19,6 +19,7 @@ from cudf_polars.streaming.io import (
     ParquetSourceInfo,
     Scan,
     StreamingScan,
+    hybrid_scan_eligible,
 )
 
 if TYPE_CHECKING:
@@ -158,7 +159,6 @@ def prefetch_parquet_file_metadata_for_ir(
     stats: StatsCollector | None = None,
     *,
     remote_only: bool = False,
-    parse_hybrid_metadata: bool = False,
 ) -> dict[str, CachedParquetInfo]:
     """
     Prefetch parquet metadata for all parquet scans in an IR graph.
@@ -177,21 +177,26 @@ def prefetch_parquet_file_metadata_for_ir(
     remote_only
         If ``True``, only prefetch metadata for remote URIs (e.g. ``s3://``),
         skipping local paths.
-    parse_hybrid_metadata
-        Whether to eagerly parse ``HybridScanMetadata`` for newly-prefetched
-        paths. Only useful when ``ParquetOptions.use_hybrid_scan`` is enabled.
 
     Returns
     -------
     A dictionary mapping each individual path to its cached parquet metadata.
+    ``HybridScanMetadata`` is eagerly parsed for the paths of tasks that are
+    read with a single-file hybrid scan.
     """
     all_paths: set[str] = set()
+    hybrid_scan_paths: set[str] = set()
 
     for node in traversal([root]):
         if isinstance(node, StreamingScan) and node.base_scan.typ == "parquet":
+            hybrid_scan = hybrid_scan_eligible(
+                node.base_scan.parquet_options, node.base_scan
+            )
             for task in node.tasks:
                 for path in task.paths:
                     all_paths.add(path)
+                if hybrid_scan and len(task.paths) == 1:
+                    hybrid_scan_paths.update(task.paths)
         elif isinstance(node, Scan) and node.typ == "parquet":  # pragma: no cover
             raise RuntimeError("Unexpected parquet 'Scan' node in lowered IR graph.")
 
@@ -227,7 +232,7 @@ def prefetch_parquet_file_metadata_for_ir(
             py_executor.submit(
                 _prefetch_parquet_footers_for_paths,
                 [path],
-                parse_hybrid_metadata=parse_hybrid_metadata,
+                parse_hybrid_metadata=path in hybrid_scan_paths,
             )
             for path in missing_paths
         ]

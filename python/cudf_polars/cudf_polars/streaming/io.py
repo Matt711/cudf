@@ -219,19 +219,15 @@ def expand_scan_for_rank(
     return StreamingScan(tasks, ir)
 
 
-def hybrid_scan_eligible(
-    parquet_options: ParquetOptions,
-    *,
-    row_index: tuple[str, int] | None,
-    include_file_paths: str | None,
-    predicate: NamedExpr | None,
-) -> bool:
+def hybrid_scan_eligible(parquet_options: ParquetOptions, scan: Scan) -> bool:
     """Whether scan options allow hybrid scan if metadata is available."""
     return (
         parquet_options.use_hybrid_scan
-        and row_index is None
-        and include_file_paths is None
-        and predicate is not None
+        and scan.skip_rows == 0
+        and scan.n_rows == -1
+        and scan.row_index is None
+        and scan.include_file_paths is None
+        and scan.predicate is not None
     )
 
 
@@ -869,16 +865,7 @@ class ParquetScanTask(ScanTask):
         base_scan = task.base_scan
         paths = task.paths
         task_parquet_info = task._get_task_parquet_info_from_cache()
-        should_try_hybrid_scan = (
-            base_scan.skip_rows == 0
-            and base_scan.n_rows == -1
-            and hybrid_scan_eligible(
-                parquet_options,
-                row_index=base_scan.row_index,
-                include_file_paths=base_scan.include_file_paths,
-                predicate=base_scan.predicate,
-            )
-        )
+        should_try_hybrid_scan = hybrid_scan_eligible(parquet_options, base_scan)
         if task_parquet_info is None and should_try_hybrid_scan:
             # read_parquet_metadata is faster (for now),
             # but hybrid scan needs FileMetaData.
@@ -1673,14 +1660,15 @@ def _build_source_info(
         max_rg = config_options.parquet_options.max_row_group_samples
         needed_cols = frozenset(ir.schema) if needed_cols is None else needed_cols
         schema = tuple(ir.schema.items()) if schema is None else schema
-        use_hybrid_scan = config_options.parquet_options.use_hybrid_scan
         return _build_parquet_source(
             paths,
             needed_cols,
             schema,
             max_footer,
             max_rg,
-            parse_hybrid_metadata=use_hybrid_scan,
+            parse_hybrid_metadata=hybrid_scan_eligible(
+                config_options.parquet_options, ir
+            ),
         )
     else:  # pragma: no cover
         raise ValueError(f"Unsupported Scan type: {ir.typ}")
