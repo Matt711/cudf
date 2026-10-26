@@ -9,6 +9,7 @@ import math
 from typing import TYPE_CHECKING, Any, ClassVar, TypeGuard, assert_never, cast
 
 import polars as pl
+from polars.exceptions import ComputeError
 
 import pylibcudf as plc
 
@@ -407,6 +408,29 @@ class UnaryFunction(Expr):
                     "top_k_by only supports a single by expression"
                 )
             self.options = (tuple(self.options[0]),)
+
+    @staticmethod
+    def _top_k_count(k_expr: Expr, df: DataFrame, context: ExecutionContext) -> int:
+        """Evaluate and validate the ``k`` argument of ``top_k``/``top_k_by``."""
+        if isinstance(k_expr, Literal):
+            k = k_expr.value
+        else:
+            k_col = k_expr.evaluate(df, context=context)
+            if k_col.size != 1:
+                raise ComputeError(
+                    f"got {k_col.size} values for 'k' in top_k, expected exactly one"
+                )
+            k = k_col.obj_scalar(stream=df.stream).to_py(stream=df.stream)
+        # Mirror polars: any numeric is truncated to an integer; null, NaN
+        # and negative values are errors.
+        if (
+            k is None
+            or not isinstance(k, (int, float))
+            or math.isnan(k)
+            or k < 0
+        ):
+            raise ComputeError(f"invalid value of 'k' in top_k: {k!r}")
+        return int(k)
 
     @staticmethod
     def _bound_clip_operand(
@@ -1697,15 +1721,7 @@ class UnaryFunction(Expr):
         elif self.name == "top_k":
             column = self.children[0].evaluate(df, context=context)
             (reverse,) = self.options
-            k_expr = self.children[1]
-            if isinstance(k_expr, Literal):
-                k = k_expr.value
-            else:
-                k = (
-                    k_expr.evaluate(df, context=context)
-                    .obj_scalar(stream=df.stream)
-                    .to_py(stream=df.stream)
-                )
+            k = self._top_k_count(self.children[1], df, context)
             return Column(
                 plc.sorting.top_k(
                     column.obj,
@@ -1720,16 +1736,11 @@ class UnaryFunction(Expr):
         elif self.name == "top_k_by":
             col_value = self.children[0].evaluate(df, context=context)
             by = self.children[2].evaluate(df, context=context)
+            if by.size != col_value.size:
+                # A scalar key (e.g. ``x.max()``) applies to every row.
+                by = broadcast(by, target_length=col_value.size, stream=df.stream)[0]
             (descending,) = self.options
-            k_expr = self.children[1]
-            if isinstance(k_expr, Literal):
-                k = k_expr.value
-            else:
-                k = (
-                    k_expr.evaluate(df, context=context)
-                    .obj_scalar(stream=df.stream)
-                    .to_py(stream=df.stream)
-                )
+            k = self._top_k_count(self.children[1], df, context)
             indices = plc.sorting.top_k_order(
                 by.obj,
                 k,
