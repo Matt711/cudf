@@ -1143,3 +1143,39 @@ def test_scan_parquet_hive_partitioned_decimal_predicate(
         pl.col("price") > Decimal("2.00")
     )
     assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pl.List(pl.Decimal(10, 2)),
+        pl.Struct({"a": pl.Decimal(5, 1)}),
+        pl.List(pl.Struct({"a": pl.Decimal(18, 1)})),
+    ],
+)
+def test_scan_parquet_nested_narrow_decimal_raises(
+    engine: pl.GPUEngine, tmp_path, dtype
+):
+    # libcudf does not widen nested DECIMAL32/64 children to DECIMAL128.
+    path = tmp_path / "nested_decimal.parquet"
+    pl.DataFrame({"a": [None]}, schema={"a": dtype}).write_parquet(path)
+    q = pl.scan_parquet(path)
+    assert_ir_translation_raises(q, engine, NotImplementedError)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [pl.Decimal(10, 2), pl.List(pl.Decimal(19, 2)), pl.List(pl.Int64), pl.Int8],
+)
+def test_scan_parquet_wide_or_top_level_decimal(engine: pl.GPUEngine, tmp_path, dtype):
+    path = tmp_path / "decimal.parquet"
+    pl.DataFrame({"a": [None]}, schema={"a": dtype}).write_parquet(path)
+    assert_gpu_result_equal(pl.scan_parquet(path), engine=engine)
+
+
+def test_has_nested_narrow_decimal_dtype_class():
+    from cudf_polars.dsl.ir import _has_nested_narrow_decimal
+
+    assert not _has_nested_narrow_decimal(pl.Decimal)
+    assert not _has_nested_narrow_decimal(pl.List(pl.Decimal))
+    assert _has_nested_narrow_decimal(pl.Array(pl.Decimal(5, 1), 2))
