@@ -347,6 +347,8 @@ EXPECTED_FAILURES: dict[str, str] = {
     "tests/unit/io/test_order_keeping_pushdown.py::test_expression_that_raises_is_evaluated[dtype4-expr4]": "Overflowing arithmetic on the GPU does not raise as polars does",
     "tests/unit/io/test_order_keeping_pushdown.py::test_not_order_keeping_stays_above_projection[expr3]": "Overflowing non-strict casts and temporal arithmetic wrap around in libcudf instead of producing null (or raising) as polars does",
     "tests/unit/operations/test_sort.py::test_sort_by_scalar_key_29583_29760": "Error messages for an invalid scalar sort_by key differ from polars ('conversion', 'arithmetic')",
+    "tests/unit/io/test_parquet_encryption.py::test_write_plaintext_footer_readable_without_keys[column_keys0]": "libcudf does not support Parquet modular encryption: the footer parse fails on plaintext-footer encrypted files, and the GPU engine cannot detect encryption at translation",
+    "tests/unit/io/test_parquet_encryption.py::test_write_plaintext_footer_readable_without_keys[column_keys1]": "libcudf does not support Parquet modular encryption: the footer parse fails on plaintext-footer encrypted files, and the GPU engine cannot detect encryption at translation",
 }
 
 
