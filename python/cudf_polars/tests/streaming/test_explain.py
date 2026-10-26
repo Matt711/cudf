@@ -462,12 +462,14 @@ def test_explain_logical_io_then_concat_then_groupby(explain_engine, tmp_path, k
     repr = explain_query(q_1, explain_engine, physical=False)
     assert "SORT" in repr
     assert "GROUPBY" in repr
-    assert "UNION" in repr
-    if kind == "parquet":
-        # Each source file has 3 rows
-        assert re.search(r"SCAN PARQUET.*row_count='~3'", repr)
-    elif kind == "frame":
+    if kind == "frame":
+        assert "UNION" in repr
         assert re.search(r"DATAFRAMESCAN.*row_count='~3'", repr)
+    else:
+        # Polars merges the concatenated file scans into a single scan.
+        assert "UNION" not in repr
+        if kind == "parquet":
+            assert re.search(r"SCAN PARQUET.*row_count='~6'", repr)
     # CSV has no row_count annotation in explain output
 
     # Check query plan q_2 - only SCAN nodes carry row_count annotations

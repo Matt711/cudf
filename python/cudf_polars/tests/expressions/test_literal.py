@@ -190,8 +190,15 @@ def test_literal_stable_id_is_content_based():
 
 def test_struct_literal_not_supported(engine: pl.GPUEngine):
     df = pl.LazyFrame({"a": [1, 2, 3]})
-    q = df.select(pl.lit({"x": 1, "y": "foo"}))
+    q = df.with_columns(pl.lit({"x": 1, "y": "foo"}).alias("s"))
     assert_ir_translation_raises(q, engine, NotImplementedError)
+
+
+def test_struct_literal_select_folded_to_scan(engine: pl.GPUEngine):
+    # Polars folds a constant struct literal into a DataFrameScan.
+    df = pl.LazyFrame({"a": [1, 2, 3]})
+    q = df.select(pl.lit({"x": 1, "y": "foo"}))
+    assert_gpu_result_equal(q, engine=engine)
 
 
 def test_coalesce(engine: pl.GPUEngine) -> None:

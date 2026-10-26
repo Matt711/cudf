@@ -767,7 +767,7 @@ def test_groupby_aggs_keep_unsupported_as_null(
 ) -> None:
     request.applymarker(
         pytest.mark.xfail(
-            condition="sum" in str(agg_expr),
+            condition=any(name in str(agg_expr) for name in ("sum", "mean", "median")),
             reason="polars raises now",
         )
     )

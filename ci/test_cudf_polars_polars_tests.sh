@@ -49,6 +49,13 @@ sed -i 's/^pyarrow$/pyarrow<25/' polars/py-polars/requirements-dev.txt
 # TODO: Remove after this is resolved upstream.
 sed -i 's/^duckdb$/duckdb<2/' polars/py-polars/requirements-ci.txt
 
+# Polars 2.1 plans Iceberg scans with the separate polars-iceberg plugin, which the
+# Iceberg tests need. Older polars versions do not declare it.
+POLARS_ICEBERG_REQUIREMENT=()
+if grep -q 'polars-iceberg' polars/py-polars/pyproject.toml; then
+    POLARS_ICEBERG_REQUIREMENT=("polars-iceberg>=0.1.0,<1.0.0")
+fi
+
 # notes:
 #
 #   * just providing --constraint="${PIP_CONSTRAINT}" to be explicit, and because
@@ -59,7 +66,8 @@ rapids-pip-retry install \
     --prefer-binary \
     --constraint "${PIP_CONSTRAINT}" \
     -r polars/py-polars/requirements-dev.txt \
-    -r polars/py-polars/requirements-ci.txt
+    -r polars/py-polars/requirements-ci.txt \
+    "${POLARS_ICEBERG_REQUIREMENT[@]}"
 
 # shellcheck disable=SC2317
 function set_exitcode()

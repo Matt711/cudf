@@ -808,11 +808,10 @@ def _(node: plrs._ir_nodes.Join, translator: Translator, schema: Schema) -> ir.I
             inp_right,
         )
     else:
-        how, op1, op2 = node.options[0]
-        if how != "IEJoin":
-            raise NotImplementedError(
-                f"Unsupported join type {how}"
-            )  # pragma: no cover; asof joins not yet exposed
+        if node.options[0][0] != "IEJoin":
+            # e.g. ("Left", "cross_and_filter") for join_where(how="left")
+            raise NotImplementedError(f"Unsupported join type {node.options[0]}")
+        _, op1, op2 = node.options[0]
         if op2 is None:
             ops = [op1]
         else:

@@ -108,3 +108,10 @@ def test_float_to_decimal_rounding(engine: pl.GPUEngine):
     )
     q = df.select(pl.col("foo") / pl.col("bar"))
     assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize("dtype", [pl.UInt16, pl.Int32, pl.Int64])
+def test_cast_integer_to_date(engine: pl.GPUEngine, dtype):
+    df = pl.LazyFrame({"a": [0, 1, 2, 35, None]}, schema={"a": dtype})
+    query = df.select(pl.col("a").cast(pl.Date()))
+    assert_gpu_result_equal(query, engine=engine)
