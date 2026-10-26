@@ -625,6 +625,9 @@ def _(node: plrs._ir_nodes.Scan, translator: Translator, schema: Schema) -> ir.I
     else:
         reader_options, cloud_options = map(json.loads, options)
     file_options = node.file_options
+    if typ == "csv":
+        # Not part of the CSV reader options, but needed to read the files.
+        reader_options["extra_columns"] = file_options.extra_columns_policy
     with_columns = file_options.with_columns
     row_index = file_options.row_index
     include_file_paths = file_options.include_file_paths
