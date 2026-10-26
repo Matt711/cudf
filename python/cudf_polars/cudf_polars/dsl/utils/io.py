@@ -32,9 +32,9 @@ class CachedParquetInfo:
     """
     Metadata for a parquet file.
 
-    File metadata is only cached when the setting
-    ``ParquetOptions.prefetch_file_metadata`` is ``True``. Metadata is cached
-    for the duration of the query.
+    File metadata is only cached when
+    ``ParquetOptions.should_prefetch_file_metadata`` is ``True``. Metadata is
+    cached for the duration of the query.
 
     Parameters
     ----------

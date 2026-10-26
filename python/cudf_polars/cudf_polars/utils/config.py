@@ -618,16 +618,17 @@ class ParquetOptions:
     prefetch_file_metadata
         Whether to prefetch parquet file metadata and pass it through
         `parquet_metadatas` to avoid rereading file footers. Not supported
-        by the in-memory executor. It defaults to disabled; enabling
-        ``use_hybrid_scan`` implicitly enables it.
+        by the in-memory executor. When unspecified, it is enabled if
+        ``use_hybrid_scan`` is enabled and disabled otherwise.
     use_jit_filter
         Whether to use JIT compilation for post-read filtering in Parquet scans.
         When enabled, filter predicates are JIT-compiled to CUDA kernels for
         improved performance on large datasets with complex filters.
         Default is False.
     use_hybrid_scan
-        Whether to use the ``HybridScanReader`` for parquet scan tasks when a
-        predicate can be pushed down to a parquet filter. Default is False.
+        Whether to use the hybrid scan readers for parquet scan tasks when a
+        predicate can be pushed down to a parquet filter. Only used by the
+        streaming executor. Default is False.
     pass_mode
         How a hybrid scan read fetches and materializes its columns. See
         :class:`HybridScanPassMode`. Ignored when ``use_hybrid_scan`` is False.
@@ -739,14 +740,15 @@ class ParquetOptions:
         object.__setattr__(self, "pass_mode", HybridScanPassMode(self.pass_mode))
         if not isinstance(self.hybrid_scan_interleave_remote_io, bool):
             raise TypeError("hybrid_scan_interleave_remote_io must be a bool")
-        if isinstance(self.prefetch_file_metadata, Unspecified):
-            object.__setattr__(self, "prefetch_file_metadata", self.use_hybrid_scan)
-        if self.use_hybrid_scan and self.prefetch_file_metadata is False:
-            raise ValueError(
-                "use_hybrid_scan requires prefetch_file_metadata to be enabled"
-            )
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
+
+    @property
+    def should_prefetch_file_metadata(self) -> bool:
+        """Whether to prefetch parquet file metadata."""
+        if isinstance(self.prefetch_file_metadata, Unspecified):
+            return self.use_hybrid_scan
+        return self.prefetch_file_metadata
 
 
 def default_target_partition_size(min_device_size: int | None) -> int:
