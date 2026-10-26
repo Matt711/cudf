@@ -847,7 +847,7 @@ class Scan(IR):
             if self.reader_options["skip_rows_after_header"] != 0:
                 raise NotImplementedError("Skipping rows after header in CSV reader")
             parse_options = self.reader_options["parse_options"]
-            if parse_options["encoding"] != "Utf8":
+            if parse_options.get("encoding", "Utf8") != "Utf8":
                 # libcudf does not repair invalid UTF-8 (polars' "utf8-lossy")
                 raise NotImplementedError(
                     f"CSV encoding {parse_options['encoding']!r} is not supported"
