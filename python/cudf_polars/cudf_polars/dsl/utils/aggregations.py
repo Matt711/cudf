@@ -303,7 +303,9 @@ def decompose_single_agg(
                     is_top=False,
                     context=context,
                 )
-                if any(nested_agg for _, nested_agg in child_aggs):
+                if any(
+                    nested_agg for _, nested_agg in child_aggs
+                ):  # pragma: no cover; polars 2.1 drops scalar sort keys
                     raise NotImplementedError(
                         "Nested aggs in sorted groupby aggregation not supported"
                     )

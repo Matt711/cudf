@@ -2684,7 +2684,7 @@ class GroupBy(IR):
             else:
                 # Anything else, we pre-evaluate
                 column = value.evaluate(df, context=ExecutionContext.GROUPBY)
-                if column.size != keys[0].size:
+                if column.size != keys[0].size:  # pragma: no cover; polars 2.0 only
                     column = broadcast(
                         column, target_length=keys[0].size, stream=df.stream
                     )[0]

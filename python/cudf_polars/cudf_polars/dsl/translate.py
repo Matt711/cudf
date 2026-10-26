@@ -798,7 +798,7 @@ def _(node: plrs._ir_nodes.Join, translator: Translator, schema: Schema) -> ir.I
         "Semi",
         "Anti",
     }:
-        if how != "Cross" and not left_on:
+        if how != "Cross" and not left_on:  # pragma: no cover; polars 2.0 only
             raise NotImplementedError(
                 "Joins without keys carry a predicate that polars does not expose"
             )
@@ -930,7 +930,7 @@ def _(node: plrs._ir_nodes.Sort, translator: Translator, schema: Schema) -> ir.I
     unique_null_order = []
     for key, key_order, key_null_order in zip(by, order, null_order, strict=True):
         if isinstance(key.value, expr.Col):
-            if key.value.name in seen:
+            if key.value.name in seen:  # pragma: no cover; polars 2.0 only
                 continue
             seen.add(key.value.name)
         unique_by.append(key)
