@@ -936,10 +936,14 @@ class UnaryFunction(Expr):
         if self.name in ("max_by", "min_by"):
             val, by = (child.evaluate(df, context=context) for child in self.children)
             if val.size != by.size:
-                raise pl.exceptions.ShapeError(
-                    f"'by' column in {self.name} expression has incorrect length: "
-                    f"expected {val.size}, got {by.size}"
-                )
+                if val.size != 1 and by.size != 1:
+                    raise pl.exceptions.ShapeError(
+                        f"'by' column in {self.name} expression has incorrect "
+                        f"length: expected {val.size}, got {by.size}"
+                    )
+                # A scalar operand (e.g. a literal or an aggregation) applies
+                # to every row of the other operand.
+                val, by = broadcast(val, by, stream=df.stream)
             unmasked = by
             by = by.mask_nans(stream=df.stream)
             agg = (

@@ -181,7 +181,6 @@ def test_max_min_by_float_nan(engine: pl.GPUEngine, expr: str, by) -> None:
     [
         pl.col("b").filter(pl.col("b") > 20),
         pl.col("b").head(2),
-        pl.lit(1),
     ],
 )
 def test_max_min_by_mismatched_length_raises(
@@ -198,15 +197,26 @@ def test_max_min_by_mismatched_length_raises(
 
 
 @pytest.mark.parametrize("expr", ["max_by", "min_by"])
-def test_max_min_by_scalar_value(engine: pl.GPUEngine, expr: str) -> None:
+@pytest.mark.parametrize("value", [pl.lit(99), pl.col("b").max()])
+def test_max_min_by_scalar_value(engine: pl.GPUEngine, expr: str, value) -> None:
+    # polars >= 2.1 broadcasts a scalar value over the `by` keys.
     df = pl.LazyFrame({"b": [1, 5, 2]})
-    q = df.select(getattr(pl.lit(99), expr)("b"))
-    if is_streaming_engine(engine):
-        with pytest.RaisesGroup(pl.exceptions.ShapeError):
-            q.collect(engine=engine)
-    else:
-        with pytest.raises(pl.exceptions.ShapeError):
-            q.collect(engine=engine)
+    q = df.select(getattr(value, expr)("b").alias("out"))
+    assert_gpu_result_equal(q, engine=engine)
+    empty = df.clear().select(getattr(value, expr)("b").alias("out"))
+    assert_gpu_result_equal(empty, engine=engine)
+
+
+@pytest.mark.parametrize("expr", ["max_by", "min_by"])
+def test_max_min_by_scalar_key(engine: pl.GPUEngine, expr: str) -> None:
+    # A scalar `by` ties every row, so any row of the input may be returned.
+    df = pl.LazyFrame({"a": [1, 2, 3, 4]})
+    for by in [pl.lit(1), pl.col("a").max()]:
+        q = df.select(getattr(pl.col("a"), expr)(by))
+        out = q.collect(engine=engine).item()
+        assert out in {1, 2, 3, 4}
+    q = df.select(getattr(pl.col("a"), expr)(pl.lit(None, dtype=pl.Int64)))
+    assert_gpu_result_equal(q, engine=engine)
 
 
 @pytest.mark.parametrize("agg", ["max_by", "min_by"])
