@@ -278,3 +278,15 @@ def test_concat_list_unsupported(engine: pl.GPUEngine) -> None:
     df = pl.LazyFrame({"a": [[1, 2], [3]], "b": [[4], [5, 6]]})
     q = df.select(pl.concat_list("a", "b"))
     assert_ir_translation_raises(q, engine, NotImplementedError)
+
+
+def test_null_literal_cast_to_list(engine: pl.GPUEngine):
+    df = pl.LazyFrame({"a": [1, 2, 3]})
+    q = df.select(
+        pl.lit(None).cast(pl.List(pl.Int64)).alias("n"),
+        pl.when(pl.col("a") > 5)
+        .then(pl.col("a").implode())
+        .otherwise(pl.lit(None).cast(pl.List(pl.Int64)))
+        .alias("w"),
+    )
+    assert_gpu_result_equal(q, engine=engine)

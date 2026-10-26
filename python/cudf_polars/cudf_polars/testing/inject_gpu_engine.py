@@ -317,15 +317,11 @@ EXPECTED_FAILURES: dict[str, str] = {
     # TODO: As of polars 1.34, the column names for left and right came in unaligned, which causes the dtypes to mismatch when calling plc.replace.replace_nulls
     # Need to investigate what changed in polars
     "tests/unit/operations/test_join.py::test_join_coalesce_column_order_23177": "Misaligned left/right column names left and right tables in join op",
-    "tests/unit/operations/test_inequality_join.py::test_join_where_how_left": "join_where(how='left'/'right') is translated through the equi-join path using the predicate's columns as literal equality keys, ignoring the actual inequality condition",
-    "tests/unit/operations/test_inequality_join.py::test_join_where_how_right": "join_where(how='left'/'right') is translated through the equi-join path using the predicate's columns as literal equality keys, ignoring the actual inequality condition",
     "tests/unit/sql/test_cast.py::test_cast_errors[values0-values::uint8-InvalidOperationError-conversion from `f64` to `u64` failed]": "Strict cast of out-of-range floats to integers does not raise",
     "tests/unit/sql/test_cast.py::test_cast_errors[values1-values::uint4-InvalidOperationError-conversion from `i64` to `u32` failed]": "Strict cast of out-of-range integers does not raise",
     "tests/unit/sql/test_cast.py::test_cast_errors[values2-values::int1-InvalidOperationError-conversion from `i64` to `i8` failed]": "Strict cast of out-of-range integers does not raise",
     "tests/unit/sql/test_cast.py::test_cast_errors[values4-values::int4-InvalidOperationError-conversion from `str` to `i32` failed]": "Strict cast failure message differs from polars",
     "tests/unit/sql/test_joins.py::test_constant_key_join_keeps_validation": "Join validation is not supported",
-    "tests/unit/sql/test_joins.py::test_non_equi_left_join_null_keys": "SQL LEFT/RIGHT JOIN with an inequality condition is translated through the equi-join path, ignoring the inequality condition",
-    "tests/unit/sql/test_joins.py::test_non_equi_right_join_pure": "SQL LEFT/RIGHT JOIN with an inequality condition is translated through the equi-join path, ignoring the inequality condition",
     "tests/unit/operations/namespaces/string/test_pad.py::test_str_zfill_unicode_not_respected": "polars doesn't add zeros for unicode characters.",
     "tests/unit/lazyframe/test_predicates.py::test_predicate_pushdown_split_pushable": "Casting that raises not supported on GPU",
     "tests/unit/lazyframe/test_predicates.py::test_filter_contradiction_fallible_error_handling": "Casting that raises not supported on GPU",
@@ -340,10 +336,27 @@ EXPECTED_FAILURES: dict[str, str] = {
     "tests/unit/io/test_scan.py::test_scan_sink_metrics_multiple_phases": "sink metrics are not reported by the GPU engine",
     "tests/unit/io/test_parquet.py::test_read_parquet_concatenated_gzip_members_28787": "Non-deterministic garbage in the last row; likely a libcudf GZIP multi-member decompression bug",
     "tests/unit/datatypes/test_struct.py::test_struct_equal_missing_null_25360": "struct equality with a null raises libcudf 'Index out of bounds' (get_element)",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_expression_that_gives_null_keeps_null_filter[values0-expr0]": "Overflowing non-strict casts and temporal arithmetic wrap around in libcudf instead of producing null (or raising) as polars does",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_expression_that_gives_null_keeps_null_filter[values1-expr1]": "Overflowing non-strict casts and temporal arithmetic wrap around in libcudf instead of producing null (or raising) as polars does",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_expression_that_gives_null_keeps_null_filter[values2-expr2]": "Overflowing non-strict casts and temporal arithmetic wrap around in libcudf instead of producing null (or raising) as polars does",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_expression_that_gives_null_keeps_null_filter[values3-expr3]": "Overflowing non-strict casts and temporal arithmetic wrap around in libcudf instead of producing null (or raising) as polars does",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_expression_that_gives_null_keeps_null_filter[values5-expr5]": "Overflowing non-strict casts and temporal arithmetic wrap around in libcudf instead of producing null (or raising) as polars does",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_expression_that_gives_null_keeps_null_filter[values6-expr6]": "Overflowing non-strict casts and temporal arithmetic wrap around in libcudf instead of producing null (or raising) as polars does",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_expression_that_raises_is_evaluated[UInt32-expr0]": "Overflowing arithmetic on the GPU does not raise as polars does",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_expression_that_raises_is_evaluated[Date-expr1]": "Overflowing arithmetic on the GPU does not raise as polars does",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_expression_that_raises_is_evaluated[dtype4-expr4]": "Overflowing arithmetic on the GPU does not raise as polars does",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_not_order_keeping_stays_above_projection[expr3]": "Overflowing non-strict casts and temporal arithmetic wrap around in libcudf instead of producing null (or raising) as polars does",
+    "tests/unit/operations/test_sort.py::test_sort_by_scalar_key_29583_29760": "Error messages for an invalid scalar sort_by key differ from polars ('conversion', 'arithmetic')",
 }
 
 
 TESTS_TO_SKIP: dict[str, str] = {
+    "tests/unit/io/test_order_keeping_pushdown.py::test_top_k_through_order_keeping_projection[False-expr6]": "Checks verbose logs or metrics specific to the Polars CPU streaming engine",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_top_k_through_order_keeping_projection[False-expr7]": "Checks verbose logs or metrics specific to the Polars CPU streaming engine",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_top_k_through_order_keeping_projection[True-expr6]": "Checks verbose logs or metrics specific to the Polars CPU streaming engine",
+    "tests/unit/io/test_order_keeping_pushdown.py::test_top_k_through_order_keeping_projection[True-expr7]": "Checks verbose logs or metrics specific to the Polars CPU streaming engine",
+    "tests/unit/streaming/test_streaming.py::test_log_metrics_reports_query_io_time": "Checks verbose logs or metrics specific to the Polars CPU streaming engine",
+    "tests/unit/lazyframe/test_query_monitoring.py::test_metrics_handle_snapshot": "Checks verbose logs or metrics specific to the Polars CPU streaming engine",
     "tests/unit/io/test_delta.py::test_scan_delta_loads_aws_profile_endpoint_url": "Does not use the GPU engine; fails whenever AWS_DEFAULT_REGION is set, as in CI",
     # CI has shown two different failure modes across runs (a PanicException on
     # an invalid datetime, and garbage/uninitialized-looking datetime values),
@@ -651,6 +664,13 @@ STREAMING_ENGINE_TESTS_TO_SKIP_SMALL_BLOCKSIZE: Mapping[str, str] = {
 
 STREAMING_ENGINE_EXPECTED_FAILURES: Mapping[str, str] = {
     "tests/unit/sql/test_subqueries.py::test_scalar_subquery_multi_row_errors": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
+    "tests/unit/operations/aggregation/test_aggregations.py::test_item_on_groups_null_29780[2.0]": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
+    "tests/unit/operations/aggregation/test_aggregations.py::test_item_on_groups_null_29780[x]": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
+    "tests/unit/operations/aggregation/test_aggregations.py::test_item_on_groups_null_29780[True]": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
+    "tests/unit/sql/test_correlated_subqueries.py::test_correlated_aggregate_fallible_expression_only_over_outer_rows": "Correct polars.exceptions.InvalidOperationError raised but it's in an ExceptionGroup",
+    "tests/unit/sql/test_correlated_subqueries.py::test_correlated_one_input_condition_in_join_on_many_rows[a.v = (SELECT c.id * 10 FROM c WHERE c.b_id = a.id)]": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
+    "tests/unit/sql/test_correlated_subqueries.py::test_correlated_one_input_condition_in_join_on_many_rows[a.id = (SELECT b.id FROM c AS b WHERE b.b_id = a.id)]": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
+    "tests/unit/sql/test_joins.py::test_join_on_subquery_unsupported[a.v = (SELECT x FROM c)-expected no or a single value]": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
     "tests/unit/functions/test_union.py::test_union_lazyframe_horizontal": "Correct polars.exceptions.ShapeError raised but it's in an ExceptionGroup",
     "tests/unit/functions/test_concat.py::test_concat_lazyframe_horizontal": "Correct polars.exceptions.ShapeError raised but it's in an ExceptionGroup",
     "tests/unit/functions/test_concat.py::test_concat_horizontal_zero_width_height_mismatch_26876": "https://github.com/NVIDIA/cudf/issues/21644",

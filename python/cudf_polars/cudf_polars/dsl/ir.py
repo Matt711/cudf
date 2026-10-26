@@ -4278,19 +4278,12 @@ class Empty(IR):
     @nvtx_annotate_cudf_polars(message="Empty")
     def do_evaluate(
         cls, schema: Schema, *, context: IRExecutionContext
-    ) -> DataFrame:  # pragma: no cover
+    ) -> DataFrame:
         """Evaluate and return a dataframe."""
-        stream = context.get_cuda_stream()
-        return DataFrame(
-            [
-                Column(
-                    plc.column_factories.make_empty_column(
-                        dtype.plc_type, stream=stream
-                    ),
-                    dtype=dtype,
-                    name=name,
-                )
-                for name, dtype in schema.items()
-            ],
-            stream=stream,
+        # libcudf cannot make an empty column of a nested type directly.
+        return DataFrame.from_polars(
+            pl.DataFrame(
+                schema={name: dtype.polars_type for name, dtype in schema.items()}
+            ),
+            stream=context.get_cuda_stream(),
         )

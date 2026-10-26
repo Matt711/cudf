@@ -1738,6 +1738,13 @@ def _(
 
     # Push casts into literals so we can handle Cast(Literal(Null))
     if isinstance(inner, expr.Literal):
+        if dtype.id() == plc.TypeId.LIST:
+            # TODO: Remove once pylibcudf.Scalar supports lists
+            if inner.value is not None:  # pragma: no cover; polars rejects this cast
+                raise NotImplementedError("Casting a non-null literal to a list")
+            return expr.LiteralColumn(
+                dtype, pl.Series([None], dtype=dtype.polars_type)
+            )
         return inner.astype(dtype)
     else:
         return expr.Cast(dtype, strict, inner)
