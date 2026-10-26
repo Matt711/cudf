@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
 
+import polars as pl
 from polars import _plr as polars
 
 import pylibcudf as plc
@@ -33,6 +34,8 @@ def _decimal_rescale_may_overflow(left: DataType, right: DataType) -> bool:
     ):
         return False
     lt, rt = left.polars_type, right.polars_type
+    assert isinstance(lt, pl.Decimal)
+    assert isinstance(rt, pl.Decimal)
     lp = lt.precision or _DECIMAL128_MAX_PRECISION
     rp = rt.precision or _DECIMAL128_MAX_PRECISION
     scale = max(lt.scale, rt.scale)

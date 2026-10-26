@@ -671,7 +671,9 @@ def _prepare_parquet_predicate(
     return predicate
 
 
-def _has_nested_narrow_decimal(dtype: pl.DataType, *, nested: bool = False) -> bool:
+def _has_nested_narrow_decimal(
+    dtype: pl.DataType | pl.datatypes.DataTypeClass, *, nested: bool = False
+) -> bool:
     """Whether ``dtype`` has a Decimal(precision <= 18) inside a List/Array/Struct."""
     if isinstance(dtype, type):
         dtype = dtype()
