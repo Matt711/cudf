@@ -41,6 +41,30 @@ Ground rules:
 - Never `pkill -f <pattern>`; the pattern can match your own shell's command line. Use `pgrep`, then kill by pid.
 - Run long suites in the background with output to a log file, and check them later rather than waiting inline.
 - The narwhals pin lives in `dependencies.yaml` (`depends_on_narwhals`); read it there instead of assuming a version.
+- **CI under-reports failures.** Every test job stops at its first failure (`-x`, or xdist "stopping after N failures"), so a red PR
+  shows only a handful of tests. In the Polars 2.1 upgrade CI showed 3 unit and 4 upstream failures per job; the full local runs
+  had 37 unit failures and 153 (in-memory) / 65 (spmd) upstream failures. Treat CI as a smoke signal and triage from full local
+  runs (`--maxfail=300`, `--maxfail=100000`). Read CI logs with
+  `gh pr checks <pr>` and `gh run view --job <job-id> --log-failed`.
+- **Shared GPUs.** Check `nvidia-smi` before every run and never disturb other people's work. Use one GPU per process
+  (`CUDA_VISIBLE_DEVICES`) and keep concurrent jobs on different GPUs. The streaming engine (and the xdist plugin runs) abort with
+  `No GPUs found on current NUMA node N` when the process runs on CPUs of the other NUMA node. Find the GPU's node with
+  `nvidia-smi topo -m` and pin: `numactl --cpunodebind=<node> --membind=<node> python -m pytest ...`. The `in-memory` engine is unaffected.
+- A kvikio `FutureWarning` ("remote_io_reactor_dispatch is deprecated") can turn into an error under `filterwarnings = error` when
+  the environment's kvikio is newer than the repo expects. Pass `-W "ignore:remote_io_reactor_dispatch:FutureWarning"` locally and
+  say so; do not edit the repo for it unless CI shows it.
+- `pytest-cov` can under-report: lines such as `raise NotImplementedError(...)` that a test provably executes may show as missed in a
+  full run. Before adding a pragma or a test, confirm a line is really unreachable by tracing it:
+  run the query under `sys.settrace` (or with `pytest <that test file> --cov`) and see whether the line executes. Only lines that are
+  not reached by any query on the new polars need a test or `# pragma: no cover`.
+- Upstream tests marked `write_disk` are deselected unless you pass `-m ""` (CI passes `-m "not slow"`); remember this when running
+  a single upstream test.
+- The narwhals repo keeps its package under `src/narwhals`. To test the pinned version without installing it, put `<clone>/src` (not the
+  clone root) first on `PYTHONPATH`, and print `narwhals.__file__` to confirm which copy is imported.
+- **Parallel work.** Independent failure clusters can be handed to subagents. Give each its own `git worktree` and branch off the
+  current PR commit, its own GPU, a list of exact test ids, and the rule "fix and test on your branch, or recommend an xfail with a
+  drafted issue". Agents must not edit shared dicts like `inject_gpu_engine.py`; you merge their commits with `git cherry-pick` and
+  resolve the (usually append-only) conflicts. Give each agent a private scratch directory; shared scratch scripts get overwritten.
 
 ## Step 1. Survey what changed upstream
 
@@ -115,6 +139,25 @@ Run the code against the new polars and fix in this order.
    Prefer `Column.astype` over hand-rolled cast checks, and drop `hasattr` guards for APIs that now always exist.
 7. **Imports.** Use `from polars import _plr as plrs` for the private Rust bindings. mypy needs the overrides already in
    the root `pyproject.toml` for `polars._plr`.
+
+8. **Polars constant-folds literals into scans.** In 2.1 `select(pl.lit(<struct/enum>))` becomes a `DataFrameScan`, so the translator
+   never sees a `Literal` and a test that expects `NotImplementedError` from that query stops raising. Keep the raise test but build
+   the query with `with_columns` (or `when/then`), which still reaches the `Literal`, and add a small `assert_gpu_result_equal` test for
+   the folded `select` form. Check what a changed test now exercises (print `translator.errors`), not just that it passes.
+9. **Option payloads can change shape.** 2.1 added a join type whose `options[0]` is a 2-tuple (`("Left", "cross_and_filter")`) where
+   code unpacked a 3-tuple. Look at the kind of the payload before unpacking, and raise `NotImplementedError` for kinds you do not support.
+10. **A polars panic cannot be caught.** If a visitor call panics (for example `get_schema()` on a `BinaryOffset` column, which polars
+    maps to `unimplemented!()`), the exception is a `BaseException` and the visitor's arena lock is poisoned, so neither a catch nor the CPU
+    fallback works. Do not add a try/except. Xfail the affected tests with a reason and draft an issue for `pola-rs/polars`.
+11. **Optimizer rewrites that hide behind a visitor limit.** 2.1 lowers `x.sort_by(k).first()` in `group_by` to `min_by` with a "total
+    order" that the Python visitor refuses to expose, so such queries fall back to CPU. Where the rewrite is skipped (for example
+    `maintain_order=True`) keep the GPU path covered by passing that option in tests, and add a canary test that the default form raises.
+12. **Version-specific code.** The supported range spans two polars minors, but CI measures coverage on the newest. Code reachable
+    only on the older version gets `# pragma: no cover; polars 2.0 only` on its `if`/`raise` line; code now unreachable on the newer
+    version one gets a note naming that version. Re-run the coverage check after every polars-induced plan change.
+13. **mypy.** `DataType.polars_type` is the generic `pl.DataType`; narrow it with `assert isinstance(t, pl.Decimal)` before reading
+    `.precision`/`.scale`. Run `mypy --config-file=pyproject.toml cudf_polars tests` from `python/cudf_polars` and ignore the
+    `import-untyped`/`_expr_nodes` noise that comes from not having the hook's isolated environment.
 
 Keep comments about polars behaviour short and link the polars issue/PR when there is one.
 
@@ -197,7 +240,17 @@ Conventions for the dicts (`EXPECTED_FAILURES`, `TESTS_TO_SKIP`, `STREAMING_ENGI
 - Conditional entries use plain Python guards after the dict (not tuples).
 - **Audit the existing entries.** xfails are strict: remove entries whose test now passes (XPASS fails the run) or no longer exists.
   The Polars 2.0 audit removed 76 and added about 30.
-- Wrong-result failures should become fallbacks, not xfails.
+- Wrong-result failures should become fallbacks, not xfails. In the 2.1 upgrade several "failures" were real wrong results
+  (integer-to-`Date` casts relabelled an `INT64` buffer as `INT32`; mixed-scale `Decimal` comparisons wrapped in libcudf; non-strict
+  narrowing casts wrapped instead of returning null). Compare the GPU result with the CPU result before assuming a test is flaky.
+- When a fix turns a fallback into correct GPU execution (or the reverse), the matching xfail becomes an XPASS: rerun the whole
+  upstream suite after merging fixes and delete the stale entries.
+- SPMD/streaming failures where the right polars error arrives wrapped in an `ExceptionGroup` go in
+  `STREAMING_ENGINE_EXPECTED_FAILURES` with the established phrase ("Correct polars.exceptions.X raised but it's in an ExceptionGroup").
+
+If the new polars adds an optional dependency that its tests need, install it too: read the `[project.optional-dependencies]` of the cloned
+`py-polars/pyproject.toml` (2.1 needs `polars-iceberg`, without which ~110 Iceberg/catalog tests fail with a `PerformanceWarning`). Add it to
+`ci/test_cudf_polars_polars_tests.sh` conditionally on the cloned repo declaring it, so older tags keep working.
 
 If an upstream test requirement breaks (a new dependency release or a warning under `-W error`), patch the requirement with `sed -i`
 in `ci/test_cudf_polars_polars_tests.sh` or add a `-W ignore:` filter in `ci/run_cudf_polars_polars_tests.sh`, with a comment that
@@ -215,6 +268,9 @@ Narwhals runs three plugin variants (`ci/test_narwhals.sh`): cudf, cudf-polars a
    Add an `EXPECTED_FAILURES` entry with a reason to **each plugin the test fails in**. Interchange-protocol tests, for example,
    had to be added to all three. Link a narwhals or cudf issue where one exists.
 4. Remove entries that now pass (they are strict xfails) or whose tests no longer exist.
+5. The cudf and cudf.pandas variants need `cudf` installed and exercise pandas/cudf, not polars. If the environment has no `cudf`, say
+   so in the PR and rely on CI for those two; the cudf-polars variant is the one a polars upgrade can break. It needs the NUMA pinning from
+   the practical notes. Local-environment noise (a newer duckdb API, the version test) is not a regression; compare with CI.
 
 ## Step 7. Final checks
 
@@ -228,7 +284,8 @@ Narwhals runs three plugin variants (`ci/test_narwhals.sh`): cudf, cudf-polars a
 ## Drafting issues
 
 Every xfail/skip/fallback that stands for a real gap needs an issue the maintainers can act on without asking questions. Draft each as
-a markdown file for the user to review; never open one without being asked. Title format `[BUG] ...` or `[FEA] ...`; labels `bug` or
+a markdown file for the user to review; open an issue only when asked, and open issues in other repositories (for example
+`pola-rs/polars`) only with an explicit go-ahead. Title format `[BUG] ...` or `[FEA] ...`; labels `bug` or
 `feature request` plus `cudf-polars`. Use this structure (modelled on a well-received issue about hanging upstream tests):
 
 1. **Description.** Plain-language symptom first: what happens (wrong result, exception, hang), how it shows up in CI, and what still works
@@ -244,6 +301,11 @@ a markdown file for the user to review; never open one without being asked. Titl
 7. **Caveats.** Anything the workaround may be hiding (for example a skipped hang hides every test behind it).
 
 Link the issue number in the xfail reason (`.../issues/NNNNN`) once the user has opened it. Until then use `TODO: <draft filename>`.
+
+When the user asks you to open them: `gh issue create -R NVIDIA/cudf --title ... --body-file ... --label bug --label cudf-polars`
+(use `--label libcudf` for libcudf reader/kernel bugs and `--label "feature request"` for `[FEA]`). End each body with a line linking the
+upgrade PR ("Found while upgrading cudf-polars to Polars X.Y in <PR url>"). Verify the labels with `gh issue view <n> --json labels`, then
+replace the `TODO` placeholders in the dicts with the issue URLs and commit. Group tests that share a cause into one issue.
 
 ## Reference: where things live
 
