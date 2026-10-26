@@ -228,9 +228,7 @@ def test_rolling_null_count(engine: pl.GPUEngine, df):
 
 def test_rolling_has_nulls_empty_window(engine: pl.GPUEngine):
     lf = pl.LazyFrame({"t": [1, 2, 3, 4], "x": [None, 2, None, 4]})
-    q = lf.rolling("t", period="1i", closed="left").agg(
-        hn=pl.col("x").has_nulls(), nc=pl.col("x").null_count()
-    )
+    q = lf.rolling("t", period="1i", closed="left").agg(hn=pl.col("x").has_nulls())
     assert_gpu_result_equal(q, engine=engine)
 
 
