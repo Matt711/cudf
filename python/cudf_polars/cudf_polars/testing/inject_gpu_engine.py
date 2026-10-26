@@ -667,6 +667,7 @@ STREAMING_ENGINE_TESTS_TO_SKIP_SMALL_BLOCKSIZE: Mapping[str, str] = {
 
 STREAMING_ENGINE_EXPECTED_FAILURES: Mapping[str, str] = {
     "tests/unit/sql/test_subqueries.py::test_scalar_subquery_multi_row_errors": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
+    "tests/unit/lazyframe/test_order_observability.py::test_top_k_by_drops_scalar_keys": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
     "tests/unit/operations/aggregation/test_aggregations.py::test_item_on_groups_null_29780[2.0]": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
     "tests/unit/operations/aggregation/test_aggregations.py::test_item_on_groups_null_29780[x]": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
     "tests/unit/operations/aggregation/test_aggregations.py::test_item_on_groups_null_29780[True]": "Correct polars.exceptions.ComputeError raised but it's in an ExceptionGroup",
