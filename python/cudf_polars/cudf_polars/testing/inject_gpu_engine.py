@@ -286,6 +286,8 @@ EXPECTED_FAILURES: dict[str, str] = {
     "tests/unit/io/test_parquet.py::test_binary_offset_roundtrip": "binary offset type unsupported",
     "tests/unit/io/test_lazy_csv.py::test_scan_csv_schema_new_columns_dtypes[foods1.csv]": "CSV reader's use_cols_names picks the wrong columns when combined with a column_names_overwrite rename",
     "tests/unit/io/test_lazy_csv.py::test_scan_csv_schema_new_columns_dtypes[foods*.csv]": "CSV reader's use_cols_names picks the wrong columns when combined with a column_names_overwrite rename",
+    "tests/unit/sql/test_table_functions.py::test_read_csv_override_that_does_not_fit": "libcudf CSV/JSON readers turn values that do not parse as the requested dtype into nulls instead of raising (https://github.com/NVIDIA/cudf/issues/TODO)",
+    "tests/unit/sql/test_table_functions.py::test_read_ndjson_option_errors[schema_overrides => {'a': 'INT'}-ComputeError-cannot parse 'oops' \\\\(string\\\\) as Int32]": "libcudf CSV/JSON readers turn values that do not parse as the requested dtype into nulls instead of raising (https://github.com/NVIDIA/cudf/issues/TODO)",
     "tests/unit/lazyframe/test_engine_selection.py::test_engine_import_error_raises[gpu]": "Expect this to pass because cudf-polars is installed",
     "tests/unit/lazyframe/test_engine_selection.py::test_engine_import_error_raises[engine1]": "Expect this to pass because cudf-polars is installed",
     "tests/unit/lazyframe/test_engine_selection.py::test_default_engine_and_affinity[streaming]": "This plugin forces engine=<injected GPU engine> on LazyFrame.collect via partialmethod, so the default engine and POLARS_ENGINE_AFFINITY are never consulted",
@@ -359,6 +361,7 @@ TESTS_TO_SKIP: dict[str, str] = {
     "tests/unit/io/test_order_keeping_pushdown.py::test_top_k_through_order_keeping_projection[True-expr7]": "Checks verbose logs or metrics specific to the Polars CPU streaming engine",
     "tests/unit/streaming/test_streaming.py::test_log_metrics_reports_query_io_time": "Checks verbose logs or metrics specific to the Polars CPU streaming engine",
     "tests/unit/lazyframe/test_query_monitoring.py::test_metrics_handle_snapshot": "Checks verbose logs or metrics specific to the Polars CPU streaming engine",
+    "tests/unit/sql/test_correlated_subqueries.py::test_correlated_aggregate_unknown_outer_size_not_restricted": "Asserts that the polars streaming engine stops reading an IO source early after a LIMIT; the GPU engine reads the whole source",
     "tests/unit/io/test_delta.py::test_scan_delta_loads_aws_profile_endpoint_url": "Does not use the GPU engine; fails whenever AWS_DEFAULT_REGION is set, as in CI",
     # CI has shown two different failure modes across runs (a PanicException on
     # an invalid datetime, and garbage/uninitialized-looking datetime values),
