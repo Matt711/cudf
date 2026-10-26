@@ -452,6 +452,7 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PREFETCH_FILE_METADATA", "1")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__USE_JIT_FILTER", "1")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PASS_MODE", "single_pass")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__HYBRID_SCAN_INTERLEAVE_REMOTE_IO", "0")
 
         # Test default
         engine = pl.GPUEngine()
@@ -467,6 +468,7 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         assert config.parquet_options.prefetch_file_metadata is True
         assert config.parquet_options.use_jit_filter is True
         assert config.parquet_options.pass_mode is HybridScanPassMode.SINGLE_PASS
+        assert config.parquet_options.hybrid_scan_interleave_remote_io is False
 
     with monkeypatch.context() as m:
         # Env must win over the executor-derived default (streaming => True).
@@ -710,6 +712,7 @@ def test_fallback_mode_default(monkeypatch: pytest.MonkeyPatch) -> None:
         "max_row_group_samples",
         "prefetch_file_metadata",
         "use_hybrid_scan",
+        "hybrid_scan_interleave_remote_io",
         "use_jit_filter",
     ],
 )

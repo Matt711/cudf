@@ -10,6 +10,8 @@ import pytest
 
 import polars as pl
 
+from pylibcudf.io.parquet_io_utils import IOSubmissionPolicy
+
 from cudf_polars import Translator
 from cudf_polars.containers import DataType
 from cudf_polars.dsl.ir import (
@@ -36,6 +38,7 @@ from cudf_polars.streaming.io import (
     ParquetScanTask,
     ScanTask,
     StreamingScan,
+    _hybrid_scan_io_submission_policy,
     expand_scan_for_rank,
     scan_partition_plan,
 )
@@ -249,6 +252,33 @@ def test_cached_parquet_info_hybrid_scan_reader_lazy(tmp_path, df) -> None:
 
     info.hybrid_scan_reader(info.default_reader_options())
     assert info._hybrid_scan_metadata is not None
+
+
+@pytest.mark.parametrize(
+    "paths,interleave_remote_io,expected",
+    [
+        (["file.parquet"], True, IOSubmissionPolicy.SERIALIZE),
+        (["s3://bucket/file.parquet"], True, IOSubmissionPolicy.INTERLEAVE),
+        (["s3://bucket/file.parquet"], False, IOSubmissionPolicy.SERIALIZE),
+        (
+            ["file.parquet", "s3://bucket/file.parquet"],
+            True,
+            IOSubmissionPolicy.INTERLEAVE,
+        ),
+    ],
+)
+def test_hybrid_scan_io_submission_policy(
+    paths: list[str],
+    expected: IOSubmissionPolicy,
+    *,
+    interleave_remote_io: bool,
+) -> None:
+    assert (
+        _hybrid_scan_io_submission_policy(
+            paths, interleave_remote_io=interleave_remote_io
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(

@@ -44,7 +44,7 @@ from cudf_polars.utils.config import Cluster, HybridScanPassMode
 from cudf_polars.utils.cuda_stream import get_cuda_stream
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable, Mapping, MutableMapping, Sequence
+    from collections.abc import Hashable, Iterable, Mapping, MutableMapping, Sequence
 
     import pylibcudf.expressions as plc_expr
     from rmm.pylibrmm.stream import Stream
@@ -260,6 +260,16 @@ def _dataframe_from_hybrid_scan_table(
     )
 
 
+def _hybrid_scan_io_submission_policy(
+    paths: Iterable[str], *, interleave_remote_io: bool
+) -> plc.io.parquet_io_utils.IOSubmissionPolicy:
+    if interleave_remote_io and any(
+        plc.io.SourceInfo._is_remote_uri(path) for path in paths
+    ):
+        return plc.io.parquet_io_utils.IOSubmissionPolicy.INTERLEAVE
+    return plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE
+
+
 def _read_with_hybrid_scan(
     schema: Schema,
     paths: list[str],
@@ -273,6 +283,7 @@ def _read_with_hybrid_scan(
     total_splits: int = 1,
     stats_pruning: bool = True,
     pass_mode: HybridScanPassMode = HybridScanPassMode.TWO_PASS,
+    interleave_remote_io: bool = True,
 ) -> DataFrame:
     """Parquet read via HybridScanReader for a row-group-aligned task."""
     assert len(paths) == 1, "hybrid scan only supports tasks with one physical file"
@@ -281,6 +292,9 @@ def _read_with_hybrid_scan(
     ):
         source_info = plc.io.SourceInfo(
             [plc.io.types.FilepathSource(cached_info.path, cached_info.size)]
+        )
+        io_submission_policy = _hybrid_scan_io_submission_policy(
+            paths, interleave_remote_io=interleave_remote_io
         )
         options = cached_info.default_reader_options()
         if with_columns is not None:
@@ -302,7 +316,7 @@ def _read_with_hybrid_scan(
                     bloom_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                         source_info,
                         bloom_ranges,
-                        plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                        io_submission_policy,
                         stream=stream,
                     )
                     row_group_indices = reader.filter_row_groups_with_bloom_filters(
@@ -329,7 +343,7 @@ def _read_with_hybrid_scan(
             all_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                 source_info,
                 reader.all_column_chunks_byte_ranges(row_group_indices, options),
-                plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                io_submission_policy,
                 stream=stream,
             )
             return _dataframe_from_hybrid_scan_table(
@@ -349,7 +363,7 @@ def _read_with_hybrid_scan(
         filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
             source_info,
             reader.filter_column_chunks_byte_ranges(row_group_indices, options),
-            plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+            io_submission_policy,
             stream=stream,
         )
         filter_df = _dataframe_from_hybrid_scan_table(
@@ -371,7 +385,7 @@ def _read_with_hybrid_scan(
             payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
                 source_info,
                 reader.payload_column_chunks_byte_ranges(row_group_indices, options),
-                plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+                io_submission_policy,
                 stream=stream,
             )
             payload_df = _dataframe_from_hybrid_scan_table(
@@ -765,6 +779,9 @@ class ParquetScanTask(ScanTask):
                     total_splits=total_splits,
                     stats_pruning=parquet_options._hybrid_scan_stats_pruning,
                     pass_mode=parquet_options.pass_mode,
+                    interleave_remote_io=(
+                        parquet_options.hybrid_scan_interleave_remote_io
+                    ),
                 )
                 if hive_parts is not None:
                     df = df.with_columns(
