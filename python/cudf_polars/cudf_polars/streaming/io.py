@@ -90,13 +90,6 @@ def scan_partition_plan(
     """Extract the partitioning plan of a Scan operation."""
     if ir.typ == "parquet":
         blocksize: int = config_options.executor.target_partition_size
-        single_file = len(ir.paths) == 1
-        # A single file always uses a split parquet task when hybrid scan is enabled,
-        # so the hybrid reader can be used even when the file would otherwise not split.
-        # The split factor is still size-based, so a large file is split into many.
-        hybrid_single_file = (
-            single_file and config_options.parquet_options.use_hybrid_scan
-        )
         if source := stats.scan_stats.get(ir):
             column_sizes = [
                 sz
@@ -113,18 +106,12 @@ def scan_partition_plan(
                         <= abs(file_size / k_hi - blocksize)
                         else k_hi
                     )
-                    if factor >= 2 or hybrid_single_file:
+                    if factor >= 2:
                         return IOPartitionPlan(
                             factor,
                             IOPartitionFlavor.SPLIT_FILES,
                             estimated_chunk_bytes=file_size // factor,
                         )
-                elif hybrid_single_file:
-                    return IOPartitionPlan(
-                        1,
-                        IOPartitionFlavor.SPLIT_FILES,
-                        estimated_chunk_bytes=file_size,
-                    )
                 else:
                     k_lo = min(blocksize // int(file_size), len(ir.paths))
                     k_hi = k_lo + 1
@@ -140,9 +127,6 @@ def scan_partition_plan(
                     IOPartitionFlavor.FUSED_FILES,
                     estimated_chunk_bytes=file_size * factor,
                 )
-
-        if hybrid_single_file:
-            return IOPartitionPlan(1, IOPartitionFlavor.SPLIT_FILES)
 
     # TODO: Use file sizes for csv and json
     return IOPartitionPlan(1, IOPartitionFlavor.SINGLE_FILE)
