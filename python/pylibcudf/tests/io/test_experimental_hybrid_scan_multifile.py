@@ -766,21 +766,24 @@ def test_hybrid_scan_multifile_filter_row_groups_with_dictionary_pages(
 
 @requires_pyarrow_bloom_filters
 def test_hybrid_scan_multifile_filter_row_groups_with_bloom_filters(
+    tmp_path,
     multifile_parquet_tables,
     row_group_size,
     num_rows_per_source,
 ):
     """Test filtering row groups with the bloom filters of all sources."""
+    paths = []
     parquet_bytes = []
-    for table in multifile_parquet_tables:
-        buf = io.BytesIO()
+    for i, table in enumerate(multifile_parquet_tables):
+        path = tmp_path / f"source{i}.parquet"
         pq.write_table(
             table,
-            buf,
+            path,
             row_group_size=row_group_size,
             bloom_filter_options={"col1": BLOOM_FILTER_OPTIONS},
         )
-        parquet_bytes.append(buf.getvalue())
+        paths.append(str(path))
+        parquet_bytes.append(path.read_bytes())
 
     options = plc.io.parquet.ParquetReaderOptions.builder(
         plc.io.SourceInfo([])
@@ -799,8 +802,15 @@ def test_hybrid_scan_multifile_filter_row_groups_with_bloom_filters(
     )
 
     all_row_groups = reader.all_row_groups(options)
-    bloom_ranges = reader.bloom_filters_byte_ranges(all_row_groups, options)
-    bloom_data = _fetch_to_device(parquet_bytes, bloom_ranges)
+    bloom_ranges, bloom_sources = reader.bloom_filters_byte_ranges(
+        all_row_groups, options
+    )
+    bloom_data = plc.io.parquet_io_utils.fetch_bloom_filters_to_device(
+        plc.io.SourceInfo(paths),
+        bloom_ranges,
+        plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE,
+        source_indices=bloom_sources,
+    )
     synchronize_stream()
 
     filtered = reader.filter_row_groups_with_bloom_filters(
@@ -815,6 +825,7 @@ def test_hybrid_scan_multifile_filter_row_groups_with_bloom_filters(
     "use_data_page_mask", [UseDataPageMask.NO, UseDataPageMask.YES]
 )
 def test_hybrid_scan_multifile_materialize_filter_and_payload_columns(
+    tmp_path,
     multifile_parquet_bytes,
     multifile_hybrid_scan_reader,
     multifile_parquet_options,
@@ -824,6 +835,13 @@ def test_hybrid_scan_multifile_materialize_filter_and_payload_columns(
     use_data_page_mask,
 ):
     """Test the two pass workflow of materializing filter and payload columns."""
+    paths = []
+    for i, source in enumerate(multifile_parquet_bytes):
+        path = tmp_path / f"source{i}.parquet"
+        path.write_bytes(source)
+        paths.append(str(path))
+    source_info = plc.io.SourceInfo(paths)
+    policy = plc.io.parquet_io_utils.IOSubmissionPolicy.SERIALIZE
     filter_threshold = num_rows_per_source // 10
     filter_expression = Operation(
         ASTOperator.GREATER_EQUAL,
@@ -853,8 +871,12 @@ def test_hybrid_scan_multifile_materialize_filter_and_payload_columns(
             filtered_row_groups, multifile_parquet_options
         )
     )
-    filter_data = _fetch_to_device(
-        multifile_parquet_bytes, filter_ranges, stream
+    filter_data = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+        source_info,
+        filter_ranges[0],
+        policy,
+        stream,
+        source_indices=filter_ranges[1],
     )
     synchronize_stream(stream)
 
@@ -877,8 +899,12 @@ def test_hybrid_scan_multifile_materialize_filter_and_payload_columns(
             filtered_row_groups, multifile_parquet_options
         )
     )
-    payload_data = _fetch_to_device(
-        multifile_parquet_bytes, payload_ranges, stream
+    payload_data = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+        source_info,
+        payload_ranges[0],
+        policy,
+        stream,
+        source_indices=payload_ranges[1],
     )
     synchronize_stream(stream)
 
@@ -896,7 +922,7 @@ def test_hybrid_scan_multifile_materialize_filter_and_payload_columns(
     assert payload_result.tbl.num_rows() == expected_total
 
     comparison_options = plc.io.parquet.ParquetReaderOptions.builder(
-        plc.io.SourceInfo([io.BytesIO(b) for b in multifile_parquet_bytes])
+        source_info
     ).build()
     comparison_options.set_filter(filter_expression)
     expected_result = plc.io.parquet.read_parquet(comparison_options, stream)

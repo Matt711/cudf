@@ -81,7 +81,7 @@ def test_fetch_byte_ranges_to_device_multiple_sources(
 def test_fetch_byte_ranges_to_device_requires_source_indices(
     source_info,
 ) -> None:
-    with pytest.raises(ValueError, match="requires source_indices"):
+    with pytest.raises(ValueError, match="source_indices is required"):
         fetch_byte_ranges_to_device(
             source_info,
             [ByteRangeInfo(0, 16)],
