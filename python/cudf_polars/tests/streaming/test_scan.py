@@ -784,6 +784,49 @@ def test_split_scan_hybrid(
     assert_gpu_result_equal(q, engine=streaming_engine)
 
 
+@pytest.mark.parametrize(
+    "predicate,use_columns",
+    [
+        # uses hybrid scan reader
+        (pl.col("x") < 1_000, None),
+        (pl.col("x") < 1_000, ["x", "z"]),
+        (pl.col("x") < 1_000, ["z"]),
+        (pl.col("x") < 1_000, ["x"]),
+        (pl.col("x") > 1_000, ["z"]),
+        (pl.col("x") > 10_000, None),
+        # falls back to default parquet reader
+        (pl.col("y").str.contains("cat"), None),
+        (None, None),
+    ],
+)
+@pytest.mark.parametrize("pass_mode", list(HybridScanPassMode))
+def test_fused_scan_hybrid(
+    tmp_path: Path,
+    df: pl.DataFrame,
+    predicate: pl.Expr | None,
+    use_columns: list[str] | None,
+    pass_mode: HybridScanPassMode,
+    streaming_engine_factory: Callable[..., StreamingEngine],
+) -> None:
+    streaming_engine = streaming_engine_factory(
+        StreamingOptions(
+            target_partition_size=1_000_000,
+            parquet_options={
+                "use_hybrid_scan": True,
+                "prefetch_file_metadata": True,
+                "pass_mode": pass_mode,
+            },
+        ),
+    )
+    make_partitioned_source(df, tmp_path, "parquet", n_files=4, row_group_size=100)
+    q = pl.scan_parquet(tmp_path)
+    if predicate is not None:
+        q = q.filter(predicate)
+    if use_columns is not None:
+        q = q.select(use_columns)
+    assert_gpu_result_equal(q, engine=streaming_engine)
+
+
 def test_scan_path_mismatch_raises() -> None:
     # This isn't reachable by polars' public API, so we test it directly.
     scan = _make_parquet_scan(
@@ -1109,7 +1152,14 @@ def hive_root(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize("target_partition_size", [1_000, 1_000_000])
-@pytest.mark.parametrize("use_hybrid_scan", [True, False])
+@pytest.mark.parametrize(
+    "use_hybrid_scan,pass_mode",
+    [
+        (False, HybridScanPassMode.TWO_PASS),
+        (True, HybridScanPassMode.TWO_PASS),
+        (True, HybridScanPassMode.SINGLE_PASS),
+    ],
+)
 @pytest.mark.parametrize(
     "query",
     [
@@ -1126,13 +1176,17 @@ def test_hive_partitioned_streaming_scan(
     streaming_engine_factory: Callable[..., StreamingEngine],
     target_partition_size: int,
     query,
+    pass_mode: HybridScanPassMode,
     *,
     use_hybrid_scan: bool,
 ) -> None:
     streaming_engine = streaming_engine_factory(
         StreamingOptions(
             target_partition_size=target_partition_size,
-            parquet_options={"use_hybrid_scan": use_hybrid_scan},
+            parquet_options={
+                "use_hybrid_scan": use_hybrid_scan,
+                "pass_mode": pass_mode,
+            },
         ),
     )
     q = query(pl.scan_parquet(hive_root, hive_partitioning=True))

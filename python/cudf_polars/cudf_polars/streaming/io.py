@@ -251,12 +251,48 @@ def hybrid_scan_eligible(
     )
 
 
+def _empty_hybrid_scan_dataframe(
+    schema: Schema, with_columns: list[str] | None, stream: Stream
+) -> DataFrame:
+    col_names = with_columns if with_columns is not None else list(schema)
+    return DataFrame(
+        [
+            Column(
+                plc.column_factories.make_empty_column(
+                    schema[name].plc_type, stream=stream
+                ),
+                dtype=schema[name],
+                name=name,
+            )
+            for name in col_names
+        ],
+        stream=stream,
+    )
+
+
 def _dataframe_from_hybrid_scan_table(
     tbl_w_meta: plc.io.types.TableWithMetadata, schema: Schema, stream: Stream
 ) -> DataFrame:
     names = tbl_w_meta.column_names(include_children=False)
     return DataFrame.from_table(
         tbl_w_meta.tbl, names, [schema[name] for name in names], stream=stream
+    )
+
+
+def _dataframe_with_source_index_from_hybrid_scan_table(
+    tbl_w_meta: plc.io.types.TableWithMetadata,
+    schema: Schema,
+    stream: Stream,
+    *,
+    prepended_source_index: bool,
+) -> tuple[plc.Column | None, DataFrame]:
+    source_index, table, names = Scan._pop_source_index(
+        tbl_w_meta.tbl,
+        tbl_w_meta.column_names(include_children=False),
+        prepended=prepended_source_index,
+    )
+    return source_index, DataFrame.from_table(
+        table, names, [schema[name] for name in names], stream=stream
     )
 
 
@@ -324,20 +360,7 @@ def _read_with_hybrid_scan(
                     )
 
         if not row_group_indices:
-            col_names = with_columns if with_columns is not None else list(schema)
-            return DataFrame(
-                [
-                    Column(
-                        plc.column_factories.make_empty_column(
-                            schema[name].plc_type, stream=stream
-                        ),
-                        dtype=schema[name],
-                        name=name,
-                    )
-                    for name in col_names
-                ],
-                stream=stream,
-            )
+            return _empty_hybrid_scan_dataframe(schema, with_columns, stream)
 
         if pass_mode is HybridScanPassMode.SINGLE_PASS:
             all_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
@@ -403,6 +426,154 @@ def _read_with_hybrid_scan(
             columns = [*columns, *payload_df.columns]
 
         return DataFrame(columns, stream=stream).select(list(schema.keys()))
+
+
+def _read_with_hybrid_scan_multifile(
+    schema: Schema,
+    with_columns: list[str] | None,
+    plc_filter: plc_expr.Expression,
+    row_group_indices: list[list[int]],
+    stream: Stream,
+    cached_infos: list[CachedParquetInfo],
+    *,
+    stats_pruning: bool = True,
+    pass_mode: HybridScanPassMode = HybridScanPassMode.TWO_PASS,
+    interleave_remote_io: bool = True,
+    prepend_source_index: bool = False,
+) -> tuple[DataFrame, plc.Column | None]:
+    """
+    Parquet read via HybridScanMultiFile for a task of one or more files.
+
+    Returns the dataframe and, if ``prepend_source_index`` is set and any rows
+    were read, the index of the file each row was read from.
+    """
+    with nvtx_annotate_cudf_polars(
+        message="HybridScanMultiFile", payload=len(cached_infos)
+    ):
+        source_info = plc.io.SourceInfo(
+            [plc.io.types.FilepathSource(info.path, info.size) for info in cached_infos]
+        )
+        io_submission_policy = _hybrid_scan_io_submission_policy(
+            (info.path for info in cached_infos),
+            interleave_remote_io=interleave_remote_io,
+        )
+        options = (
+            plc.io.parquet.ParquetReaderOptions.builder(source_info)
+            .decimal_width(plc.TypeId.DECIMAL128)
+            .build()
+        )
+        if with_columns is not None:
+            options.set_column_names(with_columns)
+        options.set_filter(plc_filter)
+        if prepend_source_index:
+            options.enable_prepend_source_index_column(val=True)
+
+        reader = plc.io.experimental.HybridScanMultiFile.from_parquet_metadatas(
+            [info.file_metadata for info in cached_infos], options
+        )
+        row_groups = plc.io.experimental.RowGroupIndices.from_lists(row_group_indices)
+
+        if stats_pruning:
+            row_groups = reader.filter_row_groups_with_stats(
+                row_groups, options, stream=stream
+            )
+
+            if reader.total_rows_in_row_groups(row_groups):
+                bloom_ranges, bloom_sources = reader.bloom_filters_byte_ranges(
+                    row_groups, options
+                )
+                if bloom_ranges:
+                    bloom_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                        source_info,
+                        bloom_ranges,
+                        io_submission_policy,
+                        stream=stream,
+                        source_indices=bloom_sources,
+                    )
+                    row_groups = reader.filter_row_groups_with_bloom_filters(
+                        bloom_chunks, row_groups, options, stream=stream
+                    )
+
+        if not reader.total_rows_in_row_groups(row_groups):
+            return _empty_hybrid_scan_dataframe(schema, with_columns, stream), None
+
+        if pass_mode is HybridScanPassMode.SINGLE_PASS:
+            all_ranges, all_sources = reader.all_column_chunks_byte_ranges(
+                row_groups, options
+            )
+            all_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                source_info,
+                all_ranges,
+                io_submission_policy,
+                stream=stream,
+                source_indices=all_sources,
+            )
+            source_index, df = _dataframe_with_source_index_from_hybrid_scan_table(
+                reader.materialize_all_columns(
+                    row_groups, all_chunks, options, stream=stream
+                ),
+                schema,
+                stream,
+                prepended_source_index=prepend_source_index,
+            )
+            return df.select(list(schema.keys())), source_index
+
+        row_mask = reader.build_all_true_row_mask(row_groups, stream=stream)
+
+        filter_ranges, filter_sources = reader.filter_column_chunks_byte_ranges(
+            row_groups, options
+        )
+        filter_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+            source_info,
+            filter_ranges,
+            io_submission_policy,
+            stream=stream,
+            source_indices=filter_sources,
+        )
+        source_index, filter_df = _dataframe_with_source_index_from_hybrid_scan_table(
+            reader.materialize_filter_columns(
+                row_groups,
+                filter_chunks,
+                row_mask,
+                plc.io.experimental.UseDataPageMask.YES,
+                options,
+                stream=stream,
+            ),
+            schema,
+            stream,
+            prepended_source_index=prepend_source_index,
+        )
+
+        requested_columns = with_columns if with_columns is not None else list(schema)
+        columns = filter_df.columns
+        if set(requested_columns) - filter_df.column_names_set:
+            payload_ranges, payload_sources = reader.payload_column_chunks_byte_ranges(
+                row_groups, options
+            )
+            payload_chunks = plc.io.parquet_io_utils.fetch_byte_ranges_to_device(
+                source_info,
+                payload_ranges,
+                io_submission_policy,
+                stream=stream,
+                source_indices=payload_sources,
+            )
+            payload_df = _dataframe_from_hybrid_scan_table(
+                reader.materialize_payload_columns(
+                    row_groups,
+                    payload_chunks,
+                    row_mask,
+                    plc.io.experimental.UseDataPageMask.YES,
+                    options,
+                    stream=stream,
+                ),
+                schema,
+                stream,
+            )
+            columns = [*columns, *payload_df.columns]
+
+        return DataFrame(columns, stream=stream).select(
+            list(schema.keys())
+        ), source_index
 
 
 class ParquetScanTaskBounds(NamedTuple):
@@ -594,7 +765,7 @@ class ParquetScanTask(ScanTask):
 
         return _prefetch_parquet_footers_for_paths(
             self.paths,
-            parse_hybrid_metadata=True,
+            parse_hybrid_metadata=len(self.paths) == 1,
         )
 
     def _split_task_bounds_from_row_group_counts(
@@ -715,8 +886,7 @@ class ParquetScanTask(ScanTask):
         paths = task.paths
         task_parquet_info = task._get_task_parquet_info_from_cache()
         should_try_hybrid_scan = (
-            len(paths) == 1
-            and base_scan.skip_rows == 0
+            base_scan.skip_rows == 0
             and base_scan.n_rows == -1
             and hybrid_scan_eligible(
                 parquet_options,
@@ -737,7 +907,6 @@ class ParquetScanTask(ScanTask):
         if (
             should_try_hybrid_scan
             and bounds.row_groups is not None
-            and len(bounds.row_groups) == 1
             and task_parquet_info is not None
         ):
             assert base_scan.predicate is not None
@@ -767,27 +936,50 @@ class ParquetScanTask(ScanTask):
                 unreadable_columns=hive_names,
             )
             if plc_filter is not None:
-                df = _read_with_hybrid_scan(
-                    file_schema,
-                    paths,
-                    file_columns,
-                    plc_filter,
-                    bounds.row_groups[0],
-                    stream,
-                    task_parquet_info[0],
-                    split_index=split_index,
-                    total_splits=total_splits,
-                    stats_pruning=parquet_options._hybrid_scan_stats_pruning,
-                    pass_mode=parquet_options.pass_mode,
-                    interleave_remote_io=(
-                        parquet_options.hybrid_scan_interleave_remote_io
-                    ),
-                )
+                source_index = None
+                if len(paths) == 1:
+                    df = _read_with_hybrid_scan(
+                        file_schema,
+                        paths,
+                        file_columns,
+                        plc_filter,
+                        bounds.row_groups[0],
+                        stream,
+                        task_parquet_info[0],
+                        split_index=split_index,
+                        total_splits=total_splits,
+                        stats_pruning=parquet_options._hybrid_scan_stats_pruning,
+                        pass_mode=parquet_options.pass_mode,
+                        interleave_remote_io=(
+                            parquet_options.hybrid_scan_interleave_remote_io
+                        ),
+                    )
+                else:
+                    df, source_index = _read_with_hybrid_scan_multifile(
+                        file_schema,
+                        file_columns,
+                        plc_filter,
+                        bounds.row_groups,
+                        stream,
+                        task_parquet_info,
+                        stats_pruning=parquet_options._hybrid_scan_stats_pruning,
+                        pass_mode=parquet_options.pass_mode,
+                        interleave_remote_io=(
+                            parquet_options.hybrid_scan_interleave_remote_io
+                        ),
+                        prepend_source_index=(
+                            hive_parts is not None and not hive_parts.is_uniform
+                        ),
+                    )
                 if hive_parts is not None:
-                    df = df.with_columns(
-                        hive_parts.broadcast(df.num_rows, stream=stream),
-                        stream=stream,
-                    ).select(list(base_scan.schema))
+                    hive_columns = (
+                        hive_parts.broadcast(df.num_rows, stream=stream)
+                        if source_index is None
+                        else hive_parts.gather(source_index, stream=stream)
+                    )
+                    df = df.with_columns(hive_columns, stream=stream).select(
+                        list(base_scan.schema)
+                    )
                 # TODO: Evaluate conjuncts that only reference hive columns once
                 # per file, skipping the read when they are false.
                 return apply_predicate(
