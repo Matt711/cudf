@@ -6,6 +6,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, cast
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import polars as pl
@@ -892,6 +894,40 @@ def test_fused_scan_hybrid(
         q = q.filter(predicate)
     if use_columns is not None:
         q = q.select(use_columns)
+    assert_gpu_result_equal(q, engine=streaming_engine)
+
+
+@pytest.mark.skipif(
+    int(pa.__version__.split(".", 1)[0]) < 24,
+    reason="pyarrow writes Parquet bloom filters from 24.0",
+)
+@pytest.mark.parametrize("n_files", [1, 3])
+@pytest.mark.parametrize("pass_mode", list(HybridScanPassMode))
+def test_hybrid_scan_bloom_filter(
+    tmp_path: Path,
+    n_files: int,
+    pass_mode: HybridScanPassMode,
+    streaming_engine_factory: Callable[..., StreamingEngine],
+) -> None:
+    streaming_engine = streaming_engine_factory(
+        StreamingOptions(
+            target_partition_size=1_000_000,
+            parquet_options={"use_hybrid_scan": True, "pass_mode": pass_mode},
+        ),
+    )
+    for i in range(n_files):
+        pq.write_table(
+            pa.table(
+                {
+                    "x": range(i * 1_000, (i + 1) * 1_000),
+                    "y": [f"v{j}" for j in range(i * 1_000, (i + 1) * 1_000)],
+                }
+            ),
+            tmp_path / f"part{i}.parquet",
+            row_group_size=250,
+            bloom_filter_options={"y": {"ndv": 1_000, "fpp": 0.0001}},
+        )
+    q = pl.scan_parquet(tmp_path).filter(pl.col("y") == f"v{n_files * 1_000 - 10}")
     assert_gpu_result_equal(q, engine=streaming_engine)
 
 
