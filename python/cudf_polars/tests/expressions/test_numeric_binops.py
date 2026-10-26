@@ -225,8 +225,10 @@ def test_decimal_comparison_mixed_scale_overflow(
     big = "9" * (left_dtype.precision - left_dtype.scale) + "." + "9" * left_dtype.scale
     left = pl.DataFrame({"a": ["-2.5", "1", big, None]}).cast(left_dtype)
     right = pl.DataFrame({"b": ["1", "-1.5", "0.5", "3"]}).cast(right_dtype)
-    q = pl.concat([left, right], how="horizontal").lazy().select(
-        gt=pl.col("a") > pl.col("b"), eq=pl.col("a") == pl.col("b")
+    q = (
+        pl.concat([left, right], how="horizontal")
+        .lazy()
+        .select(gt=pl.col("a") > pl.col("b"), eq=pl.col("a") == pl.col("b"))
     )
     if fallback:
         assert_ir_translation_raises(q, engine, NotImplementedError)

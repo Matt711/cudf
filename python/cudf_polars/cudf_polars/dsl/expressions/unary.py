@@ -105,9 +105,7 @@ class Cast(Expr):
                 result = Column(
                     plc.copying.copy_if_else(
                         result.obj,
-                        plc.Scalar.from_py(
-                            None, self.dtype.plc_type, stream=df.stream
-                        ),
+                        plc.Scalar.from_py(None, self.dtype.plc_type, stream=df.stream),
                         in_range,
                         stream=df.stream,
                     ),

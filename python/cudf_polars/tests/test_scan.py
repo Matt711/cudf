@@ -1180,6 +1180,7 @@ def test_has_nested_narrow_decimal_dtype_class():
     assert not _has_nested_narrow_decimal(pl.List(pl.Decimal))
     assert _has_nested_narrow_decimal(pl.Array(pl.Decimal(5, 1), 2))
 
+
 def test_scan_csv_quote_char_none(engine: pl.GPUEngine, tmp_path):
     (tmp_path / "test.csv").write_text('a,b\n1,"x"\n')
     q = pl.scan_csv(tmp_path / "test.csv", quote_char=None)

@@ -4360,9 +4360,7 @@ class Empty(IR):
     @classmethod
     @log_do_evaluate
     @nvtx_annotate_cudf_polars(message="Empty")
-    def do_evaluate(
-        cls, schema: Schema, *, context: IRExecutionContext
-    ) -> DataFrame:
+    def do_evaluate(cls, schema: Schema, *, context: IRExecutionContext) -> DataFrame:
         """Evaluate and return a dataframe."""
         # libcudf cannot make an empty column of a nested type directly.
         return DataFrame.from_polars(
