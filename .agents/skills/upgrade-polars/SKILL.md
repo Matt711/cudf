@@ -284,8 +284,9 @@ What usually breaks, and the fix:
 - **An xfail you deleted because it XPASSes on the new version** still fails on the old one. Keep it, conditional on the old version:
   `pytest.mark.xfail(POLARS_VERSION_LT_NN, reason=...)`. Strict xfail only fires when the condition is true.
 - **A new xfail for new behaviour** needs `not POLARS_VERSION_LT_NN` in its condition, or it XPASSes (and fails) on the old version.
-- Define the flag next to the others in `cudf_polars/utils/versions.py` (`POLARS_VERSION_LT_NN = POLARS_VERSION < parse("X.Y")`) and delete it
-  when the lower bound passes it. Ruff 0.16 flags that form as a Yoda comparison; the repo's pinned ruff does not, so keep the repo's form.
+- Define the flag next to the others in `cudf_polars/utils/versions.py` and delete it when the lower bound passes it. Write it as
+  `POLARS_VERSION_LT_NN = parse("X.Y") > POLARS_VERSION`: the pinned ruff flags `POLARS_VERSION < parse("X.Y")` as a Yoda condition (SIM300),
+  and pre-commit.ci fails on it (older flags in this file predate that rule).
 - Failures that mention a libcudf feature newer than the nightly in your environment (for example a test from a just-merged C++ change) are
   an environment limit, not a regression. CI builds libcudf from the branch.
 
