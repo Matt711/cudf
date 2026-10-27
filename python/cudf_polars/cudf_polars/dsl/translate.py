@@ -1858,8 +1858,6 @@ def _int128_comparison_operands(
             operands.append((node.value, True))
         else:
             return None
-    if all(is_literal for _, is_literal in operands):
-        return None
     decimal = DataType(pl.Decimal(38, 0))
     result: list[expr.Expr] = []
     for operand, is_literal in operands:
