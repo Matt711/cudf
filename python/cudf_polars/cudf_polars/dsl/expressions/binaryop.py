@@ -150,6 +150,14 @@ class BinOp(Expr):
         right: Column, result: plc.Column, stream: Stream
     ) -> None:
         bool_type = plc.DataType(plc.TypeId.BOOL8)
+
+        def any_true(mask: plc.Column) -> bool:
+            return bool(
+                plc.reduce.reduce(
+                    mask, plc.aggregation.any(), bool_type, stream=stream
+                ).to_py(stream=stream)
+            )
+
         is_zero = plc.binaryop.binary_operation(
             right.obj,
             plc.Scalar.from_py(Decimal(0), right.obj.type(), stream=stream),
@@ -157,20 +165,19 @@ class BinOp(Expr):
             bool_type,
             stream=stream,
         )
-        if is_zero.size() != result.size():
-            is_zero = plc.Column.from_scalar(
-                is_zero.to_scalar(stream=stream), result.size(), stream=stream
+        if right.size == 1:
+            # A scalar divisor: one value decides, so the result is only
+            # looked at when that value is zero.
+            if not any_true(is_zero):
+                return
+            divides_by_zero = plc.unary.is_valid(result, stream=stream)
+        else:
+            divides_by_zero = plc.binaryop.binary_operation(
+                is_zero,
+                plc.unary.is_valid(result, stream=stream),
+                plc.binaryop.BinaryOperator.LOGICAL_AND,
+                bool_type,
+                stream=stream,
             )
-        divides_by_zero = plc.binaryop.binary_operation(
-            is_zero,
-            plc.unary.is_valid(result, stream=stream),
-            plc.binaryop.BinaryOperator.LOGICAL_AND,
-            bool_type,
-            stream=stream,
-        )
-        if bool(
-            plc.reduce.reduce(
-                divides_by_zero, plc.aggregation.any(), bool_type, stream=stream
-            ).to_py(stream=stream)
-        ):
+        if any_true(divides_by_zero):
             raise ComputeError("division by zero Decimal")

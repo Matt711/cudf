@@ -234,6 +234,37 @@ def test_sql_decimal_div_by_zero_literal(engine: pl.GPUEngine):
     assert_decimal_div_by_zero_raises(q, engine)
 
 
+@pytest.mark.parametrize("rows", [1, 3], ids=["one-row", "many-rows"])
+def test_sql_decimal_div_by_zero_literal_row_counts(engine: pl.GPUEngine, rows):
+    df = pl.LazyFrame({"x": [Decimal("1.00")] * rows}, schema={"x": pl.Decimal(15, 2)})
+    q = df.sql("SELECT x / 0.00 AS share FROM self")
+    assert_decimal_div_by_zero_raises(q, engine)
+
+
+def test_sql_decimal_div_by_zero_literal_null_dividends(engine: pl.GPUEngine):
+    df = pl.LazyFrame({"x": [None, None]}, schema={"x": pl.Decimal(15, 2)})
+    q = df.sql("SELECT x / 0.00 AS share FROM self")
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_sql_decimal_div_by_nonzero_literal(engine: pl.GPUEngine):
+    df = pl.LazyFrame(
+        {"x": [Decimal("1.00"), None, Decimal("-3.00")]},
+        schema={"x": pl.Decimal(15, 2)},
+    )
+    q = df.sql("SELECT x / 2.00 AS share FROM self")
+    assert_gpu_result_equal(q, engine=engine)
+
+
+def test_sql_decimal_div_by_zero_single_row_column(engine: pl.GPUEngine):
+    df = pl.LazyFrame(
+        {"x": [Decimal("1.00")], "y": [Decimal("0")]},
+        schema={"x": pl.Decimal(15, 2), "y": pl.Decimal(15, 2)},
+    )
+    q = df.sql("SELECT x / y AS share FROM self")
+    assert_decimal_div_by_zero_raises(q, engine)
+
+
 def test_multiply_with_decimals(engine: pl.GPUEngine):
     df = pl.LazyFrame(
         {
