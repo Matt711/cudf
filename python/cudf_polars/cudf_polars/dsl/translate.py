@@ -807,6 +807,10 @@ def _(node: plrs._ir_nodes.Join, translator: Translator, schema: Schema) -> ir.I
             inp_left,
             inp_right,
         )
+    elif len(how) == 2 and how[1] == "cross_and_filter":
+        return _translate_cross_and_filter(
+            node, translator, schema, inp_left, inp_right, left_on, right_on
+        )
     else:
         how, op1, op2 = node.options[0]
         if how != "IEJoin":
@@ -847,6 +851,50 @@ def _(node: plrs._ir_nodes.Join, translator: Translator, schema: Schema) -> ir.I
         )
 
         return ir.ConditionalJoin(schema, predicate, node.options, inp_left, inp_right)
+
+
+def _translate_cross_and_filter(
+    node: plrs._ir_nodes.Join,
+    translator: Translator,
+    schema: Schema,
+    inp_left: ir.IR,
+    inp_right: ir.IR,
+    left_on: list[expr.NamedExpr],
+    right_on: list[expr.NamedExpr],
+) -> ir.IR:
+    """
+    Translate a join that Polars plans as a nested loop join.
+
+    The join type is ``(<how>, "cross_and_filter")`` and ``node.predicate`` is the
+    condition that is applied to the cross product, for example from
+    ``x NOT IN (SELECT ...)`` in SQL. A cross join followed by a filter is supported;
+    Left and Right joins need outer join semantics and fall back to the CPU, see
+    https://github.com/NVIDIA/cudf/issues/24693.
+    """
+    how, nulls_equal, zlice, suffix, coalesce, maintain_order = node.options
+    if how[0] != "Cross":
+        raise NotImplementedError(f"Unsupported join type {how}")
+    if (
+        zlice is not None
+    ):  # pragma: no cover; polars does not push a slice into this join
+        raise NotImplementedError("Slice in a nested loop join")
+    mask = translate_predicate(
+        translator,
+        n=node.predicate.node,
+        output_name=node.predicate.output_name,
+        schema=schema,
+    )
+    # polars does not put dynamic predicate hints in a join predicate
+    assert mask is not None
+    cross = ir.Join(
+        schema,
+        left_on,
+        right_on,
+        ("Cross", nulls_equal, None, suffix, coalesce, maintain_order),
+        inp_left,
+        inp_right,
+    )
+    return ir.Filter(schema, mask, cross)
 
 
 @_translate_ir.register

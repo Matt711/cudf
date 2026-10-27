@@ -16,6 +16,7 @@ from cudf_polars.containers import DataType
 from cudf_polars.dsl import expr as ir_expr
 from cudf_polars.dsl.ir import ConditionalJoin
 from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.utils.versions import POLARS_VERSION_LT_21
 
 FUSED_PREDICATE_XFAIL = pytest.mark.xfail(
     reason="Polars 2.0 plans an equi join with a residual predicate as a "
@@ -293,7 +294,10 @@ def test_join_maintain_order_with_slice(
         pl.col("foo") == pl.col("bar"),
         pytest.param(
             pl.col("foo") != pl.col("bar"),
-            marks=pytest.mark.xfail(reason="nested loop join"),
+            marks=pytest.mark.xfail(
+                POLARS_VERSION_LT_21,
+                reason="Polars 2.0 plans this as a nested loop join, which its visitor does not expose",
+            ),
         ),
     ],
 )
