@@ -81,6 +81,52 @@ def test_count_above_threshold(engine: pl.GPUEngine):
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
 
 
+@pytest.mark.parametrize("closed", ["both", "left", "right", "none"])
+def test_uint64_signed_is_between(engine: pl.GPUEngine, df, closed):
+    q = df.select(
+        pl.col("u").is_between(pl.col("i8"), pl.col("i"), closed=closed).alias("r")
+    )
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        (0, pl.col("i")),
+        (pl.col("i"), 100),
+        (2**63, pl.col("u")),
+        (pl.col("i8"), 2**63),
+    ],
+    ids=["literal-low", "literal-high", "uint64-literal-low", "uint64-literal-high"],
+)
+def test_uint64_signed_is_between_literal_bound(engine: pl.GPUEngine, df, bounds):
+    low, high = bounds
+    q = df.select(
+        pl.col("u").is_between(low, high).alias("unsigned"),
+        pl.col("i").is_between(low, high).alias("signed"),
+    )
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        (pl.col("i8"), pl.col("i")),
+        (0, pl.col("i")),
+        (pl.col("i"), 100),
+        (2**63, pl.col("u")),
+    ],
+    ids=["columns", "literal-low", "literal-high", "uint64-literal"],
+)
+def test_uint64_signed_is_between_translates(
+    in_memory_engine: pl.GPUEngine, df, bounds
+):
+    q = df.select(pl.col("u").is_between(*bounds).alias("r"))
+    translator = Translator(q._ldf.visit(), in_memory_engine)
+    translator.translate_ir()
+    assert not translator.errors
+
+
 @pytest.mark.parametrize("signed", ["i", "i8"])
 def test_uint64_signed_comparison_translates(
     in_memory_engine: pl.GPUEngine, df, signed
@@ -97,7 +143,6 @@ def test_uint64_signed_comparison_translates(
         pl.col("u") + pl.col("i"),
         pl.col("u").cast(pl.Int128),
         (pl.col("u") + pl.col("i")) > 0,
-        pl.col("u").is_between(pl.col("i"), pl.col("i8")),
         pl.max_horizontal("u", "i"),
         pl.col("i").cast(pl.Float64).cast(pl.Int128) > pl.col("i").cast(pl.Int128),
     ],
@@ -105,7 +150,6 @@ def test_uint64_signed_comparison_translates(
         "arithmetic",
         "cast",
         "arithmetic-in-comparison",
-        "is_between",
         "max_horizontal",
         "float-cast",
     ],

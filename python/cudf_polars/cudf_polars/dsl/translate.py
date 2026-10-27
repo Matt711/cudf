@@ -1249,9 +1249,9 @@ def _translate_function(
         )
     elif isinstance(name, plrs._expr_nodes.BooleanFunction):
         if name == plrs._expr_nodes.BooleanFunction.IsBetween:
-            column, lo, hi = (
-                translator.translate_expr(n=n, schema=schema) for n in node.input
-            )
+            column, lo, hi = _int128_comparison_operands(
+                translator, node.input, schema
+            ) or (translator.translate_expr(n=n, schema=schema) for n in node.input)
             (closed,) = options
             lop, rop = expr.BooleanFunction._BETWEEN_OPS[closed]
             # IsBetween type coercion does not
@@ -1830,40 +1830,52 @@ _NARROW_INTEGER_DTYPES = (
 
 
 def _int128_comparison_operands(
-    translator: Translator, node: plrs._expr_nodes.BinaryExpr, schema: Schema
-) -> tuple[expr.Expr, expr.Expr] | None:
+    translator: Translator, nodes: Sequence[int], schema: Schema
+) -> list[expr.Expr] | None:
     """
-    Translate the operands of ``cast(a, Int128) <cmp> cast(b, Int128)``.
+    Translate the operands of a comparison that polars widened to Int128.
 
     Polars has no 64-bit type that holds both a UInt64 and an Int64 value, so
     when it compares them (for example a ``pl.len()`` count from the 64-bit
-    runtime with an Int64 column) it casts both sides to Int128. libcudf has no
-    128-bit integer type, but Decimal(38, 0) holds every such value exactly, so
-    compare the two sides as that. Int128 is not otherwise supported, so this
-    only recognizes a comparison whose operands are casts of integers, and
+    runtime with an Int64 column) it casts every operand to Int128. libcudf has
+    no 128-bit integer type, but Decimal(38, 0) holds every such value exactly,
+    so compare the operands as that. Int128 is not otherwise supported, so this
+    only recognizes casts of integers, and integer literals next to them, and
     returns None for anything else.
     """
     visitor = translator.visitor
-    inputs = []
-    for child in (node.left, node.right):
-        cast = visitor.view_expression(child)
-        if not (
-            isinstance(cast, plrs._expr_nodes.Cast)
-            and isinstance(visitor.get_dtype(child), pl.Int128)
-            and isinstance(visitor.get_dtype(cast.expr), _NARROW_INTEGER_DTYPES)
-        ):
+    # (the input expression node, or the value of a literal), and whether it is a literal
+    operands: list[tuple[int, bool]] = []
+    for n in nodes:
+        node = visitor.view_expression(n)
+        if not isinstance(visitor.get_dtype(n), pl.Int128):
             return None
-        inputs.append(cast.expr)
+        if isinstance(node, plrs._expr_nodes.Cast) and isinstance(
+            visitor.get_dtype(node.expr), _NARROW_INTEGER_DTYPES
+        ):
+            operands.append((node.expr, False))
+        elif isinstance(node, plrs._expr_nodes.Literal) and type(node.value) is int:
+            operands.append((node.value, True))
+        else:
+            return None
+    if all(is_literal for _, is_literal in operands):
+        return None
     decimal = DataType(pl.Decimal(38, 0))
-    left, right = (
-        expr.Cast(
-            decimal,
-            True,  # noqa: FBT003
-            translator.translate_expr(n=n, schema=schema),
-        )
-        for n in inputs
-    )
-    return left, right
+    result: list[expr.Expr] = []
+    for operand, is_literal in operands:
+        if is_literal:
+            # polars drops literals outside the 64-bit range from a comparison
+            if -(2**63) <= operand < 2**63:
+                literal_dtype = DataType(pl.Int64())
+            elif 0 <= operand < 2**64:
+                literal_dtype = DataType(pl.UInt64())
+            else:  # pragma: no cover; polars simplifies these away
+                raise NotImplementedError(f"Int128 literal {operand}")
+            translated: expr.Expr = expr.Literal(literal_dtype, operand)
+        else:
+            translated = translator.translate_expr(n=operand, schema=schema)
+        result.append(expr.Cast(decimal, True, translated))  # noqa: FBT003
+    return result
 
 
 @_translate_expr.register
@@ -1874,7 +1886,9 @@ def _(
     schema: Schema,
 ) -> expr.Expr:
     if node.op in _INT128_COMPARISON_OPS and (
-        operands := _int128_comparison_operands(translator, node, schema)
+        operands := _int128_comparison_operands(
+            translator, (node.left, node.right), schema
+        )
     ):
         return expr.BinOp(dtype, expr.BinOp._MAPPING[node.op], *operands)
     left = translator.translate_expr(n=node.left, schema=schema)
