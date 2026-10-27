@@ -1424,6 +1424,9 @@ def _translate_function(
         if name == "decimal_div":
             # libcudf division yields scale s1 - s2 and truncates, so divide
             # with one extra digit of scale and then round to the output scale.
+            # TODO: Replace with a libcudf decimal division that takes an output
+            # scale and rounds half to even:
+            # https://github.com/NVIDIA/cudf/issues/24774
             left, right = children
             out_type = dtype.polars_type
             right_type = right.dtype.polars_type
