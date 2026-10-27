@@ -810,11 +810,18 @@ def _(node: plrs._ir_nodes.Join, translator: Translator, schema: Schema) -> ir.I
             inp_left,
             inp_right,
         )
+    elif len(how) == 2 and how[1] == "cross_and_filter":
+        return _translate_cross_and_filter(
+            node, translator, schema, inp_left, inp_right, left_on, right_on
+        )
+    elif len(how) == 2 and how[1] == "fused_predicate":
+        return _translate_fused_predicate(
+            node, translator, schema, inp_left, inp_right, left_on, right_on
+        )
     else:
-        if node.options[0][0] != "IEJoin":
-            # e.g. ("Left", "cross_and_filter") for join_where(how="left")
-            raise NotImplementedError(f"Unsupported join type {node.options[0]}")
-        _, op1, op2 = node.options[0]
+        if how[0] != "IEJoin":  # pragma: no cover; asof joins not yet exposed
+            raise NotImplementedError(f"Unsupported join type {how}")
+        _, op1, op2 = how
         if op2 is None:
             ops = [op1]
         else:
@@ -849,6 +856,44 @@ def _(node: plrs._ir_nodes.Join, translator: Translator, schema: Schema) -> ir.I
         )
 
         return ir.ConditionalJoin(schema, predicate, node.options, inp_left, inp_right)
+
+
+def _translate_cross_and_filter(
+    node: plrs._ir_nodes.Join,
+    translator: Translator,
+    schema: Schema,
+    inp_left: ir.IR,
+    inp_right: ir.IR,
+    left_on: list[expr.NamedExpr],
+    right_on: list[expr.NamedExpr],
+) -> ir.IR:
+    """
+    Translate a join that Polars plans as a nested loop join.
+
+    The join type is ``(<how>, "cross_and_filter")`` and ``node.predicate`` is the
+    condition that is applied to the cross product, for example from
+    ``x NOT IN (SELECT ...)`` in SQL. Not supported yet, so it falls back to the CPU.
+    """
+    raise NotImplementedError(f"Unsupported join type {node.options[0]}")
+
+
+def _translate_fused_predicate(
+    node: plrs._ir_nodes.Join,
+    translator: Translator,
+    schema: Schema,
+    inp_left: ir.IR,
+    inp_right: ir.IR,
+    left_on: list[expr.NamedExpr],
+    right_on: list[expr.NamedExpr],
+) -> ir.IR:
+    """
+    Translate an equi join that Polars plans with an extra, fused predicate.
+
+    The join type is ``(<how>, "fused_predicate")``, ``left_on`` and ``right_on`` are
+    the equality keys and ``node.predicate`` is the extra condition. Not supported
+    yet, so it falls back to the CPU.
+    """
+    raise NotImplementedError(f"Unsupported join type {node.options[0]}")
 
 
 @_translate_ir.register
