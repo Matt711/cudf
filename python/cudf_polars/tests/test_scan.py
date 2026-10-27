@@ -1211,6 +1211,17 @@ def test_scan_csv_extra_columns_ignore(engine: pl.GPUEngine, tmp_path):
     assert_gpu_result_equal(q, engine=engine)
 
 
+def test_scan_csv_extra_columns_ignore_file_paths(engine: pl.GPUEngine, tmp_path):
+    (tmp_path / "test.csv").write_text("a,b,c\n1,2,3\n4,5,6\n")
+    q = pl.scan_csv(
+        tmp_path / "test.csv",
+        schema={"a": pl.Int64, "b": pl.Int64},
+        extra_columns="ignore",
+        include_file_paths="path",
+    )
+    assert_gpu_result_equal(q, engine=engine)
+
+
 def test_scan_csv_no_columns_projected(engine: pl.GPUEngine, tmp_path):
     (tmp_path / "test.csv").write_text("a,b\n1,2\n3,4\n5,6\n")
     q = pl.scan_csv(tmp_path / "test.csv").select(pl.lit(7).filter(pl.lit(value=True)))

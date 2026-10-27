@@ -1204,9 +1204,10 @@ class Scan(IR):
             if usecols is None and reader_options.get("extra_columns") == "ignore":
                 # Files may have columns beyond the schema (extra_columns="ignore");
                 # read only the schema's columns so the pieces concatenate.
-                usecols = [
-                    name for name in schema if row_index is None or name != row_index[0]
-                ]
+                generated = {include_file_paths}
+                if row_index is not None:
+                    generated.add(row_index[0])
+                usecols = [name for name in schema if name not in generated]
             has_header = reader_options["has_header"]
             header = 0 if has_header else -1
 
