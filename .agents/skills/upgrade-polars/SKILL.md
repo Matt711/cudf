@@ -132,6 +132,10 @@ APIs, new IR nodes or `Function`/`BooleanFunction`/`StringFunction`/`StructFunct
 changed dtype semantics, and new deprecation warnings (the test suite runs with
 `filterwarnings = error`). Keep the list; it drives steps 3 to 5.
 
+Also read the Polars upgrade guide (https://docs.pola.rs/releases/upgrade/), which lists the breaking changes and
+deprecations for each release. Check each item against cudf-polars; behaviour changes that the GitHub release notes only mention
+briefly are often described properly there.
+
 Beyond release notes, the most reliable signals are the tests themselves: `test_from_polars_all_names` for enum drift, and
 the diffs of `crates/polars-python/src/lazyframe/visit.rs` and `py-polars/src/polars/_plr.pyi` between the two tags (in the clone) for IR changes.
 
