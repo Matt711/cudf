@@ -1805,6 +1805,67 @@ def _(
     )
 
 
+_INT128_COMPARISON_OPS = frozenset(
+    {
+        plrs._expr_nodes.Operator.Eq,
+        plrs._expr_nodes.Operator.EqValidity,
+        plrs._expr_nodes.Operator.NotEq,
+        plrs._expr_nodes.Operator.NotEqValidity,
+        plrs._expr_nodes.Operator.Lt,
+        plrs._expr_nodes.Operator.LtEq,
+        plrs._expr_nodes.Operator.Gt,
+        plrs._expr_nodes.Operator.GtEq,
+    }
+)
+_NARROW_INTEGER_DTYPES = (
+    pl.Int8,
+    pl.Int16,
+    pl.Int32,
+    pl.Int64,
+    pl.UInt8,
+    pl.UInt16,
+    pl.UInt32,
+    pl.UInt64,
+)
+
+
+def _int128_comparison_operands(
+    translator: Translator, node: plrs._expr_nodes.BinaryExpr, schema: Schema
+) -> tuple[expr.Expr, expr.Expr] | None:
+    """
+    Translate the operands of ``cast(a, Int128) <cmp> cast(b, Int128)``.
+
+    Polars has no 64-bit type that holds both a UInt64 and an Int64 value, so
+    when it compares them (for example a ``pl.len()`` count from the 64-bit
+    runtime with an Int64 column) it casts both sides to Int128. libcudf has no
+    128-bit integer type, but Decimal(38, 0) holds every such value exactly, so
+    compare the two sides as that. Int128 is not otherwise supported, so this
+    only recognizes a comparison whose operands are casts of integers, and
+    returns None for anything else.
+    """
+    visitor = translator.visitor
+    inputs = []
+    for child in (node.left, node.right):
+        cast = visitor.view_expression(child)
+        if not (
+            isinstance(cast, plrs._expr_nodes.Cast)
+            and isinstance(visitor.get_dtype(child), pl.Int128)
+            and isinstance(visitor.get_dtype(cast.expr), _NARROW_INTEGER_DTYPES)
+        ):
+            return None
+        inputs.append(cast.expr)
+    decimal = DataType(pl.Decimal(38, 0))
+    left, right = (
+        expr.Cast(
+            decimal,
+            True,  # noqa: FBT003
+            translator.translate_expr(n=n, schema=schema),
+        )
+        for n in inputs
+    )
+    return left, right
+
+
 @_translate_expr.register
 def _(
     node: plrs._expr_nodes.BinaryExpr,
@@ -1812,6 +1873,10 @@ def _(
     dtype: DataType,
     schema: Schema,
 ) -> expr.Expr:
+    if node.op in _INT128_COMPARISON_OPS and (
+        operands := _int128_comparison_operands(translator, node, schema)
+    ):
+        return expr.BinOp(dtype, expr.BinOp._MAPPING[node.op], *operands)
     left = translator.translate_expr(n=node.left, schema=schema)
     right = translator.translate_expr(n=node.right, schema=schema)
     if isinstance(left.dtype.polars_type, pl.Array) or isinstance(
