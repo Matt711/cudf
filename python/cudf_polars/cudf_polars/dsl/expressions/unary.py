@@ -406,24 +406,31 @@ class UnaryFunction(Expr):
                     "top_k_by only supports a single by expression"
                 )
             self.options = (tuple(self.options[0]),)
+        if self.name in {"top_k", "top_k_by"} and isinstance(children[1], Literal):
+            self._validate_top_k(children[1].value)
 
     @staticmethod
-    def _top_k_count(k_expr: Expr, df: DataFrame, context: ExecutionContext) -> int:
-        """Evaluate and validate the ``k`` argument of ``top_k``/``top_k_by``."""
-        if isinstance(k_expr, Literal):
-            k = k_expr.value
-        else:
-            k_col = k_expr.evaluate(df, context=context)
-            if k_col.size != 1:
-                raise ComputeError(
-                    f"got {k_col.size} values for 'k' in top_k, expected exactly one"
-                )
-            k = k_col.obj_scalar(stream=df.stream).to_py(stream=df.stream)
+    def _validate_top_k(k: object) -> int:
+        """Validate the ``k`` argument of ``top_k``/``top_k_by``."""
         # Mirror polars: any numeric is truncated to an integer; null, NaN
         # and negative values are errors.
         if k is None or not isinstance(k, (int, float)) or math.isnan(k) or k < 0:
             raise ComputeError(f"invalid value of 'k' in top_k: {k!r}")
         return int(k)
+
+    @staticmethod
+    def _top_k_count(k_expr: Expr, df: DataFrame, context: ExecutionContext) -> int:
+        """Evaluate and validate the ``k`` argument of ``top_k``/``top_k_by``."""
+        if isinstance(k_expr, Literal):
+            return UnaryFunction._validate_top_k(k_expr.value)
+        k_col = k_expr.evaluate(df, context=context)
+        if k_col.size != 1:
+            raise ComputeError(
+                f"got {k_col.size} values for 'k' in top_k, expected exactly one"
+            )
+        return UnaryFunction._validate_top_k(
+            k_col.obj_scalar(stream=df.stream).to_py(stream=df.stream)
+        )
 
     @staticmethod
     def _bound_clip_operand(
