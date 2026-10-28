@@ -54,9 +54,6 @@ Ground rules:
   (`CUDA_VISIBLE_DEVICES`) and keep concurrent jobs on different GPUs. The streaming engine (and the xdist plugin runs) abort with
   `No GPUs found on current NUMA node N` when the process runs on CPUs of the other NUMA node. Find the GPU's node with
   `nvidia-smi topo -m` and pin: `numactl --cpunodebind=<node> --membind=<node> python -m pytest ...`. The `in-memory` engine is unaffected.
-- A kvikio `FutureWarning` ("remote_io_reactor_dispatch is deprecated") can turn into an error under `filterwarnings = error` when
-  the environment's kvikio is newer than the repo expects. Pass `-W "ignore:remote_io_reactor_dispatch:FutureWarning"` locally and
-  say so; do not edit the repo for it unless CI shows it.
 - `pytest-cov` can under-report: lines such as `raise NotImplementedError(...)` that a test provably executes may show as missed in a
   full run. Before adding a pragma or a test, confirm a line is really unreachable by tracing it:
   run the query under `sys.settrace` (or with `pytest <that test file> --cov`) and see whether the line executes. Only lines that are
