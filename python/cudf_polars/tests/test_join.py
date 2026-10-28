@@ -22,8 +22,11 @@ FUSED_PREDICATE_XFAIL = pytest.mark.xfail(
     reason="Polars 2.0 plans an equi join with a residual predicate as a "
     "'fused predicate' join, which its visitor does not expose"
 )
+
+
 MISMATCHED_DECIMAL_SCALE_XFAIL = pytest.mark.xfail(
-    reason="Polars 2.0 cannot join decimals with different scales on CPU"
+    POLARS_VERSION_LT_21,
+    reason="Polars 2.0 cannot join decimals with different scales on CPU",
 )
 
 
@@ -380,7 +383,7 @@ def test_cross_join_filter_decimal_float_finer_than_scale(
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
 
 
-@FUSED_PREDICATE_XFAIL
+@MISMATCHED_DECIMAL_SCALE_XFAIL
 @pytest.mark.skip_on_streaming_engine(
     "ConditionalJoin not supported for multiple partitions"
 )
