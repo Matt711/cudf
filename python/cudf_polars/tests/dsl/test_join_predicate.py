@@ -57,6 +57,11 @@ def split(node: expr.Expr) -> JoinPredicate:
     )
 
 
+def reference(node: expr.Expr) -> tuple[plc.expressions.TableReference, int]:
+    assert isinstance(node, expr.ColRef)
+    return node.table_ref, node.index
+
+
 def test_comparison_of_columns_needs_no_extra_columns() -> None:
     node = expr.BinOp(
         BOOL,
@@ -68,8 +73,8 @@ def test_comparison_of_columns_needs_no_extra_columns() -> None:
     assert predicate.left_exprs == ()
     assert predicate.right_exprs == ()
     left, right = predicate.predicate.children
-    assert (left.table_ref, left.index) == (LEFT, 1)
-    assert (right.table_ref, right.index) == (RIGHT, 1)
+    assert reference(left) == (LEFT, 1)
+    assert reference(right) == (RIGHT, 1)
 
 
 def test_expressions_of_one_input_become_extra_columns() -> None:
@@ -90,8 +95,8 @@ def test_expressions_of_one_input_become_extra_columns() -> None:
     assert right_named.value == b_plus_one
     left, right = predicate.predicate.children[0].children
     # Extra columns come after the input's own columns.
-    assert (left.table_ref, left.index) == (LEFT, 2)
-    assert (right.table_ref, right.index) == (RIGHT, 2)
+    assert reference(left) == (LEFT, 2)
+    assert reference(right) == (RIGHT, 2)
 
 
 def test_expression_is_renamed_to_the_input_column() -> None:
