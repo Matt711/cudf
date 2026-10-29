@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from functools import partial, reduce, singledispatch
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
 import polars as pl
 
@@ -19,7 +19,7 @@ from cudf_polars.dsl.traversal import CachingVisitor, reuse_if_unchanged, traver
 from cudf_polars.typing import GenericTransformer
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from rmm.pylibrmm.stream import Stream
 
@@ -112,9 +112,32 @@ class ExprTransformerState(TypedDict):
     table_ref: plc.expressions.TableReference
 
 
+class JoinPredicateState(TypedDict):
+    """
+    State used for splitting the extra condition of a join.
+
+    Parameters
+    ----------
+    columns
+        For each output column of the join, the table it comes from and its
+        name there.
+    indices
+        For each table, the index of each of its columns.
+    extras
+        For each table, the expressions to append to it and their names.
+    """
+
+    columns: Mapping[str, tuple[plc_expr.TableReference, str]]
+    indices: Mapping[plc_expr.TableReference, Mapping[str, int]]
+    extras: Mapping[plc_expr.TableReference, dict[expr.Expr, str]]
+
+
 type Transformer = GenericTransformer[expr.Expr, plc_expr.Expression, ASTState]
 type ExprTransformer = GenericTransformer[expr.Expr, expr.Expr, ExprTransformerState]
 """Protocol for transformation of Expr nodes."""
+type JoinPredicateTransformer = GenericTransformer[
+    expr.Expr, expr.Expr, JoinPredicateState
+]
 
 
 @singledispatch
@@ -441,3 +464,118 @@ def insert_colrefs(
         state={"name_to_index": name_to_index, "table_ref": table_ref},
     )
     return mapper(node)
+
+
+class JoinPredicate(NamedTuple):
+    """
+    An extra condition of an equi join, split for libcudf's mixed join.
+
+    Parts of the condition that use columns of one input only are evaluated
+    on that input before the join. Only the remaining comparison between the
+    inputs is left to the AST.
+    """
+
+    predicate: expr.Expr
+    """Expression with column references into the left and right tables."""
+    left_exprs: tuple[expr.NamedExpr, ...]
+    """Columns appended to the left table, evaluated on the left input."""
+    right_exprs: tuple[expr.NamedExpr, ...]
+    """Columns appended to the right table, evaluated on the right input."""
+
+
+def _split_join_predicate(node: expr.Expr, rec: JoinPredicateTransformer) -> expr.Expr:
+    state = rec.state
+    if isinstance(node, expr.Col):
+        table_ref, name = state["columns"][node.name]
+        return expr.ColRef(
+            node.dtype,
+            state["indices"][table_ref][name],
+            table_ref,
+            expr.Col(node.dtype, name),
+        )
+    sides = {
+        state["columns"][col.name][0]
+        for col in traversal([node])
+        if isinstance(col, expr.Col)
+    }
+    if len(sides) == 1:
+        (table_ref,) = sides
+        if not node.all_pointwise():
+            raise NotImplementedError("Join predicate with a non-pointwise expression")
+        local = _rename_to_input(node, state["columns"])
+        extras = state["extras"][table_ref]
+        if local not in extras:
+            extras[local] = f"__join_predicate_{len(extras)}"
+        name = extras[local]
+        index = len(state["indices"][table_ref]) + list(extras).index(local)
+        return expr.ColRef(node.dtype, index, table_ref, expr.Col(node.dtype, name))
+    return reuse_if_unchanged(node, rec)
+
+
+def _rename_col(node: expr.Expr, rec: JoinPredicateTransformer) -> expr.Expr:
+    if isinstance(node, expr.Col):
+        return expr.Col(node.dtype, rec.state["columns"][node.name][1])
+    return reuse_if_unchanged(node, rec)
+
+
+def _rename_to_input(
+    node: expr.Expr,
+    columns: Mapping[str, tuple[plc_expr.TableReference, str]],
+) -> expr.Expr:
+    mapper: JoinPredicateTransformer = CachingVisitor(
+        _rename_col, state={"columns": columns, "indices": {}, "extras": {}}
+    )
+    return mapper(node)
+
+
+def split_join_predicate(
+    node: expr.Expr,
+    *,
+    columns: Mapping[str, tuple[plc_expr.TableReference, str]],
+    left_names: Sequence[str],
+    right_names: Sequence[str],
+) -> JoinPredicate:
+    """
+    Split an equi join's extra condition for libcudf's mixed join.
+
+    Parameters
+    ----------
+    node
+        Condition over the columns of the join's output.
+    columns
+        For each output column, the table it comes from and its name there.
+    left_names, right_names
+        Column names of the left and right inputs.
+
+    Returns
+    -------
+    The condition with column references inserted, and the columns to add
+    to each input so that every comparison in the condition is between
+    columns of the two inputs.
+
+    Raises
+    ------
+    NotImplementedError
+        If a part of the condition that uses one input cannot be evaluated
+        on that input.
+    """
+    left = plc_expr.TableReference.LEFT
+    right = plc_expr.TableReference.RIGHT
+    extras: dict[plc_expr.TableReference, dict[expr.Expr, str]] = {left: {}, right: {}}
+    mapper: JoinPredicateTransformer = CachingVisitor(
+        _split_join_predicate,
+        state={
+            "columns": columns,
+            "indices": {
+                left: {name: i for i, name in enumerate(left_names)},
+                right: {name: i for i, name in enumerate(right_names)},
+            },
+            "extras": extras,
+        },
+    )
+    predicate = mapper(node)
+    return JoinPredicate(
+        predicate,
+        tuple(expr.NamedExpr(name, e) for e, name in extras[left].items()),
+        tuple(expr.NamedExpr(name, e) for e, name in extras[right].items()),
+    )

@@ -111,6 +111,7 @@ def test_inner_join_binds_left_right_and_suffixed_columns() -> None:
         (named_col("key", "key"),),
         (named_col("key", "key"),),
         ("Inner", False, (0, 1), "_right", False, "none"),
+        None,
         left,
         right,
     )
@@ -131,6 +132,7 @@ def test_inner_join_omits_coalesced_right_key() -> None:
         (named_col("key", "key"),),
         (named_col("key", "key"),),
         ("Inner", False, None, "_right", True, "none"),
+        None,
         left,
         right,
     )
@@ -150,6 +152,7 @@ def test_semi_join_binds_only_left_columns() -> None:
         (named_col("key", "key"),),
         (named_col("key", "key"),),
         ("Semi", False, None, "_right", False, "none"),
+        None,
         left,
         right,
     )
@@ -168,6 +171,7 @@ def test_outer_join_has_no_column_domain_bindings() -> None:
         (named_col("key", "key"),),
         (named_col("other", "other"),),
         ("Left", False, None, "_right", False, "none"),
+        None,
         left,
         right,
     )

@@ -25,7 +25,7 @@ from cudf_polars.containers import DataType
 from cudf_polars.containers.datatype import _contains_dtype
 from cudf_polars.dsl import expr, ir
 from cudf_polars.dsl.expressions.base import ExecutionContext
-from cudf_polars.dsl.to_ast import insert_colrefs
+from cudf_polars.dsl.to_ast import insert_colrefs, split_join_predicate
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.dsl.utils.aggregations import decompose_single_agg
 from cudf_polars.dsl.utils.groupby import rewrite_groupby
@@ -807,6 +807,7 @@ def _(node: plrs._ir_nodes.Join, translator: Translator, schema: Schema) -> ir.I
             left_on,
             right_on,
             node.options,
+            None,
             inp_left,
             inp_right,
         )
@@ -891,7 +892,8 @@ def _translate_fused_predicate(
 
     The join type is ``(<how>, "fused_predicate")``, ``left_on`` and ``right_on`` are
     the equality keys and ``node.predicate`` is the extra condition. For an inner
-    join this is an equi join followed by a filter.
+    join the predicate is evaluated while matching rows, so rows it rejects are
+    never materialized.
     """
     how, nulls_equal, zlice, suffix, coalesce, maintain_order = node.options
     if (
@@ -910,15 +912,34 @@ def _translate_fused_predicate(
     )
     # polars does not put dynamic predicate hints in a join predicate
     assert mask is not None
-    join = ir.Join(
+    # The predicate is over the output schema, so find which input each
+    # column comes from. A right column that clashes with a left column
+    # is suffixed in the output.
+    columns: dict[str, tuple[plc.expressions.TableReference, str]] = {
+        (f"{name}{suffix}" if name in inp_left.schema else name): (
+            plc.expressions.TableReference.RIGHT,
+            name,
+        )
+        for name in inp_right.schema
+    }
+    columns |= {
+        name: (plc.expressions.TableReference.LEFT, name) for name in inp_left.schema
+    }
+    predicate = split_join_predicate(
+        mask.value,
+        columns=columns,
+        left_names=list(inp_left.schema),
+        right_names=list(inp_right.schema),
+    )
+    return ir.Join(
         schema,
         left_on,
         right_on,
         ("Inner", nulls_equal, None, suffix, coalesce, maintain_order),
+        predicate,
         inp_left,
         inp_right,
     )
-    return ir.Filter(schema, mask, join)
 
 
 @_translate_ir.register
