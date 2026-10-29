@@ -16,10 +16,12 @@ from pylibcudf import expressions as plc_expr
 from cudf_polars.containers import DataType
 from cudf_polars.dsl import expr
 from cudf_polars.dsl.traversal import CachingVisitor, reuse_if_unchanged, traversal
+from cudf_polars.dsl.utils.naming import unique_names
+from cudf_polars.dsl.utils.replace import replace
 from cudf_polars.typing import GenericTransformer
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Generator, Mapping, Sequence
 
     from rmm.pylibrmm.stream import Stream
 
@@ -123,12 +125,15 @@ class JoinPredicateState(TypedDict):
         name there.
     indices
         For each table, the index of each of its columns.
+    names
+        For each table, a generator of names for columns to append to it.
     extras
         For each table, the expressions to append to it and their names.
     """
 
     columns: Mapping[str, tuple[plc_expr.TableReference, str]]
     indices: Mapping[plc_expr.TableReference, Mapping[str, int]]
+    names: Mapping[plc_expr.TableReference, Generator[str, None, None]]
     extras: Mapping[plc_expr.TableReference, dict[expr.Expr, str]]
 
 
@@ -502,30 +507,20 @@ def _split_join_predicate(node: expr.Expr, rec: JoinPredicateTransformer) -> exp
         (table_ref,) = sides
         if not node.all_pointwise():
             raise NotImplementedError("Join predicate with a non-pointwise expression")
-        local = _rename_to_input(node, state["columns"])
+        renames: dict[expr.Expr, expr.Expr] = {
+            col: expr.Col(col.dtype, state["columns"][col.name][1])
+            for col in traversal([node])
+            if isinstance(col, expr.Col)
+        }
+        (local,) = replace([node], renames)
         extras = state["extras"][table_ref]
         if local not in extras:
-            extras[local] = f"__join_predicate_{len(extras)}"
-        name = extras[local]
+            extras[local] = next(state["names"][table_ref])
         index = len(state["indices"][table_ref]) + list(extras).index(local)
-        return expr.ColRef(node.dtype, index, table_ref, expr.Col(node.dtype, name))
+        return expr.ColRef(
+            node.dtype, index, table_ref, expr.Col(node.dtype, extras[local])
+        )
     return reuse_if_unchanged(node, rec)
-
-
-def _rename_col(node: expr.Expr, rec: JoinPredicateTransformer) -> expr.Expr:
-    if isinstance(node, expr.Col):
-        return expr.Col(node.dtype, rec.state["columns"][node.name][1])
-    return reuse_if_unchanged(node, rec)
-
-
-def _rename_to_input(
-    node: expr.Expr,
-    columns: Mapping[str, tuple[plc_expr.TableReference, str]],
-) -> expr.Expr:
-    mapper: JoinPredicateTransformer = CachingVisitor(
-        _rename_col, state={"columns": columns, "indices": {}, "extras": {}}
-    )
-    return mapper(node)
 
 
 def split_join_predicate(
@@ -570,6 +565,7 @@ def split_join_predicate(
                 left: {name: i for i, name in enumerate(left_names)},
                 right: {name: i for i, name in enumerate(right_names)},
             },
+            "names": {left: unique_names(left_names), right: unique_names(right_names)},
             "extras": extras,
         },
     )

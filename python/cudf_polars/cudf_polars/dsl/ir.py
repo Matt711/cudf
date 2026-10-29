@@ -48,11 +48,7 @@ from cudf_polars.containers.datatype import _contains_dtype
 from cudf_polars.dsl.expressions import rolling
 from cudf_polars.dsl.expressions.base import ExecutionContext
 from cudf_polars.dsl.nodebase import Node
-from cudf_polars.dsl.to_ast import (
-    _DECIMAL_IDS,
-    to_ast,
-    to_parquet_filter,
-)
+from cudf_polars.dsl.to_ast import _DECIMAL_IDS, to_ast, to_parquet_filter
 from cudf_polars.dsl.tracing import log_do_evaluate, nvtx_annotate_cudf_polars
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.dsl.utils.naming import unique_names
@@ -85,9 +81,7 @@ if TYPE_CHECKING:
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.containers.dataframe import NamedColumn
-    from cudf_polars.dsl.to_ast import (
-        JoinPredicate,
-    )
+    from cudf_polars.dsl.to_ast import JoinPredicate
     from cudf_polars.dsl.utils.io import CachedParquetInfo
     from cudf_polars.quent._context import (
         ActorBoundQuentIRExecutionState,
