@@ -3545,6 +3545,17 @@ class Join(IR):
                 ),
                 stream=right.stream,
             )
+            if predicate_args is not None:
+                predicate_wrapper, left_exprs, right_exprs = predicate_args
+                left_casts, right_casts = _collect_decimal_binop_casts(
+                    predicate_wrapper.predicate
+                )
+                left_conditional = _apply_casts(
+                    Join._with_columns(left, left_exprs), left_casts
+                )
+                right_conditional = _apply_casts(
+                    Join._with_columns(right, right_exprs), right_casts
+                )
             with context.stream_ordered_after(left, right) as stream:
                 null_equality = (
                     plc.types.NullEquality.EQUAL
@@ -3572,19 +3583,11 @@ class Join(IR):
                             left_on.table, right_on.table, null_equality, stream=stream
                         )
                     else:
-                        predicate_wrapper, left_exprs, right_exprs = predicate_args
-                        left_casts, right_casts = _collect_decimal_binop_casts(
-                            predicate_wrapper.predicate
-                        )
                         lg, rg = plc.join.mixed_inner_join(
                             left_on.table,
                             right_on.table,
-                            _apply_casts(
-                                Join._with_columns(left, left_exprs), left_casts
-                            ).table,
-                            _apply_casts(
-                                Join._with_columns(right, right_exprs), right_casts
-                            ).table,
+                            left_conditional.table,
+                            right_conditional.table,
                             predicate_wrapper.ast,
                             null_equality,
                             stream=stream,
