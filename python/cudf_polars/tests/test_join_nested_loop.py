@@ -79,3 +79,19 @@ def test_cross_join_filter_maintain_order(engine: pl.GPUEngine, maintain_order):
         (pl.col("x") + pl.col("y")) % 2 == 0
     )
     assert_gpu_result_equal(q, engine=engine, check_row_order=maintain_order != "none")
+
+
+@pytest.mark.parametrize("maintain_order", ["none", "left", "right_left"])
+@pytest.mark.parametrize("empty", ["left", "right"])
+def test_cross_join_filter_maintain_order_empty(
+    engine: pl.GPUEngine, maintain_order, empty
+):
+    schema = {"x": pl.Int64}
+    left = pl.LazyFrame({"x": [] if empty == "left" else [0, 1, 2]}, schema=schema)
+    right = pl.LazyFrame(
+        {"y": [] if empty == "right" else [0, 1, 2]}, schema={"y": pl.Int64}
+    )
+    q = left.join(right, how="cross", maintain_order=maintain_order).filter(
+        pl.col("x") != pl.col("y")
+    )
+    assert_gpu_result_equal(q, engine=engine, check_row_order=maintain_order != "none")

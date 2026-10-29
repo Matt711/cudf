@@ -887,9 +887,8 @@ def _translate_cross_and_filter(
     how, nulls_equal, zlice, suffix, coalesce, maintain_order = node.options
     if how[0] != "Cross":
         raise NotImplementedError(f"Unsupported join type {how}")
-    if (
-        zlice is not None
-    ):  # pragma: no cover; polars does not push a slice into this join
+    if zlice is not None:  # pragma: no cover
+        # polars does not push a slice into this join
         raise NotImplementedError("Slice in a nested loop join")
     mask = translate_predicate(
         translator,
@@ -897,8 +896,9 @@ def _translate_cross_and_filter(
         output_name=node.predicate.output_name,
         schema=schema,
     )
-    # polars does not put dynamic predicate hints in a join predicate
-    assert mask is not None
+    if mask is None:  # pragma: no cover
+        # polars does not put dynamic predicate hints in a join predicate
+        raise NotImplementedError("Dynamic predicate hint in a nested loop join")
     cross = ir.Join(
         schema,
         left_on,
