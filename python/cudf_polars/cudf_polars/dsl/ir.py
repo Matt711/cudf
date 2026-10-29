@@ -3435,10 +3435,10 @@ class Join(IR):
                         columns = plc.join.cross_join(
                             right.table, left.table, stream=stream
                         ).columns()
-                        columns = [
+                        columns = (
                             *columns[right.num_columns :],
                             *columns[: right.num_columns],
-                        ]
+                        )
                     else:
                         columns = plc.join.cross_join(
                             left.table, right.table, stream=stream
