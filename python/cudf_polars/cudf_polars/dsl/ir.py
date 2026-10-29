@@ -3440,18 +3440,6 @@ class Join(IR):
 
         return result
 
-    @staticmethod
-    def _with_columns(df: DataFrame, exprs: Sequence[expr.NamedExpr]) -> DataFrame:
-        """Append evaluated expressions to a dataframe."""
-        if not exprs:
-            return df
-        columns = broadcast(
-            *(e.evaluate(df) for e in exprs),
-            target_length=df.num_rows,
-            stream=df.stream,
-        )
-        return df.with_columns(columns, stream=df.stream)
-
     @classmethod
     @log_do_evaluate
     @nvtx_annotate_cudf_polars(message="Join")
@@ -3551,10 +3539,12 @@ class Join(IR):
                     predicate_wrapper.predicate
                 )
                 left_conditional = _apply_casts(
-                    Join._with_columns(left, left_exprs), left_casts
+                    HStack.do_evaluate(left_exprs, True, left, context=context),  # noqa: FBT003
+                    left_casts,
                 )
                 right_conditional = _apply_casts(
-                    Join._with_columns(right, right_exprs), right_casts
+                    HStack.do_evaluate(right_exprs, True, right, context=context),  # noqa: FBT003
+                    right_casts,
                 )
             with context.stream_ordered_after(left, right) as stream:
                 null_equality = (
