@@ -445,3 +445,13 @@ def test_conditional_join_cuda_context_initialized():
     t = threading.Thread(target=ConditionalJoin.Predicate, args=(predicate_expr,))
     t.start()
     t.join()
+
+
+@pytest.mark.parametrize(
+    "maintain_order", ["none", "left", "right", "left_right", "right_left"]
+)
+def test_cross_join_maintain_order(engine: pl.GPUEngine, maintain_order):
+    left = pl.LazyFrame({"x": [0, 1, 2], "a": ["p", "q", "r"]})
+    right = pl.LazyFrame({"y": [5, 6], "a": ["s", "t"]})
+    q = left.join(right, how="cross", maintain_order=maintain_order)
+    assert_gpu_result_equal(q, engine=engine, check_row_order=maintain_order != "none")

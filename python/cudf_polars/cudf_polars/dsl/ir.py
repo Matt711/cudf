@@ -3429,9 +3429,20 @@ class Join(IR):
                         zlice
                     )
                 else:
-                    columns = plc.join.cross_join(
-                        left.table, right.table, stream=stream
-                    ).columns()
+                    if maintain_order.startswith("right"):
+                        # cross_join is left-major, so swap the inputs and
+                        # move the columns back.
+                        columns = plc.join.cross_join(
+                            right.table, left.table, stream=stream
+                        ).columns()
+                        columns = [
+                            *columns[right.num_columns :],
+                            *columns[: right.num_columns],
+                        ]
+                    else:
+                        columns = plc.join.cross_join(
+                            left.table, right.table, stream=stream
+                        ).columns()
                     left_cols = Join._build_columns(
                         columns[: left.num_columns], left.columns, stream=stream
                     )
