@@ -33,7 +33,7 @@ def customers() -> pl.LazyFrame:
     return pl.LazyFrame(
         {
             "key": [1, 2, 3, None, 3],
-            "cust_nation": ["GERMANY", "FRANCE", "FRANCE", "FRANCE", "GERMANY"],
+            "cust_nation": ["GERMANY", "FRANCE", "FRANCE", "GERMANY", "GERMANY"],
             "w": [4, 3, 2, 1, 9],
         }
     )
