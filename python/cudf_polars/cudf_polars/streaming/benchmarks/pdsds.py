@@ -79,20 +79,24 @@ class PDSDSPolarsQueries(PDSDSQueries):
     EXPECTED_FAILURES_TPCDS: ClassVar[dict[int, str]] = {
         4: (
             "Falls back to the CPU: Polars casts a float ratio to Decimal(38, 2) on "
-            "both sides of a join predicate and libcudf's AST cannot cast to decimal"
+            "both sides of a join predicate and libcudf's AST cannot cast to decimal: "
+            "https://github.com/rapidsai/cudf/issues/24937"
         ),
         5: "GPU execution failure (packed data cannot be empty): https://github.com/rapidsai/cudf/issues/22073",
         11: (
             "Falls back to the CPU: Polars casts a float ratio to Decimal(38, 2) on "
-            "both sides of a join predicate and libcudf's AST cannot cast to decimal"
+            "both sides of a join predicate and libcudf's AST cannot cast to decimal: "
+            "https://github.com/rapidsai/cudf/issues/24937"
         ),
         47: (
             "Falls back to the CPU: Polars 2.x plans over(order_by=[a, b]) with a "
-            "row_encode expression that its plan visitor does not expose"
+            "row_encode expression that its plan visitor does not expose: "
+            "https://github.com/rapidsai/cudf/issues/24936"
         ),
         57: (
             "Falls back to the CPU: Polars 2.x plans over(order_by=[a, b]) with a "
-            "row_encode expression that its plan visitor does not expose"
+            "row_encode expression that its plan visitor does not expose: "
+            "https://github.com/rapidsai/cudf/issues/24936"
         ),
     }
     # See comments for EXPECTED_CASTS and EXPECTED_CASTS_DECIMAL
