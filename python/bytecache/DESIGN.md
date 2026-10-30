@@ -127,8 +127,8 @@ ahead of the newest task a producer has started (`scan_node` calls `advance(task
 `CUDF_POLARS_BYTECACHE_READAHEAD=1`.
 
 Measured (100 GB cache, cold S3, SF1000): q1 alone fetches 58 GB either way; with read-ahead 37.5 GB of it is prefetched and
-hit, q1 goes from 17.7 s to 15.3 s. Over all 22 queries read-ahead made the run **slower**: 131.3 s (98 GB prefetched, 81%
-hit rate, same 335 GB fetched) against 116.7 s without (an earlier version that registered files one at a time prefetched
+hit, q1 goes from 17.7 s to 15.3 s. Over all 22 queries read-ahead did not help: 131.3 s (98 GB prefetched, 81%
+hit rate, same 335 GB fetched) against 128 to 134 s without in later repeats (the 116.7 s that it was first compared with was a low outlier; the conclusion that it does not help stands) (an earlier version that registered files one at a time prefetched
 only 5 GB: 126.0 s). Prefetching earlier moves the same bytes sooner but makes demand reads compete for the same
 network, CPU and threads. Scan concurrency cannot be raised instead: 12 or 16 concurrent remote scan tasks made the run
 145.7 s and 176.8 s, because each task allocates its device buffers when its read starts and holds them while it waits.
@@ -186,12 +186,14 @@ memory (57 to 131 GB RSS seen without the cache). Do not use a cache so large th
 | same, 75 GB cache (block-LRU policy) | 158.4 and 172.9 s | 998 to 1023 GB |
 | **+ column-aware policy, 100 GB** | **125.6 s** (72% hit rate) | **459 GB** |
 | + column-aware policy, 75 GB | 146.6 s (57% hit rate) | 692 GB |
-| column policy, 100 GB, **256 KiB blocks** (now the default) | **116.7 s** (72% hit rate) | **336 GB** |
+| column policy, 100 GB, **256 KiB blocks** (now the default) | 116.7, 131.3, 128.0, 133.7 s (four runs, **mean 127.4 s**, spread 117 to 134 s) | **336 GB** |
 | column policy, 100 GB, 128 KiB blocks | 125.0 s (73% hit rate) | 309 GB |
 
 The three block sizes (1 MiB, 256 KiB, 128 KiB) fetch 459, 336, 309 GB with the same hit rate (the rest was over-read: whole
-blocks fetched for sparse reads). 128 KiB makes more, smaller GETs (224k at 1.4 MB) and its time is back at 125 s; the
-difference between 116.7 and 125.0 s is inside the run-to-run noise (about 5%). One-run measurements.
+blocks fetched for sparse reads). The time effect is not established: the first 256 KiB run (116.7 s) was a low outlier,
+three repeats gave 128.0 to 133.7 s, 1 MiB blocks gave 125.6 s in one run and 128 KiB 125.0 s in one run. Cold runs vary
+by about +/-7%, so only differences larger than that mean anything; fewer bytes from S3 is a clear gain, but it has not
+yet shown up as a clear gain in time.
 | Sirius main, best config (200 GB host tier) | 96 to 109 s | about 410 GB |
 
 The 145.0 s and 139.0 s rows were taken with the older unbounded-staging build. With the bounded build: 100 GB,
