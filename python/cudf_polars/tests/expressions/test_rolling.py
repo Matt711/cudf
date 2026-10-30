@@ -954,7 +954,7 @@ def test_order_sensitive_over_scalar_aggs(
             nulls_last=nulls_last,
         )
     )
-    if isinstance(order_by, list):
+    if isinstance(order_by, list) and not _polars_exposes_row_encode():
         assert_ir_translation_raises(q, engine, NotImplementedError)
     else:
         assert_gpu_result_equal(q, engine=engine)
