@@ -3390,9 +3390,7 @@ class Join(IR):
         if empty:
             return [
                 Column(
-                    plc.column_factories.make_empty_column(
-                        col.dtype.plc_type, stream=stream
-                    ),
+                    dtypes.make_empty_column(col.dtype, stream),
                     col.dtype,
                     name=rename(col.name),
                 )
@@ -4325,7 +4323,11 @@ class HConcat(IR):
 
     @staticmethod
     def _extend_with_nulls(
-        table: plc.Table, *, nrows: int, stream: Stream
+        table: plc.Table,
+        column_dtypes: Sequence[DataType],
+        *,
+        nrows: int,
+        stream: Stream,
     ) -> plc.Table:
         """
         Extend a table with nulls.
@@ -4334,6 +4336,8 @@ class HConcat(IR):
         ----------
         table
             Table to extend
+        column_dtypes
+            DataTypes of the columns of ``table``
         nrows
             Number of additional rows
         stream
@@ -4348,8 +4352,8 @@ class HConcat(IR):
                 table,
                 plc.Table(
                     [
-                        plc.Column.all_null_like(column, nrows, stream=stream)
-                        for column in table.columns()
+                        dtypes.make_all_null_column(dtype, nrows, stream)
+                        for dtype in column_dtypes
                     ]
                 ),
             ],
@@ -4398,6 +4402,7 @@ class HConcat(IR):
                             else DataFrame.from_table(
                                 cls._extend_with_nulls(
                                     df.table,
+                                    df.dtypes,
                                     nrows=max_rows - df.num_rows,
                                     stream=stream,
                                 ),
@@ -4431,10 +4436,15 @@ class Empty(IR):
     @nvtx_annotate_cudf_polars(message="Empty")
     def do_evaluate(cls, schema: Schema, *, context: IRExecutionContext) -> DataFrame:
         """Evaluate and return a dataframe."""
-        # libcudf cannot make an empty column of a nested type directly.
-        return DataFrame.from_polars(
-            pl.DataFrame(
-                schema={name: dtype.polars_type for name, dtype in schema.items()}
-            ),
-            stream=context.get_cuda_stream(),
+        stream = context.get_cuda_stream()
+        return DataFrame(
+            [
+                Column(
+                    dtypes.make_empty_column(dtype, stream),
+                    dtype=dtype,
+                    name=name,
+                )
+                for name, dtype in schema.items()
+            ],
+            stream=stream,
         )
