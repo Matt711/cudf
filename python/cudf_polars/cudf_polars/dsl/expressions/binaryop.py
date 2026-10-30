@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import TYPE_CHECKING, ClassVar
 
 import polars as pl
@@ -42,9 +42,13 @@ def _decimal_precision(node: Expr) -> int:
     dtype = node.dtype.polars_type
     assert isinstance(dtype, pl.Decimal)
     if isinstance(node, Literal) and isinstance(node.value, Decimal):
-        scaled = node.value.scaleb(dtype.scale)
-        if scaled == scaled.to_integral_value():
-            return max(len(str(abs(int(scaled)))), 1)
+        # The default context rounds to 28 digits, which would change the
+        # count for a value near the 38 digit limit.
+        with localcontext() as ctx:
+            ctx.prec = 2 * _DECIMAL128_MAX_PRECISION
+            scaled = node.value.scaleb(dtype.scale)
+            if scaled == scaled.to_integral_value():
+                return max(len(str(abs(int(scaled)))), 1)
     return dtype.precision or _DECIMAL128_MAX_PRECISION
 
 

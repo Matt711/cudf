@@ -369,3 +369,10 @@ def test_decimal_comparison_with_literal_that_may_overflow(engine: pl.GPUEngine)
     df = pl.DataFrame({"a": ["1.00", "2.00"]}).cast(pl.Decimal(38, 2)).lazy()
     q = df.select(gt=pl.col("a") > pl.lit(Decimal("1.005")))
     assert_ir_translation_raises(q, engine, NotImplementedError)
+
+
+def test_decimal_comparison_with_literal_of_maximum_precision(engine: pl.GPUEngine):
+    # Neither operand needs rescaling, so a literal of 38 digits is supported.
+    df = pl.DataFrame({"a": ["1", "9" * 38]}).cast(pl.Decimal(38, 0)).lazy()
+    q = df.select(lt=pl.col("a") < pl.lit(Decimal("9" * 38)))
+    assert_gpu_result_equal(q, engine=engine)
