@@ -120,27 +120,97 @@ io_pool& pool()
 {
   static io_pool* p = [] {
     char const* e = std::getenv("BYTECACHE_THREADS");
-    return new io_pool(e ? std::max(1, std::atoi(e)) : 128);
+    return new io_pool(e ? std::max(1, std::atoi(e)) : 512);
   }();
   return *p;
 }
 
-/// Per-thread pinned staging buffer for host-to-device copies (grown on demand, never freed).
-std::uint8_t* pinned_staging(std::size_t need)
+std::size_t env_size(char const* name, std::size_t def)
 {
-  thread_local std::uint8_t* p = nullptr;
-  thread_local std::size_t cap = 0;
-  if (need > cap) {
-    if (p != nullptr) cudaFreeHost(p);
-    std::size_t const n = std::max<std::size_t>(need, std::max<std::size_t>(cap * 2, 8 << 20));
-    if (cudaMallocHost(reinterpret_cast<void**>(&p), n) != cudaSuccess) {
-      p   = nullptr;
-      cap = 0;
+  char const* e = std::getenv(name);
+  return e ? static_cast<std::size_t>(std::max<long long>(1, std::atoll(e))) : def;
+}
+
+/// Counting budget with all-or-nothing acquisition (a reader reserves everything it needs up front, so there is no hold-and-wait).
+class counting_budget {
+ public:
+  explicit counting_budget(std::size_t cap) : cap_(cap) {}
+  std::size_t capacity() const { return cap_; }
+  void acquire(std::size_t k)
+  {
+    if (k > cap_) throw std::runtime_error("bytecache: a single read needs more staging buffers than the budget allows");
+    std::unique_lock l(m_);
+    cv_.wait(l, [&] { return used_ + k <= cap_; });
+    used_ += k;
+  }
+  void release(std::size_t k)
+  {
+    {
+      std::lock_guard l(m_);
+      used_ -= k;
+    }
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::size_t cap_, used_{0};
+};
+
+/// Bound on concurrently held GET staging buffers (BYTECACHE_GET_BUFFERS x max_get_bytes, default 256 x 16 MiB = 4 GiB).
+counting_budget& get_budget()
+{
+  static counting_budget* b = new counting_budget(env_size("BYTECACHE_GET_BUFFERS", 256));
+  return *b;
+}
+
+/// Fixed-size pool of pinned buffers for host-to-device copies, shared by all threads and bounded
+/// (BYTECACHE_PINNED_BUFFERS x 16 MiB, default 128 x 16 MiB = 2 GiB). Buffers are created lazily and never freed.
+class pinned_pool {
+ public:
+  pinned_pool(std::size_t n, std::size_t size) : n_(n), size_(size) {}
+  std::size_t buffer_size() const { return size_; }
+  std::uint8_t* acquire()
+  {
+    std::unique_lock l(m_);
+    cv_.wait(l, [&] { return !free_.empty() || created_ < n_; });
+    if (!free_.empty()) {
+      auto* p = free_.back();
+      free_.pop_back();
+      return p;
+    }
+    ++created_;
+    l.unlock();
+    void* p = nullptr;
+    if (cudaMallocHost(&p, size_) != cudaSuccess) {
+      std::lock_guard g(m_);
+      --created_;
+      cv_.notify_one();
       throw std::runtime_error("bytecache: cudaMallocHost failed");
     }
-    cap = n;
+    return static_cast<std::uint8_t*>(p);
   }
-  return p;
+  void release(std::uint8_t* p)
+  {
+    {
+      std::lock_guard l(m_);
+      free_.push_back(p);
+    }
+    cv_.notify_one();
+  }
+
+ private:
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::vector<std::uint8_t*> free_;
+  std::size_t n_, size_, created_{0};
+};
+
+pinned_pool& pinned()
+{
+  static pinned_pool* p = new pinned_pool(env_size("BYTECACHE_PINNED_BUFFERS", 128), 16 << 20);
+  return *p;
 }
 
 class cache {
@@ -266,7 +336,9 @@ class cache {
     };
     std::vector<piece> pieces;
     std::size_t const max_blocks = cfg_.max_get_bytes / B;
+    std::size_t held             = 0;  // GET staging buffers reserved from the shared budget and not yet released
     try {
+      std::vector<std::pair<std::size_t, std::size_t>> runs;
       for (std::size_t i = 0; i < nb;) {
         if (items[i].k == kind::hit) {
           ++i;
@@ -274,41 +346,56 @@ class cache {
         }
         std::size_t j = i;
         while (j + 1 < nb && items[j + 1].k != kind::hit && (j + 1 - i) < max_blocks) ++j;
-        piece p;
-        p.first = i;
-        p.last  = j;
-        p.buf   = pool_.acquire(cfg_.max_get_bytes);
-        std::size_t const foff = (b0 + i) * B;
-        std::size_t const flen = std::min((b0 + j + 1) * B, f.size) - foff;
-        p.flen                 = flen;
-        p.fut                  = f.handle->pread(p.buf.get(), flen, foff);
-        st_.gets_issued += 1;
-        st_.bytes_fetched += flen;
-        pieces.push_back(std::move(p));
+        runs.emplace_back(i, j);
         i = j + 1;
       }
-      // Phase 3: wait for the fetches, publish owned blocks, copy into dst.
-      for (auto& p : pieces) {
-        if (p.fut.get() != p.flen) throw std::runtime_error("bytecache: short remote read");
-        std::size_t const foff = (b0 + p.first) * B;
-        for (std::size_t i = p.first; i <= p.last; ++i) {
-          std::size_t const bi = b0 + i;
-          std::uint8_t const* src = p.buf.get() + (bi * B - foff);
-          copy_block_to_dst(bi, src);
-          if (items[i].k == kind::owner) {
-            block* b = items[i].blk;
-            std::memcpy(arena_ + static_cast<std::size_t>(b->slot) * B, src, b->len);
-            std::lock_guard l(m_);
-            b->st = block_state::ready;
-            b->pins--;
-            add_to_probation(b);
-            cv_.notify_all();
-            items[i].blk = nullptr;
-          }
+      // Process the runs in waves no larger than the budget; each wave reserves its buffers all at once.
+      std::size_t const wave_max = get_budget().capacity();
+      for (std::size_t w = 0; w < runs.size(); w += wave_max) {
+        std::size_t const wn = std::min(wave_max, runs.size() - w);
+        get_budget().acquire(wn);
+        held = wn;
+        pieces.clear();
+        for (std::size_t r = w; r < w + wn; ++r) {
+          auto const [i, j] = runs[r];
+          piece p;
+          p.first = i;
+          p.last  = j;
+          p.buf   = pool_.acquire(cfg_.max_get_bytes);
+          std::size_t const foff = (b0 + i) * B;
+          std::size_t const flen = std::min((b0 + j + 1) * B, f.size) - foff;
+          p.flen                 = flen;
+          p.fut                  = f.handle->pread(p.buf.get(), flen, foff);
+          st_.gets_issued += 1;
+          st_.bytes_fetched += flen;
+          pieces.push_back(std::move(p));
         }
-        pool_.release(std::move(p.buf));
+        // Phase 3: wait for the fetches, publish owned blocks, copy into dst.
+        for (auto& p : pieces) {
+          if (p.fut.get() != p.flen) throw std::runtime_error("bytecache: short remote read");
+          std::size_t const foff = (b0 + p.first) * B;
+          for (std::size_t i = p.first; i <= p.last; ++i) {
+            std::size_t const bi = b0 + i;
+            std::uint8_t const* src = p.buf.get() + (bi * B - foff);
+            copy_block_to_dst(bi, src);
+            if (items[i].k == kind::owner) {
+              block* b = items[i].blk;
+              std::memcpy(arena_ + static_cast<std::size_t>(b->slot) * B, src, b->len);
+              std::lock_guard l(m_);
+              b->st = block_state::ready;
+              b->pins--;
+              add_to_probation(b);
+              cv_.notify_all();
+              items[i].blk = nullptr;
+            }
+          }
+          pool_.release(std::move(p.buf));
+          get_budget().release(1);
+          --held;
+        }
       }
     } catch (...) {
+      if (held > 0) get_budget().release(held);
       fail_owned(items.data(), nb, [](item const& it) { return it.k == kind::owner; });
       release_hits(items.data(), nb, [](item const& it) { return it.k == kind::hit; });
       throw;
@@ -541,13 +628,23 @@ static std::size_t read_to_device(remote_file& f, std::size_t offset, std::size_
                                   cuda::stream_ref stream)
 {
   std::size_t const avail = offset < f.size ? std::min(size, f.size - offset) : 0;
-  if (avail == 0) return 0;
-  std::uint8_t* stage = pinned_staging(avail);
-  cache::get().read(f, offset, avail, stage);
-  auto s = static_cast<cudaStream_t>(stream.get());
-  if (cudaMemcpyAsync(dst, stage, avail, cudaMemcpyHostToDevice, s) != cudaSuccess ||
-      cudaStreamSynchronize(s) != cudaSuccess) {
-    throw std::runtime_error("bytecache: host-to-device copy failed");
+  auto s                  = static_cast<cudaStream_t>(stream.get());
+  auto& pp                = pinned();
+  std::size_t const S     = pp.buffer_size();
+  for (std::size_t done = 0; done < avail;) {
+    std::size_t const len = std::min(S, avail - done);
+    std::uint8_t* stage   = pp.acquire();
+    struct release_guard {
+      pinned_pool& pool;
+      std::uint8_t* p;
+      ~release_guard() { pool.release(p); }
+    } guard{pp, stage};
+    cache::get().read(f, offset + done, len, stage);
+    if (cudaMemcpyAsync(dst + done, stage, len, cudaMemcpyHostToDevice, s) != cudaSuccess ||
+        cudaStreamSynchronize(s) != cudaSuccess) {
+      throw std::runtime_error("bytecache: host-to-device copy failed");
+    }
+    done += len;
   }
   return avail;
 }
