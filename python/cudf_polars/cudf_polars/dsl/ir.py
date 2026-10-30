@@ -58,7 +58,7 @@ from cudf_polars.dsl.utils.windows import (
     offsets_to_windows,
     range_window_bounds,
 )
-from cudf_polars.utils import dtypes, sorting
+from cudf_polars.utils import bytecache, dtypes, sorting
 from cudf_polars.utils.cuda_stream import (
     get_cuda_stream,
     stream_ordered_after,
@@ -1295,10 +1295,21 @@ class Scan(IR):
                         plc.io.types.FilepathSource(info.path, info.size)
                     )
                     parquet_metadatas.append(info.file_metadata)
-                source_info = plc.io.SourceInfo(filepath_sources)
+                # Remote paths read through the cross-query byte cache when enabled; `cache_sources`
+                # keeps the cache-backed sources alive for the reads below.
+                cache_sources = bytecache.wrap_sources(
+                    [info.path for info in cached_parquet_info],
+                    [info.size for info in cached_parquet_info],
+                )
+                source_info = plc.io.SourceInfo(
+                    cache_sources if cache_sources is not None else filepath_sources
+                )
             else:
                 parquet_metadatas = None
-                source_info = plc.io.SourceInfo(paths)
+                cache_sources = bytecache.wrap_sources(paths)
+                source_info = plc.io.SourceInfo(
+                    cache_sources if cache_sources is not None else paths
+                )
 
             hive_names = (
                 frozenset(hive_parts.names) if hive_parts is not None else frozenset()

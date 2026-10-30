@@ -15,6 +15,7 @@ import pylibcudf as plc
 
 from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.dsl.traversal import traversal
+from cudf_polars.utils import bytecache
 from cudf_polars.streaming.io import (
     ParquetSourceInfo,
     Scan,
@@ -122,6 +123,21 @@ def _prefetch_parquet_footers_for_paths(
     # TODO: https://github.com/NVIDIA/cudf/issues/22734, use object metadata from polars
     # For now, we'll just use kvikio to explicitly get the size.
     sizes: list[int | None] = []
+
+    cache_sources = bytecache.wrap_sources(paths)
+    if cache_sources is not None:
+        # Remote paths read through the byte cache: sizes come from the cache's handle (one HEAD per
+        # object per process) and the footers are cached blocks, so later queries re-read neither.
+        sizes = [src.nbytes() for src in cache_sources]
+        metadata = plc.io.parquet_metadata.read_parquet_footers(
+            plc.io.types.SourceInfo(cache_sources)
+        )
+        return [
+            CachedParquetInfo(
+                path, size, file_metadata, parse_hybrid_metadata=parse_hybrid_metadata
+            )
+            for path, size, file_metadata in zip(paths, sizes, metadata, strict=True)
+        ]
 
     for path in paths:
         if paths and plc.io.SourceInfo._is_remote_uri(path):
