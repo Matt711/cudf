@@ -158,15 +158,15 @@ class counting_budget {
   std::size_t cap_, used_{0};
 };
 
-/// Bound on concurrently held GET staging buffers (BYTECACHE_GET_BUFFERS x max_get_bytes, default 256 x 16 MiB = 4 GiB).
+/// Bound on concurrently held GET staging buffers (BYTECACHE_GET_BUFFERS x max_get_bytes, default 512 x 16 MiB = 8 GiB).
 counting_budget& get_budget()
 {
-  static counting_budget* b = new counting_budget(env_size("BYTECACHE_GET_BUFFERS", 256));
+  static counting_budget* b = new counting_budget(env_size("BYTECACHE_GET_BUFFERS", 512));
   return *b;
 }
 
 /// Fixed-size pool of pinned buffers for host-to-device copies, shared by all threads and bounded
-/// (BYTECACHE_PINNED_BUFFERS x 16 MiB, default 128 x 16 MiB = 2 GiB). Buffers are created lazily and never freed.
+/// (BYTECACHE_PINNED_BUFFERS x 16 MiB, default 512 x 16 MiB = 8 GiB). Buffers are created lazily and never freed.
 class pinned_pool {
  public:
   pinned_pool(std::size_t n, std::size_t size) : n_(n), size_(size) {}
@@ -209,7 +209,7 @@ class pinned_pool {
 
 pinned_pool& pinned()
 {
-  static pinned_pool* p = new pinned_pool(env_size("BYTECACHE_PINNED_BUFFERS", 128), 16 << 20);
+  static pinned_pool* p = new pinned_pool(env_size("BYTECACHE_PINNED_BUFFERS", 512), 16 << 20);
   return *p;
 }
 

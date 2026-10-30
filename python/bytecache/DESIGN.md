@@ -78,9 +78,9 @@ pylibcudf cannot take a Python-written data source (`SourceInfo` accepts paths, 
   and synchronises before its future completes. Many jobs are in flight at once; threads are only parked in
   I/O, so the pool is large (default 512, `BYTECACHE_THREADS`).
 - **Memory is bounded independently of threads.** GET staging buffers come from a counting budget
-  (`BYTECACHE_GET_BUFFERS`, default 256 x 16 MiB), reserved all-or-nothing per read (no hold-and-wait, so no
+  (`BYTECACHE_GET_BUFFERS`, default 512 x 16 MiB), reserved all-or-nothing per read (no hold-and-wait, so no
   deadlock), in waves when one read needs more than the budget. Host-to-device copies go through a shared pinned
-  pool (`BYTECACHE_PINNED_BUFFERS`, default 128 x 16 MiB) in 16 MiB pieces. An earlier version kept a pinned
+  pool (`BYTECACHE_PINNED_BUFFERS`, default 512 x 16 MiB) in 16 MiB pieces. An earlier version kept a pinned
   buffer per thread and allocated GET buffers without limit: resident memory reached 232 GB at 100 GB cache and
   1024 threads, which exhausted host RAM and took the machine down.
 
@@ -104,8 +104,8 @@ pylibcudf cannot take a Python-written data source (`SourceInfo` accepts paths, 
 | `CUDF_POLARS_BYTECACHE_BLOCK_MB` | 1 | Block size |
 | `CUDF_POLARS_BYTECACHE_GET_MB` | 16 | Largest fused GET |
 | `BYTECACHE_THREADS` | 512 | I/O threads |
-| `BYTECACHE_GET_BUFFERS` | 256 | GET staging buffers (x GET size) |
-| `BYTECACHE_PINNED_BUFFERS` | 128 | Pinned copy buffers (x 16 MiB) |
+| `BYTECACHE_GET_BUFFERS` | 512 | GET staging buffers (x GET size) |
+| `BYTECACHE_PINNED_BUFFERS` | 512 | Pinned copy buffers (x 16 MiB) |
 | `BYTECACHE_DEBUG` | unset | Native backtrace on SIGSEGV |
 
 Recommended companions (measured to help without the cache too): `CUDF_POLARS__EXECUTOR__KVIKIO_REACTOR_COUNT=48`,
@@ -124,8 +124,11 @@ memory (57 to 131 GB RSS seen without the cache). Do not use a cache so large th
 | + bytecache 100 GB, 1024 I/O threads (per-thread buffers) | 139.0 s | - |
 | Sirius main, best config (200 GB host tier) | 96 to 109 s | about 410 GB |
 
-The 512- and 1024-thread numbers were taken with the older unbounded-staging build (before the bounded-memory
-change in section 3.3); results with the bounded build are being collected. Hit rate at 100 GB was about 60%
+The 145.0 s and 139.0 s rows were taken with the older unbounded-staging build. With the bounded build: 100 GB,
+512 threads, 512 GET / 512 pinned buffers: 150.1 s (peak RSS 201 GB); 1024 threads, 1024/1024: 157.5 s (215 GB);
+with too-small limits (256 GET / 128 pinned) it took 248 to 250 s because reads in flight were capped, and a
+75 GB cache with those limits took 371 s (hit rate 24%). q2 takes 14 to 16 s with the bounded build versus
+2 s with the old one (under investigation). Hit rate at 100 GB was about 60%
 of requested bytes (634 of 1065 GB).
 
 ## 6. Known limitations
