@@ -133,7 +133,7 @@ requested bytes are attributed to a known column.
 |---|---|---|
 | `CUDF_POLARS_BYTECACHE_GB` | unset (off) | Cache size in GB; `0` routes through the source with caching off |
 | `CUDF_POLARS_BYTECACHE_PATH` | - | Directory containing `_bytecache*.so` |
-| `CUDF_POLARS_BYTECACHE_BLOCK_MB` | 1 | Block size |
+| `CUDF_POLARS_BYTECACHE_BLOCK_MB` | 0.25 | Block size in MiB (see section 5: smaller blocks fetch fewer bytes) |
 | `CUDF_POLARS_BYTECACHE_GET_MB` | 16 | Largest fused GET |
 | `BYTECACHE_THREADS` | 512 | I/O threads |
 | `BYTECACHE_GET_BUFFERS` | 512 | GET staging buffers (x GET size) |
@@ -160,6 +160,12 @@ memory (57 to 131 GB RSS seen without the cache). Do not use a cache so large th
 | same, 75 GB cache (block-LRU policy) | 158.4 and 172.9 s | 998 to 1023 GB |
 | **+ column-aware policy, 100 GB** | **125.6 s** (72% hit rate) | **459 GB** |
 | + column-aware policy, 75 GB | 146.6 s (57% hit rate) | 692 GB |
+| column policy, 100 GB, **256 KiB blocks** (now the default) | **116.7 s** (72% hit rate) | **336 GB** |
+| column policy, 100 GB, 128 KiB blocks | 125.0 s (73% hit rate) | 309 GB |
+
+The three block sizes (1 MiB, 256 KiB, 128 KiB) fetch 459, 336, 309 GB with the same hit rate (the rest was over-read: whole
+blocks fetched for sparse reads). 128 KiB makes more, smaller GETs (224k at 1.4 MB) and its time is back at 125 s; the
+difference between 116.7 and 125.0 s is inside the run-to-run noise (about 5%). One-run measurements.
 | Sirius main, best config (200 GB host tier) | 96 to 109 s | about 410 GB |
 
 The 145.0 s and 139.0 s rows were taken with the older unbounded-staging build. With the bounded build: 100 GB,
