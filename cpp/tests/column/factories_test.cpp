@@ -772,16 +772,8 @@ void struct_from_scalar_zero_size(bool is_valid)
   auto value  = cudf::struct_scalar(src_children, is_valid);
   auto result = cudf::make_column_from_scalar(value, 0);
 
-  EXPECT_EQ(result->type().id(), cudf::type_id::STRUCT);
-  EXPECT_EQ(result->size(), 0);
-  EXPECT_EQ(result->null_count(), 0);
-  ASSERT_EQ(result->num_children(), 3);
-  EXPECT_EQ(result->child(0).type().id(), cudf::type_id::INT32);
-  EXPECT_EQ(result->child(1).type().id(), cudf::type_id::STRING);
-  EXPECT_EQ(result->child(2).type().id(), cudf::type_id::LIST);
-  for (cudf::size_type i = 0; i < result->num_children(); ++i) {
-    EXPECT_EQ(result->child(i).size(), 0);
-  }
+  auto const expected = cudf::empty_like(cudf::make_column_from_scalar(value, 1)->view());
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, *expected);
 }
 
 TEST_F(ColumnFactoryTest, FromStructScalarWithZeroSize) { struct_from_scalar_zero_size(true); }
