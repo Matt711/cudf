@@ -141,7 +141,7 @@ io_pool& pool()
   return *p;
 }
 
-std::atomic<std::uint64_t> g_ns_open{0}, g_ns_pinned_wait{0}, g_ns_read{0}, g_ns_h2d{0}, g_ns_budget_wait{0}, g_device_reads{0}, g_ns_queue_wait{0}, g_inflight{0}, g_max_inflight{0}, g_host_reads{0}, g_ns_host_read{0};
+std::atomic<std::uint64_t> g_ns_open{0}, g_ns_pinned_wait{0}, g_ns_read{0}, g_ns_h2d{0}, g_ns_budget_wait{0}, g_device_reads{0}, g_ns_queue_wait{0}, g_inflight{0}, g_max_inflight{0}, g_host_reads{0}, g_ns_host_read{0}, g_bytes_prefetched{0}, g_prefetch_jobs{0};
 
 constexpr std::size_t kMaxColumns = 4096;
 constexpr int kBuckets = 128;
@@ -281,12 +281,25 @@ pinned_pool& pinned()
   return *p;
 }
 
+/// Read-ahead runs on its own threads and its own staging budget so it can never starve demand reads.
+io_pool& prefetch_pool()
+{
+  static io_pool* p = new io_pool(env_size("BYTECACHE_PREFETCH_THREADS", 256));
+  return *p;
+}
+
+counting_budget& prefetch_budget()
+{
+  static counting_budget* b = new counting_budget(env_size("BYTECACHE_PREFETCH_BUFFERS", 256));
+  return *b;
+}
+
 class cache {
  public:
   static cache& get()
   {
-    static cache c;
-    return c;
+    static cache* c = new cache;  // never destroyed: detached I/O and read-ahead threads may still be running at exit
+    return *c;
   }
 
   void configure(config const& c)
@@ -346,11 +359,12 @@ class cache {
     return it->second;
   }
 
-  std::size_t read(remote_file& f, std::size_t off, std::size_t n, std::uint8_t* dst)
+  std::size_t read(remote_file& f, std::size_t off, std::size_t n, std::uint8_t* dst, bool prefetch = false)
   {
     if (n == 0 || off >= f.size) return 0;
     n = std::min(n, f.size - off);
-    st_.bytes_requested += n;
+    if (!prefetch) st_.bytes_requested += n;
+    counting_budget& budget = prefetch ? prefetch_budget() : get_budget();
     if (nslots_ == 0) {  // caching disabled: straight to the remote handle
       f.handle->pread(dst, n, off).get();
       st_.bytes_fetched += n;
@@ -382,12 +396,12 @@ class cache {
           block* b = it->second;
           b->pins++;
           items[i] = {b, kind::hit, b->col};
-          cols_[b->col]->requested += overlap;
+          if (!prefetch) cols_[b->col]->requested += overlap;
           if (b->st == block_state::ready) touch(b);
           continue;
         }
         std::uint32_t const col = col_of(layout, bstart);
-        cols_[col]->requested += overlap;
+        if (!prefetch) cols_[col]->requested += overlap;
         std::uint32_t slot;
         if (!alloc_slot(col, slot)) {
           items[i] = {nullptr, kind::uncached, col};
@@ -405,6 +419,7 @@ class cache {
     }
 
     auto copy_block_to_dst = [&](std::size_t bi, std::uint8_t const* src) -> std::size_t {
+      if (dst == nullptr) return 0;  // read-ahead: only populate the cache
       std::size_t const bstart = bi * B;
       std::size_t const lo = std::max(off, bstart), hi = std::min(off + n, bstart + B);
       if (hi <= lo) return 0;
@@ -425,22 +440,23 @@ class cache {
     try {
       std::vector<std::pair<std::size_t, std::size_t>> runs;
       for (std::size_t i = 0; i < nb;) {
-        if (items[i].k == kind::hit) {
+        auto skip = [&](std::size_t k) { return items[k].k == kind::hit || (prefetch && items[k].k == kind::uncached); };
+        if (skip(i)) {
           ++i;
           continue;
         }
         std::size_t j = i;
-        while (j + 1 < nb && items[j + 1].k != kind::hit && (j + 1 - i) < max_blocks) ++j;
+        while (j + 1 < nb && !skip(j + 1) && (j + 1 - i) < max_blocks) ++j;
         runs.emplace_back(i, j);
         i = j + 1;
       }
       // Process the runs in waves no larger than the budget; each wave reserves its buffers all at once.
-      std::size_t const wave_max = get_budget().capacity();
+      std::size_t const wave_max = budget.capacity();
       for (std::size_t w = 0; w < runs.size(); w += wave_max) {
         std::size_t const wn = std::min(wave_max, runs.size() - w);
         {
           stage_timer t(g_ns_budget_wait);
-          get_budget().acquire(wn);
+          budget.acquire(wn);
         }
         held = wn;
         pieces.clear();
@@ -456,6 +472,7 @@ class cache {
           p.fut                  = f.handle->pread(p.buf.get(), flen, foff);
           st_.gets_issued += 1;
           st_.bytes_fetched += flen;
+          if (prefetch) g_bytes_prefetched += flen;
           pieces.push_back(std::move(p));
         }
         // Phase 3: wait for the fetches, publish owned blocks, copy into dst.
@@ -479,12 +496,12 @@ class cache {
             }
           }
           pool_.release(std::move(p.buf));
-          get_budget().release(1);
+          budget.release(1);
           --held;
         }
       }
     } catch (...) {
-      if (held > 0) get_budget().release(held);
+      if (held > 0) budget.release(held);
       fail_owned(items.data(), nb, [](item const& it) { return it.k == kind::owner; });
       release_hits(items.data(), nb, [](item const& it) { return it.k == kind::hit; });
       throw;
@@ -495,6 +512,12 @@ class cache {
     for (std::size_t i = 0; i < nb; ++i) {
       if (items[i].k != kind::hit) continue;
       block* b = items[i].blk;
+      if (prefetch) {  // read-ahead only populates the cache: nothing to copy, nothing to wait for
+        std::lock_guard l(m_);
+        unpin(b);
+        items[i].blk = nullptr;
+        continue;
+      }
       {
         std::unique_lock l(m_);
         if (b->st == block_state::loading) {
@@ -562,6 +585,60 @@ class cache {
     fit->second->layout = std::move(segs);
   }
 
+  /// Submit read-ahead of the given columns of a file. Returns the bytes of the ranges (0 if the file/layout is unknown).
+  std::uint64_t prefetch_columns(std::string const& path, std::string const& table, std::vector<std::string> const& columns)
+  {
+    std::shared_ptr<remote_file> file;
+    std::shared_ptr<const std::vector<segment>> layout;
+    std::vector<std::uint32_t> ids;
+    {
+      std::lock_guard l(m_);
+      if (nslots_ == 0) return 0;
+      auto fit = files_.find(path);
+      if (fit == files_.end() || !fit->second->layout) return 0;
+      file   = fit->second;
+      layout = file->layout;
+      for (auto const& name : columns) {
+        auto it = col_ids_.find(table + "|" + name);
+        if (it != col_ids_.end()) ids.push_back(it->second);
+      }
+    }
+    if (ids.empty()) return 0;
+    std::sort(ids.begin(), ids.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;  // coalesced byte ranges, in file order
+    std::uint64_t total = 0;
+    for (auto const& s : *layout) {
+      if (!std::binary_search(ids.begin(), ids.end(), s.col)) continue;
+      total += s.end - s.start;
+      if (!ranges.empty() && s.start <= ranges.back().second + (1 << 20)) {
+        ranges.back().second = std::max(ranges.back().second, s.end);
+      } else {
+        ranges.emplace_back(s.start, s.end);
+      }
+    }
+    if (ranges.empty()) return 0;
+    g_prefetch_jobs += 1;
+    // One pool job per range piece (at most 64 MiB), so the ranges of one file are fetched concurrently instead of one
+    // GET at a time (a single S3 stream delivers only about 20 to 80 MB/s).
+    for (auto const& [start, end] : ranges) {
+      for (std::uint64_t pos = start; pos < end; pos += (64ull << 20)) {
+        std::uint64_t const len = std::min<std::uint64_t>(64ull << 20, end - pos);
+        prefetch_pool().submit([this, file, pos, len] {
+          try {
+            read(*file, pos, len, nullptr, true);
+          } catch (std::exception const& e) {
+            // read-ahead is best effort: a failed fetch is simply read again on demand (but record it for diagnosis)
+            std::lock_guard l(g_slow_m);
+            if (g_slow.size() < 64) g_slow.push_back(std::string("prefetch error: ") + e.what());
+          } catch (...) {
+          }
+          return 0;
+        });
+      }
+    }
+    return total;
+  }
+
   std::vector<column_stats> column_snapshot()
   {
     std::lock_guard l(m_);
@@ -591,6 +668,7 @@ class cache {
     s.ns_open = g_ns_open; s.ns_pinned_wait = g_ns_pinned_wait; s.ns_read = g_ns_read; s.ns_h2d = g_ns_h2d;
     s.ns_budget_wait = g_ns_budget_wait; s.device_reads = g_device_reads;
     s.ns_queue_wait = g_ns_queue_wait; s.max_inflight = g_max_inflight; s.host_reads = g_host_reads; s.ns_host_read = g_ns_host_read;
+    s.bytes_prefetched = g_bytes_prefetched; s.prefetch_jobs = g_prefetch_jobs;
     std::lock_guard l(m_);
     s.blocks_resident = probation_.size() + protected_.size();
     return s;
@@ -786,6 +864,10 @@ void register_layout(std::string const& path, std::string const& table, std::vec
   cache::get().register_layout(path, table, columns, col_index, offsets, sizes);
 }
 std::vector<column_stats> get_column_stats() { return cache::get().column_snapshot(); }
+std::uint64_t prefetch_columns(std::string const& path, std::string const& table, std::vector<std::string> const& columns)
+{
+  return cache::get().prefetch_columns(path, table, columns);
+}
 
 void configure(config const& cfg)
 {

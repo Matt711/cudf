@@ -116,6 +116,30 @@ bytes and resident blocks (`get_column_stats()`). This is the per-column hit-rat
 the input the read-ahead needs (which byte ranges an upcoming scan task will read). In the SF1000 runs 99.6% of
 requested bytes are attributed to a known column.
 
+### 3.6 Read-ahead (implemented, off by default: it did not help)
+
+`prefetch_columns(path, table, columns)` fetches the registered byte ranges of the chosen columns into the cache on its own
+thread pool (`BYTECACHE_PREFETCH_THREADS`, default 256, one job per range piece of at most 64 MiB) with its own staging
+budget (`BYTECACHE_PREFETCH_BUFFERS`, default 256), skipping blocks the policy would not admit and not counting towards request
+or hit statistics. `cudf_polars/utils/bytecache.py:ScanPrefetcher` runs per scan node: it opens and registers every file of
+the node in parallel, then stays a window (`CUDF_POLARS_BYTECACHE_AHEAD_TASKS`, default 24; `..._AHEAD_GB`, default 12)
+ahead of the newest task a producer has started (`scan_node` calls `advance(task_idx)`). Enable with
+`CUDF_POLARS_BYTECACHE_READAHEAD=1`.
+
+Measured (100 GB cache, cold S3, SF1000): q1 alone fetches 58 GB either way; with read-ahead 37.5 GB of it is prefetched and
+hit, q1 goes from 17.7 s to 15.3 s. Over all 22 queries read-ahead made the run **slower**: 131.3 s (98 GB prefetched, 81%
+hit rate, same 335 GB fetched) against 116.7 s without (an earlier version that registered files one at a time prefetched
+only 5 GB: 126.0 s). Prefetching earlier moves the same bytes sooner but makes demand reads compete for the same
+network, CPU and threads. Scan concurrency cannot be raised instead: 12 or 16 concurrent remote scan tasks made the run
+145.7 s and 176.8 s, because each task allocates its device buffers when its read starts and holds them while it waits.
+
+Where the limit is (fetch microbenchmark, `scripts/fetch_microbench.py` on the benchmark host, no GPU work): plain kvikio
+reading 64 GB of 4 MB ranges from 60 lineitem objects reaches 2.0 GB/s with 64 threads, 7.8 with 256, 10.9 with 512 and
+11.3 with 1024; this cache's prefetch path fetched q1's 57 GB in 6.3 s (9.0 GB/s). So the network and the cache can move
+q1's bytes in about 6 s, but inside the engine q1 takes 15 s at about 5 GB/s. The stage timers show device reads waiting
+about 56 ms in the 512-thread pool queue and then 81 ms in the read (3 ms for the GPU copy), so the pool of blocking
+reads is saturated and per-read latency inside the engine is about 1.6x the microbenchmark's.
+
 ### 3.4 Build and ABI notes
 
 - `build.sh` builds `_bytecache.abi3.so` against the conda env (libcudf, kvikio, pylibcudf). pylibcudf is built
@@ -138,6 +162,8 @@ requested bytes are attributed to a known column.
 | `BYTECACHE_THREADS` | 512 | I/O threads |
 | `BYTECACHE_GET_BUFFERS` | 512 | GET staging buffers (x GET size) |
 | `BYTECACHE_PINNED_BUFFERS` | 512 | Pinned copy buffers (x 16 MiB) |
+| `CUDF_POLARS_BYTECACHE_READAHEAD` | 0 | `1` enables read-ahead (section 3.6) |
+| `BYTECACHE_PREFETCH_THREADS` / `_BUFFERS` | 256 / 256 | Read-ahead pool and staging budget |
 | `BYTECACHE_BIG_MB` | 4096 | Budget for temporary buffers of reads larger than one pinned buffer |
 | `BYTECACHE_PREPIN` | 1 | Pin the staging pool at start-up (`0` = lazily) |
 | `BYTECACHE_DEBUG` | unset | Native backtrace on SIGSEGV |

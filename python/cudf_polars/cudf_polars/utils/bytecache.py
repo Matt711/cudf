@@ -3,6 +3,7 @@
 """
 Optional cross-query byte cache for remote (``s3://``) parquet reads (prototype).
 
+Read-ahead is off unless ``CUDF_POLARS_BYTECACHE_READAHEAD=1`` (it did not help in measurements, see DESIGN.md).
 Enabled by setting ``CUDF_POLARS_BYTECACHE_GB`` (float, GB of host memory; ``0`` routes reads
 through the cache-capable source with caching off). The compiled extension is found through
 ``CUDF_POLARS_BYTECACHE_PATH`` (directory holding ``_bytecache*.so``). Block size and fused GET size
@@ -21,7 +22,14 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-__all__ = ["enabled", "register_layouts", "register_layouts_from_sources", "stats", "wrap_sources"]
+__all__ = [
+    "enabled",
+    "register_layouts",
+    "register_layouts_from_sources",
+    "start_scan_prefetch",
+    "stats",
+    "wrap_sources",
+]
 
 _lock = threading.Lock()
 _mod: Any = None
@@ -177,3 +185,92 @@ def wrap_sources(
         return None
     sizes = sizes if sizes is not None else [None] * len(paths)
     return [mod.CachedDatasource(str(p), int(s or 0)) for p, s in zip(paths, sizes, strict=True)]
+
+
+class ScanPrefetcher:
+    """
+    Read-ahead for one scan node.
+
+    A background thread fetches the projected columns of upcoming scan tasks into the byte cache while the
+    scan producers work on earlier tasks, staying at most ``ahead_tasks`` tasks and about ``ahead_bytes`` bytes
+    ahead of the newest task a producer has started. The data waits in host memory, so a task holds device
+    memory only for the copy and decode, not while waiting for the network. The thread ends by itself after
+    submitting every task (or after 60 s without progress).
+    """
+
+    def __init__(
+        self, mod: Any, tasks: Sequence[Any], columns: list[str], ahead_tasks: int, ahead_bytes: int
+    ) -> None:
+        self._mod = mod
+        self._tasks = tasks
+        self._columns = columns
+        self._ahead_tasks = ahead_tasks
+        self._ahead_bytes = ahead_bytes
+        self._cond = threading.Condition()
+        self._frontier = -1
+        self._enqueued: list[int] = []  # bytes enqueued for each submitted task
+        self._thread = threading.Thread(target=self._run, name="bytecache-readahead", daemon=True)
+        self._thread.start()
+
+    def advance(self, task_idx: int) -> None:
+        """Tell the prefetcher that a producer is starting task ``task_idx``."""
+        with self._cond:
+            if task_idx > self._frontier:
+                self._frontier = task_idx
+                self._cond.notify_all()
+
+    def _may_submit(self, nxt: int) -> bool:
+        ahead = self._enqueued[max(self._frontier + 1, 0) : nxt]
+        return nxt <= self._frontier + self._ahead_tasks and sum(ahead) < self._ahead_bytes
+
+    def _register_all(self) -> None:
+        """Open every remote file of the node and register its column layout, in parallel (one HEAD and a footer read each)."""
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+        paths = sorted({str(p) for t in self._tasks for p in t.paths if _is_remote(str(p))} - _registered)
+
+        def one(path: str) -> None:
+            try:
+                src = self._mod.CachedDatasource(path, 0)
+                register_layouts_from_sources([path], [src])
+            except Exception as err:  # noqa: BLE001  (best effort)
+                _layout_errors.append(repr(err))
+
+        if paths:
+            with ThreadPoolExecutor(max_workers=min(32, len(paths))) as pool:
+                list(pool.map(one, paths))
+
+    def _run(self) -> None:
+        self._register_all()
+        nxt = 0
+        while nxt < len(self._tasks):
+            with self._cond:
+                if not self._cond.wait_for(lambda: self._may_submit(nxt), timeout=60):
+                    return
+            total = 0
+            for path in self._tasks[nxt].paths:
+                path = str(path)
+                if not _is_remote(path):
+                    continue
+                try:
+                    if path not in _registered:
+                        src = self._mod.CachedDatasource(path, 0)
+                        register_layouts_from_sources([path], [src])
+                    total += self._mod.prefetch_columns(path, path.rsplit("/", 1)[0], self._columns)
+                except Exception as err:  # noqa: BLE001  (read-ahead is best effort)
+                    _layout_errors.append(repr(err))
+            self._enqueued.append(total)
+            nxt += 1
+
+
+def start_scan_prefetch(tasks: Sequence[Any]) -> ScanPrefetcher | None:
+    """Start read-ahead for a scan node's tasks, or return None when the byte cache or read-ahead is off."""
+    mod = _load()
+    if mod is None or os.environ.get("CUDF_POLARS_BYTECACHE_READAHEAD", "0") != "1" or not tasks:
+        return None
+    if not any(_is_remote(str(p)) for p in tasks[0].paths):
+        return None
+    columns = list(tasks[0].base_scan.schema.keys())
+    ahead_tasks = int(os.environ.get("CUDF_POLARS_BYTECACHE_AHEAD_TASKS", "24"))
+    ahead_bytes = int(float(os.environ.get("CUDF_POLARS_BYTECACHE_AHEAD_GB", "12")) * 1e9)
+    return ScanPrefetcher(mod, tasks, columns, ahead_tasks, ahead_bytes)

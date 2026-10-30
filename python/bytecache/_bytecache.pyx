@@ -30,6 +30,8 @@ cdef extern from "bytecache.hpp" namespace "bytecache" nogil:
         uint64_t device_reads
         uint64_t ns_queue_wait
         uint64_t max_inflight
+        uint64_t bytes_prefetched
+        uint64_t prefetch_jobs
         uint64_t host_reads
         uint64_t ns_host_read
     cdef cppclass column_stats:
@@ -40,6 +42,7 @@ cdef extern from "bytecache.hpp" namespace "bytecache" nogil:
         uint64_t fetched_bytes
         uint64_t resident_blocks
     void c_register_layout "bytecache::register_layout"(const string&, const string&, const vector[string]&, const vector[uint32_t]&, const vector[uint64_t]&, const vector[uint64_t]&) except +
+    uint64_t c_prefetch "bytecache::prefetch_columns"(const string&, const string&, const vector[string]&) except +
     vector[column_stats] c_get_column_stats "bytecache::get_column_stats"()
     void c_configure "bytecache::configure"(const config&) except +
     stats c_get_stats "bytecache::get_stats"()
@@ -80,6 +83,8 @@ def get_stats():
         "device_reads": s.device_reads,
         "ns_queue_wait": s.ns_queue_wait,
         "max_inflight": s.max_inflight,
+        "bytes_prefetched": s.bytes_prefetched,
+        "prefetch_jobs": s.prefetch_jobs,
         "host_reads": s.host_reads,
         "ns_host_read": s.ns_host_read,
     }
@@ -91,6 +96,14 @@ def register_layout(str path, str table, list columns, list col_index, list offs
     for c in columns:
         cols.push_back((<str>c).encode())
     c_register_layout(path.encode(), table.encode(), cols, col_index, offsets, sizes)
+
+
+def prefetch_columns(str path, str table, list columns):
+    """Start read-ahead of the named columns of a registered file. Returns the bytes of the ranges (0 if unknown)."""
+    cdef vector[string] cols
+    for c in columns:
+        cols.push_back((<str>c).encode())
+    return c_prefetch(path.encode(), table.encode(), cols)
 
 
 def get_column_stats():

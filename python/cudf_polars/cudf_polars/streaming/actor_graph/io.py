@@ -52,6 +52,7 @@ from cudf_polars.streaming.io import (
 )
 from cudf_polars.streaming.rank_aware_source import RankAwareSource
 from cudf_polars.streaming.utils import _fallback_inform
+from cudf_polars.utils import bytecache
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -712,10 +713,16 @@ async def scan_node(
             await ch_out.drain(context)
             return
 
+        # Read-ahead into the byte cache (no-op unless it is enabled): fetch upcoming tasks' columns into host
+        # memory while the producers work on earlier tasks.
+        prefetcher = bytecache.start_scan_prefetch(tasks)
+
         # If there is only one task or one producer, we can
         # skip the lineariser and read the chunks directly
         if len(tasks) == 1 or num_producers == 1:
             for seq_num, task in enumerate(tasks):
+                if prefetcher is not None:
+                    prefetcher.advance(seq_num)
                 await read_chunk(
                     context,
                     task,
@@ -743,6 +750,8 @@ async def scan_node(
         async def _producer(producer_id: int) -> None:
             for task_idx, task in producer_tasks[producer_id]:
                 ch_out = await lineariser.acquire(producer_id)
+                if prefetcher is not None:
+                    prefetcher.advance(task_idx)
                 await read_chunk(
                     context,
                     task,
