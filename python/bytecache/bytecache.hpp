@@ -9,6 +9,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace bytecache {
 
@@ -26,12 +27,28 @@ struct stats {
   std::uint64_t blocks_resident{0};
   std::uint64_t gets_issued{0};
   std::uint64_t waits_on_inflight{0};
+  // Time (ns, summed over threads) spent in each stage; for finding overheads.
+  std::uint64_t ns_open{0};         ///< opening remote objects (HEAD)
+  std::uint64_t ns_pinned_wait{0};  ///< waiting for / creating a pinned staging buffer
+  std::uint64_t ns_read{0};         ///< cache read (lookup, fetch, copies) inside device reads
+  std::uint64_t ns_h2d{0};          ///< host-to-device copy plus stream synchronise
+  std::uint64_t ns_budget_wait{0};  ///< waiting for GET staging buffers
+  std::uint64_t device_reads{0};    ///< device_read_async calls
+  std::uint64_t ns_queue_wait{0};   ///< time jobs waited between submit and start on the I/O pool
+  std::uint64_t host_reads{0};      ///< synchronous host_read calls (footers, metadata)
+  std::uint64_t ns_host_read{0};    ///< time inside synchronous host_read calls
+  std::uint64_t max_inflight{0};    ///< peak number of device reads running at once
 };
 
 /// Set the process-wide configuration. Must be called before the first read; later calls with a different config throw.
 void configure(config const& cfg);
 stats get_stats();
 void reset_stats();
+/// Per-second counts of device reads submitted and completed since the first submit (index = seconds, last bucket is a catch-all).
+std::vector<std::uint64_t> timeline_submit();
+std::vector<std::uint64_t> timeline_done();
+/// Device reads that took longer than 1 s: "path offset size milliseconds" (diagnostic, capped at 64 entries).
+std::vector<std::string> slow_reads();
 void clear();
 
 class cached_source : public cudf::io::datasource {

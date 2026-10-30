@@ -5,11 +5,12 @@ path = "s3://rapids-tpch/tpch-rs/scale-1/lineitem/part.0.parquet"
 n = kvikio.RemoteFile.open(path).nbytes()
 def read(src, cols):
     o = plc.io.parquet.ParquetReaderOptions.builder(plc.io.SourceInfo([src])).build()
-    o.set_column_names(cols)
+    if cols is not None:
+        o.set_column_names(cols)
     tbl = plc.io.parquet.read_parquet(o)
     t = tbl.tbl
     return pa.Table.from_arrays([c.to_arrow() for c in t.columns()], names=tbl.column_names(include_children=False))
-colsets = [["l_extendedprice", "l_discount"], ["l_shipdate", "l_extendedprice"], ["l_orderkey", "l_partkey", "l_suppkey"], ["l_comment"]]
+colsets = [["l_extendedprice", "l_discount"], ["l_shipdate", "l_extendedprice"], ["l_orderkey", "l_partkey", "l_suppkey"], ["l_comment"], None]  # None = every column: libcudf merges adjacent chunks into reads larger than one 16 MiB staging buffer (the large-read path)
 t0 = time.time(); ref = [read(path, c) for c in colsets]; print("reference reads %.1fs" % (time.time() - t0))
 CAP = int(sys.argv[1]) if len(sys.argv) > 1 else 8   # MiB; 8 forces constant eviction on a 178 MB object, 0 disables caching
 NT = int(sys.argv[2]) if len(sys.argv) > 2 else 6

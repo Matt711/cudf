@@ -84,6 +84,22 @@ pylibcudf cannot take a Python-written data source (`SourceInfo` accepts paths, 
   buffer per thread and allocated GET buffers without limit: resident memory reached 232 GB at 100 GB cache and
   1024 threads, which exhausted host RAM and took the machine down.
 
+- **Large reads run their GETs in parallel.** libcudf merges adjacent column chunks, so one read can be hundreds
+  of MB (q2 reads the 716 MB `supplier/part.0.parquet` as a single range). An earlier version copied large
+  reads through the pinned buffer 16 MiB at a time, one piece after another, so that read cost 45 sequential GET
+  latencies (15 s; q2 took 18 s instead of 4.5 s). Now a read larger than one pinned buffer is fetched whole into
+  a temporary buffer (all its GETs in flight together, as the standard kvikio path does with its 16 MiB tasks)
+  and then copied to the device through pinned pieces. The temporary buffers are bounded by `BYTECACHE_BIG_MB`
+  (default 4096 MiB); a read bigger than that budget falls back to the piece-by-piece loop.
+- **The pinned pool is created at start-up.** `cudaMallocHost` takes about 5 ms on an idle GPU but about 1 s
+  while kernels are running, so creating pinned buffers lazily inside a query stalled reads. `configure()` now
+  pins all buffers once (about 8 GiB, a few seconds); `BYTECACHE_PREPIN=0` turns that off.
+- **Diagnostics.** `get_stats()` also reports per-stage thread-time (`ns_open`, `ns_pinned_wait`, `ns_read`,
+  `ns_h2d`, `ns_budget_wait`, `ns_queue_wait`), `device_reads`, `max_inflight`, `host_reads`/`ns_host_read`;
+  `get_timeline()` gives per-second submitted/completed device reads; `get_slow_reads()` lists device reads whose
+  whole lifetime exceeded 1 s, split into queue/pinned/read/h2d milliseconds. These found the large-read problem:
+  the timeline showed 3123 of 3124 reads finishing in 2 s and one straggler finishing at 13 s.
+
 ### 3.4 Build and ABI notes
 
 - `build.sh` builds `_bytecache.abi3.so` against the conda env (libcudf, kvikio, pylibcudf). pylibcudf is built
@@ -106,6 +122,8 @@ pylibcudf cannot take a Python-written data source (`SourceInfo` accepts paths, 
 | `BYTECACHE_THREADS` | 512 | I/O threads |
 | `BYTECACHE_GET_BUFFERS` | 512 | GET staging buffers (x GET size) |
 | `BYTECACHE_PINNED_BUFFERS` | 512 | Pinned copy buffers (x 16 MiB) |
+| `BYTECACHE_BIG_MB` | 4096 | Budget for temporary buffers of reads larger than one pinned buffer |
+| `BYTECACHE_PREPIN` | 1 | Pin the staging pool at start-up (`0` = lazily) |
 | `BYTECACHE_DEBUG` | unset | Native backtrace on SIGSEGV |
 
 Recommended companions (measured to help without the cache too): `CUDF_POLARS__EXECUTOR__KVIKIO_REACTOR_COUNT=48`,
@@ -122,13 +140,15 @@ memory (57 to 131 GB RSS seen without the cache). Do not use a cache so large th
 | + bytecache 100 GB, 128 I/O threads (first working version) | 222 s | 524 GB |
 | + bytecache 100 GB, 512 I/O threads (per-thread buffers) | 145.0 s | 520 GB |
 | + bytecache 100 GB, 1024 I/O threads (per-thread buffers) | 139.0 s | - |
+| + bytecache 100 GB, 512 threads, bounded memory, pre-pinned, parallel large reads | 140.1 s | 521 GB |
 | Sirius main, best config (200 GB host tier) | 96 to 109 s | about 410 GB |
 
 The 145.0 s and 139.0 s rows were taken with the older unbounded-staging build. With the bounded build: 100 GB,
 512 threads, 512 GET / 512 pinned buffers: 150.1 s (peak RSS 201 GB); 1024 threads, 1024/1024: 157.5 s (215 GB);
 with too-small limits (256 GET / 128 pinned) it took 248 to 250 s because reads in flight were capped, and a
-75 GB cache with those limits took 371 s (hit rate 24%). q2 takes 14 to 16 s with the bounded build versus
-2 s with the old one (under investigation). Hit rate at 100 GB was about 60%
+75 GB cache with those limits took 371 s (hit rate 24%). After the pre-pinned pool and the parallel
+large-read fix (section 3.3) the 100 GB run takes 140.1 s (22/22 validated, 60% hit rate, 521 GB from S3,
+NIC average 3.5 and peak 9.0 GB/s, peak RSS 202 GB); q2 fell from 14 s to 1.9 s. Hit rate at 100 GB was about 60%
 of requested bytes (634 of 1065 GB).
 
 ## 6. Known limitations
@@ -136,7 +156,7 @@ of requested bytes (634 of 1065 GB).
 - The network is under-used: during the cache runs it averaged about 3 GB/s (peak 9 to 12 GB/s, NIC limit
   12.5 GB/s). Reads are issued on demand, not ahead of need, so the engine still waits for data.
 - Hit rate at 100 GB (about 60%) is below what a column-aware policy should reach; the block-level SLRU does
-  not know which columns are reused. q13 got slower with the cache (13.8 s vs about 7.7 s) and is unexplained.
+  not know which columns are reused. q13 took 13.8 s in one early run and about 7 s in later ones (not investigated).
 - Even a perfect cache leaves cudf-polars at about 109 s (the warm local pass), against about 88 s for Sirius,
   so the last 10 to 20 s needs compute work on the slow queries (q13, q7, q21, q18, q9).
 - No ETag or version check; single process only; no direct-to-device path (data is staged in pinned memory).

@@ -4,6 +4,7 @@
 from libc.stdint cimport uint64_t
 from libcpp.memory cimport unique_ptr
 from libcpp.string cimport string
+from libcpp.vector cimport vector
 
 from pylibcudf.io.datasource cimport Datasource
 from pylibcudf.libcudf.io.datasource cimport datasource
@@ -21,10 +22,23 @@ cdef extern from "bytecache.hpp" namespace "bytecache" nogil:
         uint64_t blocks_resident
         uint64_t gets_issued
         uint64_t waits_on_inflight
+        uint64_t ns_open
+        uint64_t ns_pinned_wait
+        uint64_t ns_read
+        uint64_t ns_h2d
+        uint64_t ns_budget_wait
+        uint64_t device_reads
+        uint64_t ns_queue_wait
+        uint64_t max_inflight
+        uint64_t host_reads
+        uint64_t ns_host_read
     void c_configure "bytecache::configure"(const config&) except +
     stats c_get_stats "bytecache::get_stats"()
     void c_reset_stats "bytecache::reset_stats"()
     void c_clear "bytecache::clear"() except +
+    vector[uint64_t] c_tl_submit "bytecache::timeline_submit"()
+    vector[uint64_t] c_tl_done "bytecache::timeline_done"()
+    vector[string] c_slow "bytecache::slow_reads"()
     cdef cppclass cached_source(datasource):
         cached_source(string path, size_t size) except +
         size_t size() const
@@ -49,7 +63,27 @@ def get_stats():
         "blocks_resident": s.blocks_resident,
         "gets_issued": s.gets_issued,
         "waits_on_inflight": s.waits_on_inflight,
+        "ns_open": s.ns_open,
+        "ns_pinned_wait": s.ns_pinned_wait,
+        "ns_read": s.ns_read,
+        "ns_h2d": s.ns_h2d,
+        "ns_budget_wait": s.ns_budget_wait,
+        "device_reads": s.device_reads,
+        "ns_queue_wait": s.ns_queue_wait,
+        "max_inflight": s.max_inflight,
+        "host_reads": s.host_reads,
+        "ns_host_read": s.ns_host_read,
     }
+
+
+def get_timeline():
+    """(submitted, completed): per-second counts of device reads since the first one."""
+    return list(c_tl_submit()), list(c_tl_done())
+
+
+def get_slow_reads():
+    """Device reads that took longer than 1 s: 'path offset size milliseconds'."""
+    return [s.decode() for s in c_slow()]
 
 
 def reset_stats():

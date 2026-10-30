@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -42,6 +43,7 @@ struct block {
 };
 
 struct remote_file {
+  std::string path;
   std::uint32_t id{};
   std::size_t size{};
   std::unique_ptr<kvikio::RemoteHandle> handle;
@@ -125,6 +127,36 @@ io_pool& pool()
   return *p;
 }
 
+std::atomic<std::uint64_t> g_ns_open{0}, g_ns_pinned_wait{0}, g_ns_read{0}, g_ns_h2d{0}, g_ns_budget_wait{0}, g_device_reads{0}, g_ns_queue_wait{0}, g_inflight{0}, g_max_inflight{0}, g_host_reads{0}, g_ns_host_read{0};
+
+constexpr int kBuckets = 128;
+std::atomic<std::uint64_t> g_hist_submit[kBuckets], g_hist_done[kBuckets];
+std::atomic<std::int64_t> g_t0_ns{0};
+
+int bucket_now()
+{
+  auto const now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  std::int64_t expected = 0;
+  g_t0_ns.compare_exchange_strong(expected, now);  // first caller sets t0
+  auto const b = (now - g_t0_ns.load()) / 1000000000;
+  return static_cast<int>(std::min<std::int64_t>(b, kBuckets - 1));
+}
+
+struct job_times { double queue_ms{0}, pinned_ms{0}, read_ms{0}, h2d_ms{0}; };
+thread_local job_times t_job;
+std::mutex g_slow_m;
+std::vector<std::string> g_slow;
+
+struct stage_timer {
+  std::atomic<std::uint64_t>& sink;
+  std::chrono::steady_clock::time_point t0{std::chrono::steady_clock::now()};
+  explicit stage_timer(std::atomic<std::uint64_t>& s) : sink(s) {}
+  ~stage_timer()
+  {
+    sink += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+  }
+};
+
 std::size_t env_size(char const* name, std::size_t def)
 {
   char const* e = std::getenv(name);
@@ -165,12 +197,33 @@ counting_budget& get_budget()
   return *b;
 }
 
+/// Bound on temporary buffers for reads larger than one pinned buffer (BYTECACHE_BIG_MB, default 4096 MiB), in 16 MiB units.
+counting_budget& big_budget()
+{
+  static counting_budget* b = new counting_budget(env_size("BYTECACHE_BIG_MB", 4096) / 16);
+  return *b;
+}
+
 /// Fixed-size pool of pinned buffers for host-to-device copies, shared by all threads and bounded
 /// (BYTECACHE_PINNED_BUFFERS x 16 MiB, default 512 x 16 MiB = 8 GiB). Buffers are created lazily and never freed.
 class pinned_pool {
  public:
   pinned_pool(std::size_t n, std::size_t size) : n_(n), size_(size) {}
   std::size_t buffer_size() const { return size_; }
+  /// Create every pinned buffer now. cudaMallocHost blocks while kernels are running (about 1 s each under load
+  /// versus 5 ms on an idle GPU), so doing this lazily inside a query stalled the reads that needed a new buffer.
+  void prefill()
+  {
+    std::vector<std::uint8_t*> made;
+    for (std::size_t i = 0; i < n_; ++i) {
+      void* p = nullptr;
+      if (cudaMallocHost(&p, size_) != cudaSuccess) break;
+      made.push_back(static_cast<std::uint8_t*>(p));
+    }
+    std::lock_guard l(m_);
+    for (auto* p : made) free_.push_back(p);
+    created_ += made.size();
+  }
   std::uint8_t* acquire()
   {
     std::unique_lock l(m_);
@@ -256,6 +309,7 @@ class cache {
     }
     // Open outside the lock (may issue a HEAD). A duplicate open race is harmless: the first insert wins.
     auto rf = std::make_shared<remote_file>();
+    rf->path = path;
     if (known_size > 0) {
       rf->handle = std::make_unique<kvikio::RemoteHandle>(kvikio::RemoteHandle::open(
         path, kvikio::infer_remote_endpoint_type(path), std::nullopt, known_size));
@@ -353,7 +407,10 @@ class cache {
       std::size_t const wave_max = get_budget().capacity();
       for (std::size_t w = 0; w < runs.size(); w += wave_max) {
         std::size_t const wn = std::min(wave_max, runs.size() - w);
-        get_budget().acquire(wn);
+        {
+          stage_timer t(g_ns_budget_wait);
+          get_budget().acquire(wn);
+        }
         held = wn;
         pieces.clear();
         for (std::size_t r = w; r < w + wn; ++r) {
@@ -439,6 +496,9 @@ class cache {
     s.blocks_evicted    = st_.blocks_evicted;
     s.gets_issued       = st_.gets_issued;
     s.waits_on_inflight = st_.waits_on_inflight;
+    s.ns_open = g_ns_open; s.ns_pinned_wait = g_ns_pinned_wait; s.ns_read = g_ns_read; s.ns_h2d = g_ns_h2d;
+    s.ns_budget_wait = g_ns_budget_wait; s.device_reads = g_device_reads;
+    s.ns_queue_wait = g_ns_queue_wait; s.max_inflight = g_max_inflight; s.host_reads = g_host_reads; s.ns_host_read = g_ns_host_read;
     std::lock_guard l(m_);
     s.blocks_resident = probation_.size() + protected_.size();
     return s;
@@ -583,9 +643,27 @@ void configure(config const& cfg)
 {
   if (std::getenv("BYTECACHE_DEBUG")) signal(SIGSEGV, segv_handler);  // debug aid: native backtrace on a crash
   cache::get().configure(cfg);
+  // Pin the staging pool at start-up, while the GPU is idle (BYTECACHE_PREPIN=0 turns this off).
+  char const* pre = std::getenv("BYTECACHE_PREPIN");
+  if (pre == nullptr || std::atoi(pre) != 0) {
+    cudaFree(nullptr);  // make sure a CUDA context exists
+    pinned().prefill();
+  }
 }
 stats get_stats() { return cache::get().snapshot(); }
-void reset_stats() { cache::get().reset_stats(); }
+void reset_stats()
+{
+  cache::get().reset_stats();
+  for (int i = 0; i < kBuckets; ++i) { g_hist_submit[i] = 0; g_hist_done[i] = 0; }
+  g_t0_ns = 0;
+}
+std::vector<std::string> slow_reads()
+{
+  std::lock_guard l(g_slow_m);
+  return g_slow;
+}
+std::vector<std::uint64_t> timeline_submit() { return {g_hist_submit, g_hist_submit + kBuckets}; }
+std::vector<std::uint64_t> timeline_done() { return {g_hist_done, g_hist_done + kBuckets}; }
 void clear() { cache::get().clear(); }
 
 struct cached_source::impl {
@@ -594,6 +672,7 @@ struct cached_source::impl {
 
 cached_source::cached_source(std::string path, std::size_t size) : p_(std::make_unique<impl>())
 {
+  stage_timer t(g_ns_open);
   p_->file = cache::get().open(path, size);
 }
 
@@ -603,6 +682,8 @@ std::size_t cached_source::size() const { return p_->file->size; }
 
 std::size_t cached_source::host_read(std::size_t offset, std::size_t size, std::uint8_t* dst)
 {
+  g_host_reads += 1;
+  stage_timer t(g_ns_host_read);
   return cache::get().read(*p_->file, offset, size, dst);
 }
 
@@ -631,17 +712,84 @@ static std::size_t read_to_device(remote_file& f, std::size_t offset, std::size_
   auto s                  = static_cast<cudaStream_t>(stream.get());
   auto& pp                = pinned();
   std::size_t const S     = pp.buffer_size();
-  for (std::size_t done = 0; done < avail;) {
-    std::size_t const len = std::min(S, avail - done);
-    std::uint8_t* stage   = pp.acquire();
+
+  auto copy_piece = [&](std::uint8_t const* src, std::size_t pos, std::size_t len) {
+    std::uint8_t* stage;
+    {
+      auto const t0 = std::chrono::steady_clock::now();
+      stage_timer t(g_ns_pinned_wait);
+      stage = pp.acquire();
+      t_job.pinned_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
     struct release_guard {
       pinned_pool& pool;
       std::uint8_t* p;
       ~release_guard() { pool.release(p); }
     } guard{pp, stage};
-    cache::get().read(f, offset + done, len, stage);
-    if (cudaMemcpyAsync(dst + done, stage, len, cudaMemcpyHostToDevice, s) != cudaSuccess ||
-        cudaStreamSynchronize(s) != cudaSuccess) {
+    std::memcpy(stage, src, len);
+    auto const t0 = std::chrono::steady_clock::now();
+    stage_timer t(g_ns_h2d);
+    struct h2d_acc {
+      std::chrono::steady_clock::time_point t0;
+      ~h2d_acc() { t_job.h2d_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+    } acc{t0};
+    if (cudaMemcpyAsync(dst + pos, stage, len, cudaMemcpyHostToDevice, s) != cudaSuccess || cudaStreamSynchronize(s) != cudaSuccess) {
+      throw std::runtime_error("bytecache: host-to-device copy failed");
+    }
+  };
+
+  // Large reads: fetch the whole range at once so its GETs run in parallel (reading it 16 MiB at a time, one
+  // after another, made a 716 MB column range take 15 s), then copy to the device through pinned pieces.
+  std::size_t const units = (avail + S - 1) / S;
+  if (units > 1 && units <= big_budget().capacity()) {
+    big_budget().acquire(units);
+    struct big_release {
+      std::size_t n;
+      ~big_release() { big_budget().release(n); }
+    } br{units};
+    std::unique_ptr<std::uint8_t[]> big(new std::uint8_t[avail]);
+    {
+      auto const t0 = std::chrono::steady_clock::now();
+      stage_timer t(g_ns_read);
+      cache::get().read(f, offset, avail, big.get());
+      t_job.read_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    for (std::size_t done = 0; done < avail;) {
+      std::size_t const len = std::min(S, avail - done);
+      copy_piece(big.get() + done, done, len);
+      done += len;
+    }
+    return avail;
+  }
+
+  // Small reads (and reads larger than the big-read budget): one pinned buffer at a time.
+  for (std::size_t done = 0; done < avail;) {
+    std::size_t const len = std::min(S, avail - done);
+    std::uint8_t* stage;
+    {
+      auto const t0 = std::chrono::steady_clock::now();
+      stage_timer t(g_ns_pinned_wait);
+      stage = pp.acquire();
+      t_job.pinned_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    struct release_guard {
+      pinned_pool& pool;
+      std::uint8_t* p;
+      ~release_guard() { pool.release(p); }
+    } guard{pp, stage};
+    {
+      auto const t0 = std::chrono::steady_clock::now();
+      stage_timer t(g_ns_read);
+      cache::get().read(f, offset + done, len, stage);
+      t_job.read_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    auto const t0 = std::chrono::steady_clock::now();
+    stage_timer t(g_ns_h2d);
+    struct h2d_acc {
+      std::chrono::steady_clock::time_point t0;
+      ~h2d_acc() { t_job.h2d_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+    } acc{t0};
+    if (cudaMemcpyAsync(dst + done, stage, len, cudaMemcpyHostToDevice, s) != cudaSuccess || cudaStreamSynchronize(s) != cudaSuccess) {
       throw std::runtime_error("bytecache: host-to-device copy failed");
     }
     done += len;
@@ -659,12 +807,36 @@ std::future<std::size_t> cached_source::device_read_async(std::size_t offset, st
                                                           std::uint8_t* dst, cuda::stream_ref stream)
 {
   auto file = p_->file;
-  return pool().submit([file, offset, size, dst, stream] { return read_to_device(*file, offset, size, dst, stream); });
+  g_device_reads += 1;
+  g_hist_submit[bucket_now()] += 1;
+  auto const t_submit = std::chrono::steady_clock::now();
+  return pool().submit([file, offset, size, dst, stream, t_submit] {
+    t_job = job_times{};
+    auto const t_start = std::chrono::steady_clock::now();
+    t_job.queue_ms     = std::chrono::duration<double, std::milli>(t_start - t_submit).count();
+    g_ns_queue_wait += static_cast<std::uint64_t>(t_job.queue_ms * 1e6);
+    auto const now = ++g_inflight;
+    auto prev      = g_max_inflight.load();
+    while (now > prev && !g_max_inflight.compare_exchange_weak(prev, now)) {}
+    struct dec { ~dec() { --g_inflight; g_hist_done[bucket_now()] += 1; } } d;
+    auto const n = read_to_device(*file, offset, size, dst, stream);
+    double const total = t_job.queue_ms + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+    if (total > 1000) {
+      std::lock_guard l(g_slow_m);
+      if (g_slow.size() < 64)
+        g_slow.push_back(file->path + " off=" + std::to_string(offset) + " size=" + std::to_string(size) + " total_ms=" + std::to_string((long)total) +
+                         " queue_ms=" + std::to_string((long)t_job.queue_ms) + " pinned_ms=" + std::to_string((long)t_job.pinned_ms) +
+                         " read_ms=" + std::to_string((long)t_job.read_ms) + " h2d_ms=" + std::to_string((long)t_job.h2d_ms));
+    }
+    return n;
+  });
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> cached_source::host_read(std::size_t offset,
                                                                        std::size_t size)
 {
+  g_host_reads += 1;
+  stage_timer t(g_ns_host_read);
   std::size_t const avail = offset < p_->file->size ? std::min(size, p_->file->size - offset) : 0;
   std::vector<std::uint8_t> out(avail);
   cache::get().read(*p_->file, offset, avail, out.data());
