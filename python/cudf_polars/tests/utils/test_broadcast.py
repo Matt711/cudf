@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import pyarrow as pa
 import pytest
 
 import polars as pl
@@ -89,3 +90,36 @@ def test_broadcast_with_scalars(nrows):
     result = broadcast(*columns, stream=stream)
     assert [c.name for c in result] == [f"col{i}" for i in range(3)]
     assert all(column.size == nrows for column in result)
+
+
+@pytest.mark.parametrize("nrows", [0, 3])
+def test_broadcast_struct_scalar(nrows):
+    stream = get_cuda_stream()
+    dtype = DataType(pl.Struct({"a": pl.Int64(), "b": pl.Int64()}))
+    scalar = Column(
+        plc.Column.from_scalar(
+            plc.Scalar.from_arrow(
+                pa.scalar(
+                    {"a": 7, "b": 7},
+                    type=pa.struct([("a", pa.int64()), ("b", pa.int64())]),
+                ),
+                stream=stream,
+            ),
+            1,
+            stream=stream,
+        ),
+        dtype=dtype,
+        name="s",
+    )
+    other = Column(
+        plc.Column.from_scalar(
+            plc.Scalar.from_py(1, plc.DataType(plc.TypeId.INT8), stream=stream),
+            nrows,
+            stream=stream,
+        ),
+        dtype=DataType(pl.Int8()),
+        name="x",
+    )
+    result = broadcast(scalar, other, target_length=nrows, stream=stream)
+    assert [c.size for c in result] == [nrows, nrows]
+    assert result[0].dtype == dtype

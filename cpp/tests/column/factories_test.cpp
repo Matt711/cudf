@@ -762,6 +762,32 @@ TEST_F(ColumnFactoryTest, FromStructScalar) { struct_from_scalar(true); }
 
 TEST_F(ColumnFactoryTest, FromStructScalarNull) { struct_from_scalar(false); }
 
+void struct_from_scalar_zero_size(bool is_valid)
+{
+  cudf::test::fixed_width_column_wrapper<int> col0{1};
+  cudf::test::strings_column_wrapper col1{"abc"};
+  cudf::test::lists_column_wrapper<int> col2{{1, 2, 3}};
+
+  std::vector<cudf::column_view> src_children({col0, col1, col2});
+  auto value  = cudf::struct_scalar(src_children, is_valid);
+  auto result = cudf::make_column_from_scalar(value, 0);
+
+  EXPECT_EQ(result->type().id(), cudf::type_id::STRUCT);
+  EXPECT_EQ(result->size(), 0);
+  EXPECT_EQ(result->null_count(), 0);
+  ASSERT_EQ(result->num_children(), 3);
+  EXPECT_EQ(result->child(0).type().id(), cudf::type_id::INT32);
+  EXPECT_EQ(result->child(1).type().id(), cudf::type_id::STRING);
+  EXPECT_EQ(result->child(2).type().id(), cudf::type_id::LIST);
+  for (cudf::size_type i = 0; i < result->num_children(); ++i) {
+    EXPECT_EQ(result->child(i).size(), 0);
+  }
+}
+
+TEST_F(ColumnFactoryTest, FromStructScalarWithZeroSize) { struct_from_scalar_zero_size(true); }
+
+TEST_F(ColumnFactoryTest, FromStructScalarNullWithZeroSize) { struct_from_scalar_zero_size(false); }
+
 TEST_F(ColumnFactoryTest, FromScalarErrors)
 {
   if (cudf::strings::is_large_strings_enabled()) { return; }
