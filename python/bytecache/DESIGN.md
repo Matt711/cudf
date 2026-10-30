@@ -56,10 +56,14 @@ pylibcudf cannot take a Python-written data source (`SourceInfo` accepts paths, 
 - **Storage.** One anonymous `mmap` arena (`MAP_NORESERVE`, so pages are touched lazily), divided into fixed
   blocks (default 1 MiB). Key = (file id, block index). File id comes from a process-wide table of remote
   objects, each holding one `kvikio::RemoteHandle` (so a path is HEAD-ed once per process).
-- **Policy.** Segmented LRU: a block seen once sits in a probation list, a block seen again moves to a protected
-  list. Eviction takes the oldest probation block first, then the oldest protected block. This approximates the
-  LRU-2 policy that the simulation favoured and resists scans (a single pass over a big column does not flush the
-  hot columns). Blocks being read or fetched are pinned and never evicted.
+- **Policy (column-aware).** Every block is attributed to the column its first byte belongs to (section 3.5). A column's
+  priority is how many times its full size has been requested so far (requested bytes / registered bytes): caching a
+  column saves its whole size on every later read, so the saving per cached byte is (reads - 1). When the cache is full
+  a new block is admitted only if its column outranks the lowest-ranked resident column, which then gives up its
+  highest-offset block (so a partly cached column keeps a stable prefix and a cyclic scan of it still hits, instead of
+  thrashing). Otherwise the block bypasses the cache. Bytes that belong to no known column (footers, metadata) rank
+  highest. The earlier policy, a segmented LRU over blocks, is still available with `BYTECACHE_POLICY=slru`; it
+  thrashes under repeated sequential scans (20% hit rate at 75 GB, versus 57% with the column policy).
 - **Misses.** Consecutive missing blocks are fused into one GET of up to 16 MiB through
   `kvikio::RemoteHandle::pread`, using the MULTI_POLL reactors that cudf-polars already configures. The bytes
   land in a staging buffer, are copied into the cache slots and into the caller's destination. Concurrent
@@ -99,6 +103,18 @@ pylibcudf cannot take a Python-written data source (`SourceInfo` accepts paths, 
   `get_timeline()` gives per-second submitted/completed device reads; `get_slow_reads()` lists device reads whose
   whole lifetime exceeded 1 s, split into queue/pinned/read/h2d milliseconds. These found the large-read problem:
   the timeline showed 3123 of 3124 reads finishing in 2 s and one straggler finishing at 13 s.
+
+### 3.5 Metadata store (column layout)
+
+pylibcudf's hybrid reader returns the exact compressed byte range of every column chunk for chosen columns and row
+groups (`HybridScanReader.all_column_chunks_byte_ranges`), computed from the footer the engine already parsed (about
+0.01 s per file, so no footer parser of our own). `cudf_polars/utils/bytecache.py` registers each remote file once
+(`register_layouts`, or `register_layouts_from_sources` when the engine did not prefetch footers: it then reads the footer
+through the cache-backed source, so the footer blocks stay cached). The C++ cache keeps, per file, the sorted
+(start, end, column) segments and, per column ("<table>|<column>"), counters: registered, requested, hit and fetched
+bytes and resident blocks (`get_column_stats()`). This is the per-column hit-rate summary used in section 5, and it is
+the input the read-ahead needs (which byte ranges an upcoming scan task will read). In the SF1000 runs 99.6% of
+requested bytes are attributed to a known column.
 
 ### 3.4 Build and ABI notes
 
@@ -140,7 +156,10 @@ memory (57 to 131 GB RSS seen without the cache). Do not use a cache so large th
 | + bytecache 100 GB, 128 I/O threads (first working version) | 222 s | 524 GB |
 | + bytecache 100 GB, 512 I/O threads (per-thread buffers) | 145.0 s | 520 GB |
 | + bytecache 100 GB, 1024 I/O threads (per-thread buffers) | 139.0 s | - |
-| + bytecache 100 GB, 512 threads, bounded memory, pre-pinned, parallel large reads | 140.1 s | 521 GB |
+| + bytecache 100 GB, 512 threads, bounded memory, pre-pinned, parallel large reads (block-LRU policy) | 135.2 to 150.1 s (four runs, mean 140.6) | 512 to 521 GB |
+| same, 75 GB cache (block-LRU policy) | 158.4 and 172.9 s | 998 to 1023 GB |
+| **+ column-aware policy, 100 GB** | **125.6 s** (72% hit rate) | **459 GB** |
+| + column-aware policy, 75 GB | 146.6 s (57% hit rate) | 692 GB |
 | Sirius main, best config (200 GB host tier) | 96 to 109 s | about 410 GB |
 
 The 145.0 s and 139.0 s rows were taken with the older unbounded-staging build. With the bounded build: 100 GB,
@@ -155,8 +174,8 @@ of requested bytes (634 of 1065 GB).
 
 - The network is under-used: during the cache runs it averaged about 3 GB/s (peak 9 to 12 GB/s, NIC limit
   12.5 GB/s). Reads are issued on demand, not ahead of need, so the engine still waits for data.
-- Hit rate at 100 GB (about 60%) is below what a column-aware policy should reach; the block-level SLRU does
-  not know which columns are reused. q13 took 13.8 s in one early run and about 7 s in later ones (not investigated).
+- Remaining waste is over-reading: some columns are fetched far more than requested (at 100 GB `l_comment` 25 GB
+  requested, 83 GB fetched; `ps_comment` 2 GB, 7 GB), probably sparse page reads against 1 MiB blocks. q13 took 13.8 s in one early run and about 7 s in later ones (not investigated).
 - Even a perfect cache leaves cudf-polars at about 109 s (the warm local pass), against about 88 s for Sirius,
   so the last 10 to 20 s needs compute work on the slow queries (q13, q7, q21, q18, q9).
 - No ETag or version check; single process only; no direct-to-device path (data is staged in pinned memory).

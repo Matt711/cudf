@@ -132,12 +132,14 @@ def _prefetch_parquet_footers_for_paths(
         metadata = plc.io.parquet_metadata.read_parquet_footers(
             plc.io.types.SourceInfo(cache_sources)
         )
-        return [
+        infos = [
             CachedParquetInfo(
                 path, size, file_metadata, parse_hybrid_metadata=parse_hybrid_metadata
             )
             for path, size, file_metadata in zip(paths, sizes, metadata, strict=True)
         ]
+        bytecache.register_layouts(infos)
+        return infos
 
     for path in paths:
         if paths and plc.io.SourceInfo._is_remote_uri(path):

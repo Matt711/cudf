@@ -40,6 +40,23 @@ struct stats {
   std::uint64_t max_inflight{0};    ///< peak number of device reads running at once
 };
 
+/// Per-column accounting (columns are known once a file's layout is registered; id 0 is "(unknown)").
+struct column_stats {
+  std::string name;                       ///< "<table>|<column>"
+  std::uint64_t registered_bytes{0};      ///< compressed bytes of this column over all registered files
+  std::uint64_t requested_bytes{0};       ///< bytes asked for by reads
+  std::uint64_t hit_bytes{0};             ///< served from the cache
+  std::uint64_t fetched_bytes{0};         ///< fetched from S3 (whole blocks)
+  std::uint64_t resident_blocks{0};       ///< blocks of this column currently cached
+};
+
+/// Register the byte layout of one remote object: for every column chunk its (offset, size), so the cache can
+/// attribute blocks to columns. `col_index[i]` indexes `columns` for chunk i. Safe to call more than once per path (later calls are ignored).
+void register_layout(std::string const& path, std::string const& table, std::vector<std::string> const& columns,
+                     std::vector<std::uint32_t> const& col_index, std::vector<std::uint64_t> const& offsets,
+                     std::vector<std::uint64_t> const& sizes);
+std::vector<column_stats> get_column_stats();
+
 /// Set the process-wide configuration. Must be called before the first read; later calls with a different config throw.
 void configure(config const& cfg);
 stats get_stats();

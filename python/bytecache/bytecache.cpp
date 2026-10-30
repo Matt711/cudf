@@ -22,6 +22,7 @@
 #include <future>
 #include <list>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -31,7 +32,19 @@ namespace {
 
 enum class block_state : std::uint8_t { loading, ready, failed };
 
+struct segment {
+  std::uint64_t start, end;
+  std::uint32_t col;
+};
+
+struct column_info {
+  std::string name;
+  std::atomic<std::uint64_t> registered{0}, requested{0}, hit{0}, fetched{0}, resident{0};
+  std::set<std::uint64_t> keys;  ///< keys of resident blocks, ordered (guarded by the cache mutex)
+};
+
 struct block {
+  std::uint32_t col{0};
   std::uint64_t key{};
   std::uint32_t slot{};
   std::uint32_t len{};   // valid bytes in the slot
@@ -44,6 +57,7 @@ struct block {
 
 struct remote_file {
   std::string path;
+  std::shared_ptr<const std::vector<segment>> layout;  ///< sorted by start; null until registered
   std::uint32_t id{};
   std::size_t size{};
   std::unique_ptr<kvikio::RemoteHandle> handle;
@@ -129,6 +143,7 @@ io_pool& pool()
 
 std::atomic<std::uint64_t> g_ns_open{0}, g_ns_pinned_wait{0}, g_ns_read{0}, g_ns_h2d{0}, g_ns_budget_wait{0}, g_device_reads{0}, g_ns_queue_wait{0}, g_inflight{0}, g_max_inflight{0}, g_host_reads{0}, g_ns_host_read{0};
 
+constexpr std::size_t kMaxColumns = 4096;
 constexpr int kBuckets = 128;
 std::atomic<std::uint64_t> g_hist_submit[kBuckets], g_hist_done[kBuckets];
 std::atomic<std::int64_t> g_t0_ns{0};
@@ -289,6 +304,14 @@ class cache {
     }
     cfg_        = c;
     configured_ = true;
+    {
+      char const* pol = std::getenv("BYTECACHE_POLICY");
+      column_policy_  = !(pol != nullptr && std::string(pol) == "slru");
+    }
+    if (cols_.empty()) {
+      cols_.reserve(kMaxColumns);  // never reallocated: readers index cols_ without the lock
+      column_id("(unknown)");
+    }
     if (c.capacity_bytes >= c.block_size) {
       nslots_ = c.capacity_bytes / c.block_size;
       void* p = mmap(nullptr, nslots_ * c.block_size, PROT_READ | PROT_WRITE,
@@ -342,34 +365,42 @@ class cache {
     struct item {
       block* blk{nullptr};
       kind k{kind::uncached};
+      std::uint32_t col{0};
     };
     std::vector<item> items(nb);
 
     // Phase 1: classify every block under the lock (hit / claimed by us / cannot be cached).
     {
       std::unique_lock l(m_);
+      auto const* layout = f.layout.get();
       for (std::size_t i = 0; i < nb; ++i) {
         std::uint64_t const key = (static_cast<std::uint64_t>(f.id) << 32) | (b0 + i);
+        std::size_t const bstart = (b0 + i) * B;
+        std::size_t const overlap = std::min(off + n, bstart + B) - std::max(off, bstart);
         auto it                 = map_.find(key);
         if (it != map_.end()) {
           block* b = it->second;
           b->pins++;
-          items[i] = {b, kind::hit};
+          items[i] = {b, kind::hit, b->col};
+          cols_[b->col]->requested += overlap;
           if (b->st == block_state::ready) touch(b);
           continue;
         }
+        std::uint32_t const col = col_of(layout, bstart);
+        cols_[col]->requested += overlap;
         std::uint32_t slot;
-        if (!alloc_slot(slot)) {
-          items[i] = {nullptr, kind::uncached};
+        if (!alloc_slot(col, slot)) {
+          items[i] = {nullptr, kind::uncached, col};
           continue;
         }
         auto* b = new block;
+        b->col  = col;
         b->key  = key;
         b->slot = slot;
         b->len  = static_cast<std::uint32_t>(std::min<std::size_t>(B, f.size - (b0 + i) * B));
         b->pins = 1;
         map_.emplace(key, b);
-        items[i] = {b, kind::owner};
+        items[i] = {b, kind::owner, col};
       }
     }
 
@@ -435,6 +466,7 @@ class cache {
             std::size_t const bi = b0 + i;
             std::uint8_t const* src = p.buf.get() + (bi * B - foff);
             copy_block_to_dst(bi, src);
+            cols_[items[i].col]->fetched += std::min<std::size_t>(B, f.size - bi * B);
             if (items[i].k == kind::owner) {
               block* b = items[i].blk;
               std::memcpy(arena_ + static_cast<std::size_t>(b->slot) * B, src, b->len);
@@ -471,7 +503,9 @@ class cache {
         }
       }
       if (b->st == block_state::ready) {
-        st_.bytes_hit += copy_block_to_dst(b0 + i, arena_ + static_cast<std::size_t>(b->slot) * B);
+        auto const got = copy_block_to_dst(b0 + i, arena_ + static_cast<std::size_t>(b->slot) * B);
+        st_.bytes_hit += got;
+        cols_[items[i].col]->hit += got;
       } else {
         retry.push_back(i);
       }
@@ -485,6 +519,64 @@ class cache {
       if (hi > lo) f.handle->pread(dst + (lo - off), hi - lo, lo).get();
     }
     return n;
+  }
+
+  static std::uint32_t col_of(std::vector<segment> const* layout, std::uint64_t offset)
+  {
+    if (layout == nullptr || layout->empty()) return 0;
+    auto it = std::upper_bound(layout->begin(), layout->end(), offset, [](std::uint64_t o, segment const& s) { return o < s.start; });
+    if (it == layout->begin()) return 0;
+    --it;
+    return offset < it->end ? it->col : 0;
+  }
+
+  std::uint32_t column_id(std::string const& key)  // requires m_ held
+  {
+    auto it = col_ids_.find(key);
+    if (it != col_ids_.end()) return it->second;
+    if (cols_.size() >= kMaxColumns) return 0;  // table full: attribute to "(unknown)"
+    auto id = static_cast<std::uint32_t>(cols_.size());
+    cols_.push_back(std::make_unique<column_info>());
+    cols_.back()->name = key;
+    col_ids_.emplace(key, id);
+    return id;
+  }
+
+  void register_layout(std::string const& path, std::string const& table, std::vector<std::string> const& columns,
+                       std::vector<std::uint32_t> const& col_index, std::vector<std::uint64_t> const& offsets,
+                       std::vector<std::uint64_t> const& sizes)
+  {
+    std::lock_guard l(m_);
+    auto fit = files_.find(path);
+    if (fit == files_.end() || fit->second->layout) return;  // unknown file, or already registered
+    std::vector<std::uint32_t> ids(columns.size());
+    for (std::size_t i = 0; i < columns.size(); ++i) ids[i] = column_id(table + "|" + columns[i]);
+    auto segs = std::make_shared<std::vector<segment>>();
+    segs->reserve(offsets.size());
+    for (std::size_t i = 0; i < offsets.size(); ++i) {
+      std::uint32_t const col = ids[col_index[i]];
+      segs->push_back({offsets[i], offsets[i] + sizes[i], col});
+      cols_[col]->registered += sizes[i];
+    }
+    std::sort(segs->begin(), segs->end(), [](segment const& a, segment const& b) { return a.start < b.start; });
+    fit->second->layout = std::move(segs);
+  }
+
+  std::vector<column_stats> column_snapshot()
+  {
+    std::lock_guard l(m_);
+    std::vector<column_stats> out;
+    for (auto const& c : cols_) {
+      column_stats s;
+      s.name = c->name;
+      s.registered_bytes = c->registered;
+      s.requested_bytes  = c->requested;
+      s.hit_bytes        = c->hit;
+      s.fetched_bytes    = c->fetched;
+      s.resident_blocks  = c->resident;
+      out.push_back(std::move(s));
+    }
+    return out;
   }
 
   stats snapshot()
@@ -513,18 +605,15 @@ class cache {
   void clear()
   {
     std::lock_guard l(m_);
+    std::vector<block*> victims;
     for (auto* lst : {&probation_, &protected_}) {
-      for (auto it = lst->begin(); it != lst->end();) {
-        block* b = *it;
-        if (b->pins == 0) {
-          it = lst->erase(it);
-          map_.erase(b->key);
-          free_slots_.push_back(b->slot);
-          delete b;
-        } else {
-          ++it;
-        }
+      for (block* b : *lst) {
+        if (b->pins == 0) victims.push_back(b);
       }
+    }
+    for (block* b : victims) {
+      free_slots_.push_back(b->slot);
+      evict_block(b);
     }
   }
 
@@ -538,6 +627,8 @@ class cache {
   void add_to_probation(block* b)
   {
     probation_.push_back(b);
+    cols_[b->col]->resident += 1;
+    cols_[b->col]->keys.insert(b->key);
     b->it         = std::prev(probation_.end());
     b->in_list    = true;
     b->is_protected = false;
@@ -555,21 +646,67 @@ class cache {
     b->it = std::prev(protected_.end());
   }
 
-  bool alloc_slot(std::uint32_t& slot)
+  /// Remove a resident, unpinned block from every structure and free its memory object (the caller takes its slot).
+  void evict_block(block* b)
+  {
+    (b->is_protected ? protected_ : probation_).erase(b->it);
+    cols_[b->col]->keys.erase(b->key);
+    cols_[b->col]->resident -= 1;
+    map_.erase(b->key);
+    delete b;
+  }
+
+  /// How many times the column's full size has been requested so far. Re-read columns rank high: caching a column
+  /// saves its whole size on every later read, so the saving per cached byte is (reads - 1).
+  /// Bytes that belong to no known column (footers, metadata) rank highest because they are tiny and every query re-reads them.
+  double priority(std::uint32_t col) const
+  {
+    if (col == 0) return cols_.size() > 1 ? 1e18 : 0.0;
+    auto const reg = cols_[col]->registered.load();
+    return reg ? static_cast<double>(cols_[col]->requested.load()) / static_cast<double>(reg) : 0.0;
+  }
+
+  /// Find a slot for a block of column `incoming`. Column policy: a block is only admitted if its column ranks above the
+  /// lowest-ranked resident column, which then gives up its highest-offset block (so a partly cached column keeps a stable
+  /// prefix instead of thrashing under repeated sequential scans); otherwise the block bypasses the cache.
+  bool alloc_slot(std::uint32_t incoming, std::uint32_t& slot)
   {
     if (!free_slots_.empty()) {
       slot = free_slots_.back();
       free_slots_.pop_back();
       return true;
     }
+    if (column_policy_) {
+      std::uint32_t victim = 0;
+      double pv            = 1e300;
+      bool have            = false;
+      for (std::uint32_t id = 0; id < cols_.size(); ++id) {
+        if (cols_[id]->keys.empty()) continue;
+        double const p = priority(id);
+        if (p < pv) {
+          pv     = p;
+          victim = id;
+          have   = true;
+        }
+      }
+      if (!have || pv >= priority(incoming)) return false;
+      auto& ks = cols_[victim]->keys;
+      for (auto it = ks.rbegin(); it != ks.rend(); ++it) {
+        block* b = map_.find(*it)->second;
+        if (b->pins != 0) continue;
+        slot = b->slot;
+        evict_block(b);
+        st_.blocks_evicted += 1;
+        return true;
+      }
+      return false;
+    }
     for (auto* lst : {&probation_, &protected_}) {
       for (auto it = lst->begin(); it != lst->end(); ++it) {
         block* b = *it;
         if (b->pins != 0) continue;
         slot = b->slot;
-        lst->erase(it);
-        map_.erase(b->key);
-        delete b;
+        evict_block(b);
         st_.blocks_evicted += 1;
         return true;
       }
@@ -613,6 +750,9 @@ class cache {
 
   std::mutex m_;
   std::condition_variable cv_;
+  std::vector<std::unique_ptr<column_info>> cols_;
+  std::unordered_map<std::string, std::uint32_t> col_ids_;
+  bool column_policy_{true};
   config cfg_{};
   bool configured_{false};
   std::uint8_t* arena_{nullptr};
@@ -638,6 +778,14 @@ void segv_handler(int sig)
   raise(sig);
 }
 }  // namespace
+
+void register_layout(std::string const& path, std::string const& table, std::vector<std::string> const& columns,
+                     std::vector<std::uint32_t> const& col_index, std::vector<std::uint64_t> const& offsets,
+                     std::vector<std::uint64_t> const& sizes)
+{
+  cache::get().register_layout(path, table, columns, col_index, offsets, sizes);
+}
+std::vector<column_stats> get_column_stats() { return cache::get().column_snapshot(); }
 
 void configure(config const& cfg)
 {

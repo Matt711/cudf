@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # distutils: language = c++
 """Cython glue: expose bytecache::cached_source as a pylibcudf Datasource (see DESIGN.md)."""
-from libc.stdint cimport uint64_t
+from libc.stdint cimport uint32_t, uint64_t
 from libcpp.memory cimport unique_ptr
 from libcpp.string cimport string
 from libcpp.vector cimport vector
@@ -32,6 +32,15 @@ cdef extern from "bytecache.hpp" namespace "bytecache" nogil:
         uint64_t max_inflight
         uint64_t host_reads
         uint64_t ns_host_read
+    cdef cppclass column_stats:
+        string name
+        uint64_t registered_bytes
+        uint64_t requested_bytes
+        uint64_t hit_bytes
+        uint64_t fetched_bytes
+        uint64_t resident_blocks
+    void c_register_layout "bytecache::register_layout"(const string&, const string&, const vector[string]&, const vector[uint32_t]&, const vector[uint64_t]&, const vector[uint64_t]&) except +
+    vector[column_stats] c_get_column_stats "bytecache::get_column_stats"()
     void c_configure "bytecache::configure"(const config&) except +
     stats c_get_stats "bytecache::get_stats"()
     void c_reset_stats "bytecache::reset_stats"()
@@ -74,6 +83,30 @@ def get_stats():
         "host_reads": s.host_reads,
         "ns_host_read": s.ns_host_read,
     }
+
+
+def register_layout(str path, str table, list columns, list col_index, list offsets, list sizes):
+    """Tell the cache where each column chunk of an object lives (offset, size), so blocks can be attributed to columns."""
+    cdef vector[string] cols
+    for c in columns:
+        cols.push_back((<str>c).encode())
+    c_register_layout(path.encode(), table.encode(), cols, col_index, offsets, sizes)
+
+
+def get_column_stats():
+    """Per-column accounting: registered/requested/hit/fetched bytes and resident blocks."""
+    cdef vector[column_stats] v = c_get_column_stats()
+    return [
+        {
+            "name": s.name.decode(),
+            "registered_bytes": s.registered_bytes,
+            "requested_bytes": s.requested_bytes,
+            "hit_bytes": s.hit_bytes,
+            "fetched_bytes": s.fetched_bytes,
+            "resident_blocks": s.resident_blocks,
+        }
+        for s in v
+    ]
 
 
 def get_timeline():

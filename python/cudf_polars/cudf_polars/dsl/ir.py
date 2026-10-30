@@ -1307,6 +1307,8 @@ class Scan(IR):
             else:
                 parquet_metadatas = None
                 cache_sources = bytecache.wrap_sources(paths)
+                if cache_sources is not None:
+                    bytecache.register_layouts_from_sources(paths, cache_sources)
                 source_info = plc.io.SourceInfo(
                     cache_sources if cache_sources is not None else paths
                 )
