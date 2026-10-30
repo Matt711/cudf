@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <string>
 
@@ -41,7 +42,20 @@ class cached_source : public cudf::io::datasource {
 
   std::unique_ptr<buffer> host_read(std::size_t offset, std::size_t size) override;
   std::size_t host_read(std::size_t offset, std::size_t size, std::uint8_t* dst) override;
+  /// Async reads run on the cache's own thread pool (BYTECACHE_THREADS, default 128). libcudf's default
+  /// async implementation would run the blocking read on its small shared host worker pool and cap concurrency.
+  std::future<std::unique_ptr<buffer>> host_read_async(std::size_t offset, std::size_t size) override;
+  std::future<std::size_t> host_read_async(std::size_t offset, std::size_t size, std::uint8_t* dst) override;
   [[nodiscard]] std::size_t size() const override;
+
+  /// Device reads: libcudf's parquet reader only overlaps remote reads for sources that prefer device reads
+  /// (it otherwise calls the synchronous host_read on its small shared worker pool). The data is fetched on the
+  /// cache's thread pool, staged in pinned memory and copied to `dst` on `stream` before the future completes.
+  [[nodiscard]] bool supports_device_read() const override { return true; }
+  [[nodiscard]] bool is_device_read_preferred(std::size_t) const override { return true; }
+  std::size_t device_read(std::size_t offset, std::size_t size, std::uint8_t* dst, cuda::stream_ref stream) override;
+  std::future<std::size_t> device_read_async(std::size_t offset, std::size_t size, std::uint8_t* dst,
+                                             cuda::stream_ref stream) override;
 
  private:
   struct impl;

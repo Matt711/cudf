@@ -6,12 +6,16 @@
 
 #include <execinfo.h>
 #include <signal.h>
+#include <cuda_runtime.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <future>
@@ -71,6 +75,73 @@ class staging_pool {
   std::vector<buf> free_;
   std::size_t size_{0};
 };
+
+/// Fixed-size pool for blocking reads. Never destroyed (threads detach) so shutdown order cannot crash the process.
+class io_pool {
+ public:
+  explicit io_pool(std::size_t n)
+  {
+    for (std::size_t i = 0; i < n; ++i) {
+      std::thread([this] {
+        for (;;) {
+          std::function<void()> job;
+          {
+            std::unique_lock l(m_);
+            cv_.wait(l, [this] { return !q_.empty(); });
+            job = std::move(q_.front());
+            q_.pop_front();
+          }
+          job();
+        }
+      }).detach();
+    }
+  }
+  template <class F>
+  auto submit(F&& f) -> std::future<decltype(f())>
+  {
+    using R   = decltype(f());
+    auto task = std::make_shared<std::packaged_task<R()>>(std::forward<F>(f));
+    auto fut  = task->get_future();
+    {
+      std::lock_guard l(m_);
+      q_.emplace_back([task] { (*task)(); });
+    }
+    cv_.notify_one();
+    return fut;
+  }
+
+ private:
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> q_;
+};
+
+io_pool& pool()
+{
+  static io_pool* p = [] {
+    char const* e = std::getenv("BYTECACHE_THREADS");
+    return new io_pool(e ? std::max(1, std::atoi(e)) : 128);
+  }();
+  return *p;
+}
+
+/// Per-thread pinned staging buffer for host-to-device copies (grown on demand, never freed).
+std::uint8_t* pinned_staging(std::size_t need)
+{
+  thread_local std::uint8_t* p = nullptr;
+  thread_local std::size_t cap = 0;
+  if (need > cap) {
+    if (p != nullptr) cudaFreeHost(p);
+    std::size_t const n = std::max<std::size_t>(need, std::max<std::size_t>(cap * 2, 8 << 20));
+    if (cudaMallocHost(reinterpret_cast<void**>(&p), n) != cudaSuccess) {
+      p   = nullptr;
+      cap = 0;
+      throw std::runtime_error("bytecache: cudaMallocHost failed");
+    }
+    cap = n;
+  }
+  return p;
+}
 
 class cache {
  public:
@@ -446,6 +517,52 @@ std::size_t cached_source::size() const { return p_->file->size; }
 std::size_t cached_source::host_read(std::size_t offset, std::size_t size, std::uint8_t* dst)
 {
   return cache::get().read(*p_->file, offset, size, dst);
+}
+
+std::future<std::size_t> cached_source::host_read_async(std::size_t offset, std::size_t size, std::uint8_t* dst)
+{
+  auto file = p_->file;
+  return pool().submit([file, offset, size, dst] { return cache::get().read(*file, offset, size, dst); });
+}
+
+std::future<std::unique_ptr<cudf::io::datasource::buffer>> cached_source::host_read_async(
+  std::size_t offset, std::size_t size)
+{
+  auto file = p_->file;
+  return pool().submit([file, offset, size]() -> std::unique_ptr<cudf::io::datasource::buffer> {
+    std::size_t const avail = offset < file->size ? std::min(size, file->size - offset) : 0;
+    std::vector<std::uint8_t> out(avail);
+    cache::get().read(*file, offset, avail, out.data());
+    return cudf::io::datasource::buffer::create(std::move(out));
+  });
+}
+
+static std::size_t read_to_device(remote_file& f, std::size_t offset, std::size_t size, std::uint8_t* dst,
+                                  cuda::stream_ref stream)
+{
+  std::size_t const avail = offset < f.size ? std::min(size, f.size - offset) : 0;
+  if (avail == 0) return 0;
+  std::uint8_t* stage = pinned_staging(avail);
+  cache::get().read(f, offset, avail, stage);
+  auto s = static_cast<cudaStream_t>(stream.get());
+  if (cudaMemcpyAsync(dst, stage, avail, cudaMemcpyHostToDevice, s) != cudaSuccess ||
+      cudaStreamSynchronize(s) != cudaSuccess) {
+    throw std::runtime_error("bytecache: host-to-device copy failed");
+  }
+  return avail;
+}
+
+std::size_t cached_source::device_read(std::size_t offset, std::size_t size, std::uint8_t* dst,
+                                       cuda::stream_ref stream)
+{
+  return read_to_device(*p_->file, offset, size, dst, stream);
+}
+
+std::future<std::size_t> cached_source::device_read_async(std::size_t offset, std::size_t size,
+                                                          std::uint8_t* dst, cuda::stream_ref stream)
+{
+  auto file = p_->file;
+  return pool().submit([file, offset, size, dst, stream] { return read_to_device(*file, offset, size, dst, stream); });
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> cached_source::host_read(std::size_t offset,
