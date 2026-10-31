@@ -159,6 +159,12 @@ Cache size with the footer-warming build (100 GB: 107.4 s, 72% hit rate, 336 GB 
 cliff between 75 and 100 GB; process peak memory is 155, 176 and 205 GB. Raising the engine's device spill soft limit to 90% or 95% (`RAPIDSMPF_SPILL_DEVICE_LIMIT`)
 removed most spilling in q7, q9 and q13 but the total got worse (117.4 s, 118.1 s), so spilling is not what limits those queries.
 
+Why the reads are bursty (code): `reader_impl::read_compressed_data()` issues the async reads for every column chunk of a pass, then blocks on
+`read_chunks_tasks.get()`, and only then decodes; cudf-polars defaults `pass_read_limit` and `chunk_read_limit` to 0 (no limit), so one pass is the whole
+scan task (all row groups of its file(s), about 660 column chunks for a q1 task), and nothing issues the next task's reads while this one decodes.
+Setting `CUDF_POLARS__PARQUET_OPTIONS__PASS_READ_LIMIT=2GiB` makes q1's I/O smooth (no idle seconds, steady 5.5 to 8.5 GB/s) but the full run is worse
+(122.7 s; 128.5 s with 8 GiB; 107.4 s default), because smaller passes slow the other queries (q4 4.2 -> 6.0 s, q13 6.2 -> 7.8 s, q21 9.9 -> 11.9 s). The limit is global.
+
 What the q1 profile showed (per-second cache counters): reads are issued in bursts of 1000 to 1900 (one scan task's reads), which
 saturate the 512-thread pool for about a second, and the pool then drains to zero running reads while the tasks decode, so
 the network is idle roughly half the time even though a plain kvikio microbenchmark reaches 10.9 GB/s at the same
