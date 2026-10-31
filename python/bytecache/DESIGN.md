@@ -329,3 +329,31 @@ Cold sums to 273.6 s because each query starts with an empty cache; the warm sec
 That is the no-S3-I/O estimate. The read, copy and decode of 57 GB of q1 columns from the host cache runs at about 15 GB/s (3.7 s); the
 rest of q1's warm 9.5 s is compute and contention. Quent traces (`cudf_polars_quent`, built from `quent/bridge` into its own env)
 show warm q1 is compute-bound: GroupBy and HStack take 3.5 to 6 times longer per task when 8 decodes run beside them.
+
+### 9.4 Cross-query prefetch: measured upper bound, and why the naive version loses
+
+Headroom (104.5 s full run against the 84.0 s no-S3-I/O floor): about 21 s of exposed I/O, spread thin (q18 3.8 s, q12 2.6, q1 2.1,
+q4 2.0, q21 2.0, most others under 1.6). The bytes cannot shrink much: at 100 GB the oracle static pin set still fetches 320 GB (ours 335 GB)
+of which 186 GB is first touch, so prefetch can only change *when* bytes arrive.
+
+Oracle experiment (`tasks/.../scripts/oracle_prefetch.py`, benchmark-host only): when query q starts, prefetch the columns query q+1 will
+read (true next query, so not a fair result). Held state, 22/22 validated:
+
+| variant | total |
+|---|---|
+| baseline | 104.5 s (two runs); run-to-run spread about +-2 to 3 s (q1 swings 9 to 12 s) |
+| oracle prefetch, gate 64 | 110.2 s |
+| oracle prefetch, gate 2 (idle only) | 112.2 s |
+| registration only (footers and layouts, no data) | 102.5 s, then 106.6 s (noise) |
+
+Prefetch helps the next query (q2 -0.9 s, q4 -1.9 s) but slows the *running* one (q3 +4.9 s, reproducible; q13 +1.7 to 2.9 s). In a
+four-query run (q1 to q4, no evictions) q3 is 9.7 s with the oracle against 4.9 s plain, so it is not cache pollution. Capping
+`BYTECACHE_PREFETCH_BUFFERS` made it much worse (q3 55 s at 32 buffers, 190 s at 8, validated). Cause: priority inversion in `read()`.
+Phase 1 claims every block of the range up front and the fetch happens later in budget-limited waves, so a demand read that needs a block
+claimed by a queued prefetch piece (here `o_orderkey` and `l_orderkey`, shared by q3 and q4) waits for the low-priority fetch.
+
+Design to fix it (not implemented): demand promotion. Mark prefetch-claimed blocks (`pf`) and set a `wave_started` flag when their GET is issued;
+a demand read that finds a loading, pf-claimed block whose GET has not started takes ownership and fetches it itself; the prefetch skips
+or, when the run is already fused, publishes only if the block is still loading. Expected payoff: at most the exposed I/O that lands
+before the next query starts, about 3 to 4 s in the oracle run (q2, q4, q21), so the realistic target is about 100 s. A fair version must not use
+the benchmark's query order: build the metadata store from a history of observed column sets and prefetch only what recurs.
