@@ -150,6 +150,11 @@ bytes cached (0.3 s per 60-file table). Cold S3, 100 GB cache, SF1000, three run
 against 131.3, 128.0, 133.7 s (mean 131.0 s) without it (q1 16.4 -> 10.9 s, q3 6.5 -> 4.7 s). Also in this change: the column
 layout of a file is now computed with one hybrid-reader call (chunks come back row-group-major), 14x faster than one call per column.
 
+Decomposition (cold S3, SF1000, 22/22 validated): tuned no-cache 171 to 181 s; cache read path with capacity 0 (nothing cached, 1078 GB
+fetched) 179.9 s; **1 GB cache (footers cached, 1% data hit rate, 1144 GB fetched) 161.3 s**; 100 GB cache without footer warming 128 to 134 s; 100 GB cache with
+footer warming 107.4 s. So footer/open work is worth about 20 s with or without a data cache (180 -> 161 at 1 GB, 131 -> 107 at 100 GB) and the data cache about
+50 s (161 -> 107 with footers warmed): roughly additive, 180 -> 107 s in total. Read-ahead on top of the new build: 113.2 s (one run), still no gain.
+
 What the q1 profile showed (per-second cache counters): reads are issued in bursts of 1000 to 1900 (one scan task's reads), which
 saturate the 512-thread pool for about a second, and the pool then drains to zero running reads while the tasks decode, so
 the network is idle roughly half the time even though a plain kvikio microbenchmark reaches 10.9 GB/s at the same
