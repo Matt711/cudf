@@ -287,6 +287,23 @@ pinned_pool& pinned()
   return *p;
 }
 
+struct prefetch_group {
+  std::mutex m;
+  std::condition_variable cv;
+  std::atomic<std::int64_t> pending{0};
+};
+std::mutex g_groups_m;
+std::unordered_map<std::uint64_t, std::shared_ptr<prefetch_group>> g_groups;
+std::atomic<std::uint64_t> g_next_group{1};
+
+std::shared_ptr<prefetch_group> find_group(std::uint64_t id)
+{
+  if (id == 0) return nullptr;
+  std::lock_guard l(g_groups_m);
+  auto it = g_groups.find(id);
+  return it == g_groups.end() ? nullptr : it->second;
+}
+
 /// Read-ahead runs on its own threads and its own staging budget so it can never starve demand reads.
 io_pool& prefetch_pool()
 {
@@ -603,7 +620,8 @@ class cache {
   }
 
   /// Submit read-ahead of the given columns of a file. Returns the bytes of the ranges (0 if the file/layout is unknown).
-  std::uint64_t prefetch_columns(std::string const& path, std::string const& table, std::vector<std::string> const& columns)
+  std::uint64_t prefetch_columns(std::string const& path, std::string const& table, std::vector<std::string> const& columns,
+                                 std::uint64_t group_id = 0)
   {
     std::shared_ptr<remote_file> file;
     std::shared_ptr<const std::vector<segment>> layout;
@@ -635,12 +653,17 @@ class cache {
     }
     if (ranges.empty()) return 0;
     g_prefetch_jobs += 1;
+    auto group = find_group(group_id);
+    // Count the pieces first so that the group cannot look complete while jobs are still being submitted.
+    std::int64_t pieces = 0;
+    for (auto const& [start, end] : ranges) pieces += static_cast<std::int64_t>((end - start + (64ull << 20) - 1) / (64ull << 20));
+    if (group) group->pending += pieces;
     // One pool job per range piece (at most 64 MiB), so the ranges of one file are fetched concurrently instead of one
     // GET at a time (a single S3 stream delivers only about 20 to 80 MB/s).
     for (auto const& [start, end] : ranges) {
       for (std::uint64_t pos = start; pos < end; pos += (64ull << 20)) {
         std::uint64_t const len = std::min<std::uint64_t>(64ull << 20, end - pos);
-        prefetch_pool().submit([this, file, pos, len] {
+        prefetch_pool().submit([this, file, pos, len, group] {
           try {
             read(*file, pos, len, nullptr, true);
           } catch (std::exception const& e) {
@@ -648,6 +671,10 @@ class cache {
             std::lock_guard l(g_slow_m);
             if (g_slow.size() < 64) g_slow.push_back(std::string("prefetch error: ") + e.what());
           } catch (...) {
+          }
+          if (group && --group->pending == 0) {
+            std::lock_guard l(group->m);
+            group->cv.notify_all();
           }
           return 0;
         });
@@ -900,9 +927,29 @@ void warm_footers(std::vector<std::string> const& paths)
   }
   for (auto& f : futs) f.get();
 }
-std::uint64_t prefetch_columns(std::string const& path, std::string const& table, std::vector<std::string> const& columns)
+std::uint64_t prefetch_columns(std::string const& path, std::string const& table, std::vector<std::string> const& columns,
+                               std::uint64_t group)
 {
-  return cache::get().prefetch_columns(path, table, columns);
+  return cache::get().prefetch_columns(path, table, columns, group);
+}
+std::uint64_t new_group()
+{
+  auto const id = g_next_group++;
+  std::lock_guard l(g_groups_m);
+  g_groups[id] = std::make_shared<prefetch_group>();
+  return id;
+}
+bool wait_group(std::uint64_t group_id, std::uint64_t timeout_ms)
+{
+  auto g = find_group(group_id);
+  if (!g) return true;
+  std::unique_lock l(g->m);
+  return g->cv.wait_for(l, std::chrono::milliseconds(timeout_ms), [&] { return g->pending.load() <= 0; });
+}
+void release_group(std::uint64_t group_id)
+{
+  std::lock_guard l(g_groups_m);
+  g_groups.erase(group_id);
 }
 
 void configure(config const& cfg)

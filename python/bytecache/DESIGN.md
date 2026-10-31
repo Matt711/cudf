@@ -276,3 +276,56 @@ simulation is `tools/column_cache_sim.py` (it expects `results/needed-bytes.json
 column extraction on that host, and the local parquet copy). Integrity test:
 `selftest.py` (in this directory; usage `python selftest.py <cache MiB> <threads>`, needs S3 credentials in the environment) compares cache reads with standard reads on an SF1 object, single-threaded and
 with 6 concurrent readers, with and without eviction, with default and very tight staging limits.
+
+## 9. Update 2026-10-31: the machine state matters, and the scan-level ideas did not help
+
+### 9.1 The 107 s result depends on the driver holding pinned host memory
+
+The same code and configuration (100 GB cache, 512 threads, 48/512 kvikio, 8 producers) gives different totals depending on
+how much pinned host memory the NVIDIA driver already holds when the run starts:
+
+| state at start | full 22-query run |
+|---|---|
+| fresh (right after an NVIDIA driver reload, about 3 GB host used) | 115.1 s (29f0c8dca9), 118.6 s (c27344af70) |
+| held (80 to 104 GB held by the driver from earlier runs) | **104.5 s** (two runs, 104.52 s each, 22/22 validated, 0 GB growth) |
+
+The difference is the queries that spill into rapidsmpf's pinned host pool (q18 10.8 s vs 18.8 s, q7 6.7 vs 9.8 s, q13). The
+earlier 107.4 s (106.9, 108.1, 107.3 s) was measured in the held state. Getting fresh pinned memory costs about 0.3 s per GiB
+(16 GiB took 4.9 to 5.4 s). Total spill time was about 60% higher in the fresh state, with identical cache counters.
+
+What is held: after a clean exit, about 80 GB of host memory (50 to 80 GB per run from a fresh state) stays allocated by the driver. It shows as
+"used" in `free`, belongs to no process, is not in any kernel accounting category (MemFree drops, Slab/AnonPages/Cached/Mapped do not
+rise, `nr_foll_pin_acquired` equals `nr_foll_pin_released`) and is released only by reloading the NVIDIA kernel modules
+(`rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia; modprobe nvidia`). Stopping `nvidia-persistenced` or unloading only
+`nvidia_uvm` freed nothing (2 GB). `gc.collect()` and `cudaDeviceReset()` before exit freed nothing (117.4 to 117.2 GB in-process, 80 GB
+still held after exit). It is not caused by the byte cache: with the cache off, a full run (185.3 s, 22/22 validated) left the same
+80 GB. A pool-only rapidsmpf test (allocate, touch and free 20 GiB, four exit modes) did not reproduce it, and q1 with the cache on or
+with rapidsmpf pinned memory off leaks 0 to 1 GB; the heavy cases are the queries that spill (q13, q18, q21). Capping
+`RAPIDSMPF_PINNED_MAX_POOL_SIZE` bounds the amount (q18: 4 GiB cap, 0 GB held, 40 s instead of 23.7 s). Not found: why the pages are not
+returned at exit. Related external report (different platform and driver, not shown to be the same bug): a clean-exit memory hold on
+driver 590.48.01 cleared by unloading the module. Untested: `RAPIDSMPF_PINNED_INITIAL_POOL_SIZE` pre-sizing, which would move the commit cost to
+engine startup.
+
+### 9.2 Scan-level ideas tried against the 104.5 s held-state baseline (all validated 22/22, none helped)
+
+| change | total |
+|---|---|
+| baseline, 8 producers | 104.5 s |
+| scan manager (fetch ahead, decode after data is host-resident), 6 producers | 114.6 s |
+| scan manager, 4 producers | 121.5 s |
+| 12 producers | q13 out of memory (not valid); q1 25 s, q9 22 s |
+| decode credits K=4 | 106.2 s |
+| decode credits K=2 | 108.9 s |
+
+Fewer producers help only when compute is the bottleneck (warm q1 4.0 s at 4 producers vs about 10 s at 8; q7, q13) and lose 1 to 2 s on
+the scan-bound queries. All of the above are off by default: `CUDF_POLARS_SCAN_MANAGER=1` (with
+`CUDF_POLARS_SCAN_MANAGER_PRODUCERS`) and `CUDF_POLARS_SCAN_CREDITS=K` (a producer may start decoding only while fewer than K decoded chunks wait
+for the downstream actor). q1 alone with credits K=2: cold 11.1 s, warm 6.2 s vs 8.6 s without. An earlier "manager slower" result
+(128 s) was partly my error (16 cache threads); the measurements above use 512.
+
+### 9.3 Per-query I/O profile (one process per query, 2 iterations, 100 GB cache)
+
+Cold sums to 273.6 s because each query starts with an empty cache; the warm second pass (no S3 fetch) sums to 84.0 s (fresh state).
+That is the no-S3-I/O estimate. The read, copy and decode of 57 GB of q1 columns from the host cache runs at about 15 GB/s (3.7 s); the
+rest of q1's warm 9.5 s is compute and contention. Quent traces (`cudf_polars_quent`, built from `quent/bridge` into its own env)
+show warm q1 is compute-bound: GroupBy and HStack take 3.5 to 6 times longer per task when 8 decodes run beside them.

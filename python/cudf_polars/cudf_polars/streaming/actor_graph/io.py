@@ -9,6 +9,7 @@ import dataclasses
 import functools
 import io
 import math
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import polars as pl
@@ -85,6 +86,48 @@ def resolve_max_concurrent_io_tasks(
     return max_concurrent_io_tasks.local
 
 
+class ScanCredits:
+    """
+    Decode credits for one scan node (``CUDF_POLARS_SCAN_CREDITS=K``, off by default).
+
+    A producer may start decoding a task only while fewer than ``k`` decoded chunks are waiting for the
+    downstream actor to take them. When compute is the slower stage, waiting chunks pile up and decodes
+    pause, so compute is not competing with up to ``num_producers`` concurrent decodes for the GPU. When
+    compute keeps up, few chunks wait and every producer decodes at full speed. The chunk the downstream is
+    waiting for (``idx <= frontier``) may always start, so the scan cannot deadlock.
+    """
+
+    def __init__(self, k: int) -> None:
+        self.k = k
+        self.ready = 0  # decoded, not yet taken by the downstream actor
+        self.frontier = 0  # next sequence number the lineariser will forward
+        self._cond = asyncio.Condition()
+
+    async def start(self, idx: int) -> None:
+        """Wait until task ``idx`` may start decoding."""
+        async with self._cond:
+            await self._cond.wait_for(lambda: self.ready < self.k or idx <= self.frontier)
+
+    def decoded(self) -> None:
+        """A chunk finished decoding and is waiting to be forwarded."""
+        self.ready += 1
+
+    async def forwarded(self, next_seq: int) -> None:
+        """The downstream actor took a chunk."""
+        async with self._cond:
+            self.ready -= 1
+            self.frontier = next_seq
+            self._cond.notify_all()
+
+
+def scan_credits_from_env() -> int:
+    """Credits per scan node from ``CUDF_POLARS_SCAN_CREDITS`` (0 or unset: off)."""
+    try:
+        return max(int(os.environ.get("CUDF_POLARS_SCAN_CREDITS", "0")), 0)
+    except ValueError:
+        return 0
+
+
 class Lineariser:
     """
     Linearizer that ensures ordered delivery from multiple concurrent producers.
@@ -96,10 +139,15 @@ class Lineariser:
     """
 
     def __init__(
-        self, context: Context, ch_out: Channel[TableChunk], num_producers: int
+        self,
+        context: Context,
+        ch_out: Channel[TableChunk],
+        num_producers: int,
+        credits: ScanCredits | None = None,
     ):
         self.context = context
         self.ch_out = ch_out
+        self.credits = credits
         self.num_producers = num_producers
         self.input_channels = [context.create_channel() for _ in range(num_producers)]
         self._producer_slots = [asyncio.Semaphore(1) for _ in range(num_producers)]
@@ -151,6 +199,8 @@ class Lineariser:
                 new_task = asyncio.create_task(ch.recv(self.context))
                 pending_tasks[new_task] = producer_id
                 next_seq += 1
+                if self.credits is not None:
+                    await self.credits.forwarded(next_seq)
 
         # Forward any remaining buffered messages
         for seq in sorted(buffer.keys()):
@@ -570,6 +620,7 @@ async def read_chunk(
     ir_context: IRExecutionContext,
     estimated_chunk_bytes: int,
     tracer: ActorTracer | None = None,
+    on_decoded: Callable[[], None] | None = None,
 ) -> None:
     """
     Read a chunk from disk and send it to the output channel.
@@ -621,6 +672,8 @@ async def read_chunk(
             *task._non_child_args,
             context=ir_context,
         )
+        if on_decoded is not None:
+            on_decoded()
         chunk = TableChunk.from_pylibcudf_table(
             df.table,
             df.stream,
@@ -716,12 +769,19 @@ async def scan_node(
         # Read-ahead into the byte cache (no-op unless it is enabled): fetch upcoming tasks' columns into host
         # memory while the producers work on earlier tasks.
         prefetcher = bytecache.start_scan_prefetch(tasks)
+        # Scan manager (CUDF_POLARS_SCAN_MANAGER=1): a task starts only once its data is host-resident, so more tasks
+        # can run at once without holding device memory while they wait for the network.
+        manage = prefetcher is not None and bytecache.scan_manager_enabled()
+        if manage:
+            num_producers = bytecache.scan_manager_producers(num_producers)
 
         # If there is only one task or one producer, we can
         # skip the lineariser and read the chunks directly
         if len(tasks) == 1 or num_producers == 1:
             for seq_num, task in enumerate(tasks):
-                if prefetcher is not None:
+                if manage:
+                    await prefetcher.wait_ready_async(seq_num)
+                elif prefetcher is not None:
                     prefetcher.advance(seq_num)
                 await read_chunk(
                     context,
@@ -737,7 +797,9 @@ async def scan_node(
 
         # Use Lineariser to ensure ordered delivery
         num_producers = min(num_producers, len(tasks))
-        lineariser = Lineariser(context, ch_out, num_producers)
+        credits_k = scan_credits_from_env()
+        credits = ScanCredits(credits_k) if credits_k > 0 else None
+        lineariser = Lineariser(context, ch_out, num_producers, credits=credits)
 
         # Assign tasks to producers using round-robin
         producer_tasks: list[list[tuple[int, ScanTask]]] = [
@@ -749,6 +811,10 @@ async def scan_node(
 
         async def _producer(producer_id: int) -> None:
             for task_idx, task in producer_tasks[producer_id]:
+                if manage:
+                    await prefetcher.wait_ready_async(task_idx)
+                if credits is not None:
+                    await credits.start(task_idx)
                 ch_out = await lineariser.acquire(producer_id)
                 if prefetcher is not None:
                     prefetcher.advance(task_idx)
@@ -760,6 +826,7 @@ async def scan_node(
                     ir_context,
                     estimated_chunk_bytes,
                     tracer=tracer,
+                    on_decoded=credits.decoded if credits is not None else None,
                 )
             await ch_out.drain(context)
 

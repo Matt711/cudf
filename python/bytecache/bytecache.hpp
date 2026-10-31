@@ -69,7 +69,16 @@ void warm_footers(std::vector<std::string> const& paths);
 /// (its layout must be registered) into the cache. Blocks that the policy would not admit are skipped, and demand
 /// reads are never blocked by it (separate thread pool and staging budget). Returns the bytes of the ranges (0 if the
 /// file or layout is unknown).
-std::uint64_t prefetch_columns(std::string const& path, std::string const& table, std::vector<std::string> const& columns);
+std::uint64_t prefetch_columns(std::string const& path, std::string const& table, std::vector<std::string> const& columns,
+                               std::uint64_t group = 0);
+
+/// Prefetch groups: a handle for "everything submitted for one scan task". A group is complete when every prefetch job
+/// submitted with its id has finished (fetched, skipped or failed). Use `wait_group` (without the GIL) to hold a task back
+/// until its data is host-resident, so that it holds device memory only while it decodes.
+std::uint64_t new_group();
+/// Wait until the group has no pending jobs or `timeout_ms` has passed. Returns true if it completed.
+bool wait_group(std::uint64_t group, std::uint64_t timeout_ms);
+void release_group(std::uint64_t group);
 
 /// Set the process-wide configuration. Must be called before the first read; later calls with a different config throw.
 void configure(config const& cfg);

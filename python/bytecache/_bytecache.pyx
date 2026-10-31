@@ -45,7 +45,11 @@ cdef extern from "bytecache.hpp" namespace "bytecache" nogil:
         uint64_t resident_blocks
     void c_register_layout "bytecache::register_layout"(const string&, const string&, const vector[string]&, const vector[uint32_t]&, const vector[uint64_t]&, const vector[uint64_t]&) except +
     void c_warm "bytecache::warm_footers"(const vector[string]&) nogil
-    uint64_t c_prefetch "bytecache::prefetch_columns"(const string&, const string&, const vector[string]&) except +
+    uint64_t c_prefetch "bytecache::prefetch_columns"(const string&, const string&, const vector[string]&, uint64_t) except +
+    uint64_t c_new_group "bytecache::new_group"()
+    bint c_wait_group "bytecache::wait_group"(uint64_t, uint64_t) nogil
+    void c_release_group "bytecache::release_group"(uint64_t)
+
     vector[column_stats] c_get_column_stats "bytecache::get_column_stats"()
     void c_configure "bytecache::configure"(const config&) except +
     stats c_get_stats "bytecache::get_stats"()
@@ -112,12 +116,29 @@ def warm_footers(list paths):
         c_warm(ps)
 
 
-def prefetch_columns(str path, str table, list columns):
+def new_prefetch_group():
+    """A handle for 'everything submitted for one scan task'."""
+    return c_new_group()
+
+
+def wait_prefetch_group(uint64_t group, uint64_t timeout_ms):
+    """Wait (GIL released) until all prefetch jobs of the group finished or the timeout passed. True if complete."""
+    cdef bint done
+    with nogil:
+        done = c_wait_group(group, timeout_ms)
+    return done
+
+
+def release_prefetch_group(uint64_t group):
+    c_release_group(group)
+
+
+def prefetch_columns(str path, str table, list columns, uint64_t group=0):
     """Start read-ahead of the named columns of a registered file. Returns the bytes of the ranges (0 if unknown)."""
     cdef vector[string] cols
     for c in columns:
         cols.push_back((<str>c).encode())
-    return c_prefetch(path.encode(), table.encode(), cols)
+    return c_prefetch(path.encode(), table.encode(), cols, group)
 
 
 def get_column_stats():

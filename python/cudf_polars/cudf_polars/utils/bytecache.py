@@ -218,9 +218,16 @@ class ScanPrefetcher:
     """
 
     def __init__(
-        self, mod: Any, tasks: Sequence[Any], columns: list[str], ahead_tasks: int, ahead_bytes: int
+        self,
+        mod: Any,
+        tasks: Sequence[Any],
+        columns: list[str],
+        ahead_tasks: int,
+        ahead_bytes: int,
+        manage: bool = False,
     ) -> None:
         self._mod = mod
+        self._manage = manage
         self._tasks = tasks
         self._columns = columns
         self._ahead_tasks = ahead_tasks
@@ -228,6 +235,10 @@ class ScanPrefetcher:
         self._cond = threading.Condition()
         self._frontier = -1
         self._enqueued: list[int] = []  # bytes enqueued for each submitted task
+        self._groups: dict[int, int] = {}  # task index -> prefetch group (scan manager mode)
+        self._submitted = threading.Condition()
+        self._done_submitting = False
+        self._wait_pool: Any = None
         self._thread = threading.Thread(target=self._run, name="bytecache-readahead", daemon=True)
         self._thread.start()
 
@@ -237,6 +248,38 @@ class ScanPrefetcher:
             if task_idx > self._frontier:
                 self._frontier = task_idx
                 self._cond.notify_all()
+
+    def wait_ready(self, task_idx: int, timeout_s: float = 60.0) -> bool:
+        """
+        Block until every range of task ``task_idx`` is host-resident (scan manager mode).
+
+        Declares demand for the task first (so the window moves up to it), then waits for the task to be submitted
+        and for its prefetch group to finish. Falls back to returning False after ``timeout_s`` so that a stuck
+        fetch only costs time: the task then reads whatever is missing on demand.
+        """
+        import time  # noqa: PLC0415
+
+        self.advance(task_idx)
+        deadline = time.monotonic() + timeout_s
+        with self._submitted:
+            while task_idx not in self._groups and not self._done_submitting:
+                left = deadline - time.monotonic()
+                if left <= 0 or not self._submitted.wait(timeout=left):
+                    return False
+            group = self._groups.get(task_idx)
+        if group is None:
+            return True
+        left = max(deadline - time.monotonic(), 0.0)
+        return bool(self._mod.wait_prefetch_group(group, int(left * 1000)))
+
+    async def wait_ready_async(self, task_idx: int) -> bool:
+        """Async wrapper around :meth:`wait_ready`; the wait runs on a private thread pool, not the event loop."""
+        import asyncio  # noqa: PLC0415
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+        if self._wait_pool is None:
+            self._wait_pool = ThreadPoolExecutor(max_workers=64, thread_name_prefix="bytecache-wait")
+        return await asyncio.get_running_loop().run_in_executor(self._wait_pool, self.wait_ready, task_idx)
 
     def _may_submit(self, nxt: int) -> bool:
         ahead = self._enqueued[max(self._frontier + 1, 0) : nxt]
@@ -261,6 +304,14 @@ class ScanPrefetcher:
                 list(pool.map(one, paths))
 
     def _run(self) -> None:
+        try:
+            self._run_inner()
+        finally:
+            with self._submitted:
+                self._done_submitting = True
+                self._submitted.notify_all()
+
+    def _run_inner(self) -> None:
         self._register_all()
         nxt = 0
         while nxt < len(self._tasks):
@@ -268,6 +319,7 @@ class ScanPrefetcher:
                 if not self._cond.wait_for(lambda: self._may_submit(nxt), timeout=60):
                     return
             total = 0
+            group = self._mod.new_prefetch_group() if self._manage else 0
             for path in self._tasks[nxt].paths:
                 path = str(path)
                 if not _is_remote(path):
@@ -276,21 +328,36 @@ class ScanPrefetcher:
                     if path not in _registered:
                         src = self._mod.CachedDatasource(path, 0)
                         register_layouts_from_sources([path], [src])
-                    total += self._mod.prefetch_columns(path, path.rsplit("/", 1)[0], self._columns)
+                    total += self._mod.prefetch_columns(path, path.rsplit("/", 1)[0], self._columns, group)
                 except Exception as err:  # noqa: BLE001  (read-ahead is best effort)
                     _layout_errors.append(repr(err))
             self._enqueued.append(total)
+            if self._manage:
+                with self._submitted:
+                    self._groups[nxt] = group
+                    self._submitted.notify_all()
             nxt += 1
+
+
+def scan_manager_enabled() -> bool:
+    """True when ``CUDF_POLARS_SCAN_MANAGER=1`` (default off): scan tasks wait until their data is host-resident."""
+    return os.environ.get("CUDF_POLARS_SCAN_MANAGER", "0") == "1" and os.environ.get("CUDF_POLARS_BYTECACHE_GB") is not None
+
+
+def scan_manager_producers(default: int) -> int:
+    """Producer count in scan manager mode (``CUDF_POLARS_SCAN_MANAGER_PRODUCERS``); tasks hold device memory only to decode."""
+    return int(os.environ.get("CUDF_POLARS_SCAN_MANAGER_PRODUCERS", str(default))) if scan_manager_enabled() else default
 
 
 def start_scan_prefetch(tasks: Sequence[Any]) -> ScanPrefetcher | None:
     """Start read-ahead for a scan node's tasks, or return None when the byte cache or read-ahead is off."""
     mod = _load()
-    if mod is None or os.environ.get("CUDF_POLARS_BYTECACHE_READAHEAD", "0") != "1" or not tasks:
+    manage = scan_manager_enabled()
+    if mod is None or not tasks or not (manage or os.environ.get("CUDF_POLARS_BYTECACHE_READAHEAD", "0") == "1"):
         return None
     if not any(_is_remote(str(p)) for p in tasks[0].paths):
         return None
     columns = list(tasks[0].base_scan.schema.keys())
     ahead_tasks = int(os.environ.get("CUDF_POLARS_BYTECACHE_AHEAD_TASKS", "24"))
     ahead_bytes = int(float(os.environ.get("CUDF_POLARS_BYTECACHE_AHEAD_GB", "12")) * 1e9)
-    return ScanPrefetcher(mod, tasks, columns, ahead_tasks, ahead_bytes)
+    return ScanPrefetcher(mod, tasks, columns, ahead_tasks, ahead_bytes, manage)
