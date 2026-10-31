@@ -44,7 +44,7 @@ cdef extern from "bytecache.hpp" namespace "bytecache" nogil:
         uint64_t fetched_bytes
         uint64_t resident_blocks
     void c_register_layout "bytecache::register_layout"(const string&, const string&, const vector[string]&, const vector[uint32_t]&, const vector[uint64_t]&, const vector[uint64_t]&) except +
-    void c_warm "bytecache::warm_footers"(const vector[string]&) nogil
+    void c_warm "bytecache::warm_footers"(const vector[string]&, bint) nogil
     uint64_t c_prefetch "bytecache::prefetch_columns"(const string&, const string&, const vector[string]&, uint64_t) except +
     uint64_t c_new_group "bytecache::new_group"()
     bint c_wait_group "bytecache::wait_group"(uint64_t, uint64_t) nogil
@@ -107,13 +107,15 @@ def register_layout(str path, str table, list columns, list col_index, list offs
     c_register_layout(path.encode(), table.encode(), cols, col_index, offsets, sizes)
 
 
-def warm_footers(list paths):
-    """Read the footers of many objects into the cache concurrently (GIL released)."""
+def warm_footers(list paths, bint urgent=True):
+    """Read the footers of many objects into the cache concurrently (GIL released). urgent: a scan is waiting for them
+    (demand pool, no read-ahead gate); pass False from speculative callers."""
     cdef vector[string] ps
+    cdef bint u = urgent
     for p in paths:
         ps.push_back((<str>p).encode())
     with nogil:
-        c_warm(ps)
+        c_warm(ps, u)
 
 
 def new_prefetch_group():

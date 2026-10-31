@@ -63,7 +63,9 @@ std::vector<column_stats> get_column_stats();
 
 /// Open the given objects and read their last 1 MiB (the footers) into the cache, concurrently, on the prefetch pool. Blocks until done.
 /// Call it without holding the GIL: registering many files one footer at a time is dominated by serial round trips.
-void warm_footers(std::vector<std::string> const& paths);
+/// Read the footers (last 1 MiB) of the files into the cache. `urgent` (a scan is waiting for them) uses the demand pool, the demand
+/// staging budget and no read-ahead gate; speculative callers pass false so they never delay demand reads.
+void warm_footers(std::vector<std::string> const& paths, bool urgent = true);
 
 /// Read-ahead: start fetching, on the cache's prefetch pool, the byte ranges of `columns` of the file at `path`
 /// (its layout must be registered) into the cache. Blocks that the policy would not admit are skipped, and demand

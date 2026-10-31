@@ -346,14 +346,23 @@ read (true next query, so not a fair result). Held state, 22/22 validated:
 | oracle prefetch, gate 2 (idle only) | 112.2 s |
 | registration only (footers and layouts, no data) | 102.5 s, then 106.6 s (noise) |
 
-Prefetch helps the next query (q2 -0.9 s, q4 -1.9 s) but slows the *running* one (q3 +4.9 s, reproducible; q13 +1.7 to 2.9 s). In a
-four-query run (q1 to q4, no evictions) q3 is 9.7 s with the oracle against 4.9 s plain, so it is not cache pollution. Capping
-`BYTECACHE_PREFETCH_BUFFERS` made it much worse (q3 55 s at 32 buffers, 190 s at 8, validated). Cause: priority inversion in `read()`.
-Phase 1 claims every block of the range up front and the fetch happens later in budget-limited waves, so a demand read that needs a block
-claimed by a queued prefetch piece (here `o_orderkey` and `l_orderkey`, shared by q3 and q4) waits for the low-priority fetch.
+Prefetch helps the next query (q2 -0.9 s, q4 -1.9 s) but slowed the *running* one (q3 +4.9 s, reproducible; q13 +1.7 to 2.9 s). In a
+four-query run (q1 to q4, no evictions) q3 was 9.7 s with the oracle against 4.9 s plain, so it was not cache pollution. Capping
+`BYTECACHE_PREFETCH_BUFFERS` made it much worse (q3 55 s at 32 buffers, 190 s at 8, validated).
 
-Design to fix it (not implemented): demand promotion. Mark prefetch-claimed blocks (`pf`) and set a `wave_started` flag when their GET is issued;
-a demand read that finds a loading, pf-claimed block whose GET has not started takes ownership and fetches it itself; the prefetch skips
-or, when the run is already fused, publishes only if the block is still loading. Expected payoff: at most the exposed I/O that lands
-before the next query starts, about 3 to 4 s in the oracle run (q2, q4, q21), so the realistic target is about 100 s. A fair version must not use
-the benchmark's query order: build the metadata store from a history of observed column sets and prefetch only what recurs.
+First hypothesis, wrong: prefetch reads claim all their blocks up front and fetch later in budget-limited waves, so a demand read could wait
+behind a queued claim. Late claiming (a prefetch claims a block only when it holds a GET buffer; `claim_late` in `read()`) was implemented and
+passes the integrity tests, but changed nothing (q3 9.5 s, 46.8 s, 177 s at default, 32 and 8 buffers).
+
+Actual cause: `warm_footers`, which the demand path calls at the start of every scan and which blocks until done, ran on `prefetch_pool()`
+(a FIFO shared with the speculative piece jobs, whose threads wait up to 20 s at the read-ahead gate) and read with `prefetch = true`
+(prefetch budget and gate). A query's own footer reads therefore queued behind speculation, and a smaller prefetch budget drained that
+queue more slowly. Fix: `warm_footers(paths, urgent=True)` uses the demand pool, the demand staging budget and no gate; the speculative
+callers (`ScanPrefetcher._register_all`, the oracle hook) pass `urgent=False`. Result on q1 to q4 with the oracle: q3 4.1, 4.4 and 4.3 s
+at default, 32 and 8 buffers (was 9.5, 46.8, 177), q1 no longer stalls.
+
+Full run with the oracle after the fix: **104.6 s**, 22/22 validated (110.2 s before the fix, baseline 104.5 s). Per query: q2 -1.1 s,
+q4 -0.8 s, q3 -0.7 s, q18 -0.6 s, q21 -0.6 s, against q7 +1.1 s, q13 +1.3 s and +0.1 to +0.4 s on a dozen others. Net +0.1 s, inside the
++-2 to 3 s noise band. So lookahead-1 prefetch with perfect knowledge of the next query is worth about nothing; a fair history-driven
+predictor cannot beat it, and is not worth building in this form. Plain baseline with the fix: 104.1 s (no regression). New test:
+`selftest_prefetch.py` (prefetch jobs racing demand reads, compared with standard reads, 0 mismatches at 8, 64 and 256 MiB).

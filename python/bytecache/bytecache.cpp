@@ -382,13 +382,13 @@ class cache {
     return it->second;
   }
 
-  std::size_t read(remote_file& f, std::size_t off, std::size_t n, std::uint8_t* dst, bool prefetch = false)
+  std::size_t read(remote_file& f, std::size_t off, std::size_t n, std::uint8_t* dst, bool prefetch = false, bool urgent = false)
   {
     if (n == 0 || off >= f.size) return 0;
     n = std::min(n, f.size - off);
     if (!prefetch) st_.bytes_requested += n;
-    counting_budget& budget = prefetch ? prefetch_budget() : get_budget();
-    if (prefetch) {
+    counting_budget& budget = (prefetch && !urgent) ? prefetch_budget() : get_budget();
+    if (prefetch && !urgent) {
       // Demand never waits for read-ahead: only fetch speculatively while few demand reads are running or queued
       // (BYTECACHE_PREFETCH_GATE, 0 = no gating). During a burst the prefetch backs off and fills the gaps between bursts.
       static std::size_t const gate = env_size("BYTECACHE_PREFETCH_GATE", 64);
@@ -409,7 +409,7 @@ class cache {
     std::size_t const b0 = off / B, b1 = (off + n - 1) / B;
     std::size_t const nb = b1 - b0 + 1;
 
-    enum class kind : std::uint8_t { hit, owner, uncached };
+    enum class kind : std::uint8_t { hit, owner, uncached, pending };  // pending: prefetch block, claimed late (just before its GET)
     struct item {
       block* blk{nullptr};
       kind k{kind::uncached};
@@ -436,6 +436,10 @@ class cache {
         }
         std::uint32_t const col = col_of(layout, bstart);
         if (!prefetch) cols_[col]->requested += overlap;
+        if (prefetch) {  // late claim: no block exists until a GET buffer is in hand, so no demand read can wait on an idle claim
+          items[i] = {nullptr, kind::pending, col};
+          continue;
+        }
         std::uint32_t slot;
         if (!alloc_slot(col, slot)) {
           items[i] = {nullptr, kind::uncached, col};
@@ -468,6 +472,33 @@ class cache {
       staging_pool::buf buf;
       std::future<std::size_t> fut;
     };
+    // Late claim for prefetch: claim blocks [i, j] one by one, stopping at the first block that another reader already
+    // created or that cannot be cached. Returns the index one past the last claimed block (== i when none was).
+    auto claim_late = [&](std::size_t i, std::size_t j) -> std::size_t {
+      std::unique_lock l(m_);
+      std::size_t k = i;
+      for (; k <= j; ++k) {
+        std::uint64_t const key = (static_cast<std::uint64_t>(f.id) << 32) | (b0 + k);
+        if (map_.find(key) != map_.end()) {  // someone else owns or has this block: nothing to prefetch here
+          items[k].k = kind::uncached;
+          break;
+        }
+        std::uint32_t slot;
+        if (!alloc_slot(items[k].col, slot)) {
+          items[k].k = kind::uncached;
+          break;
+        }
+        auto* b = new block;
+        b->col  = items[k].col;
+        b->key  = key;
+        b->slot = slot;
+        b->len  = static_cast<std::uint32_t>(std::min<std::size_t>(B, f.size - (b0 + k) * B));
+        b->pins = 1;
+        map_.emplace(key, b);
+        items[k] = {b, kind::owner, items[k].col};
+      }
+      return k;
+    };
     std::vector<piece> pieces;
     std::size_t const max_blocks = cfg_.max_get_bytes / B;
     std::size_t held             = 0;  // GET staging buffers reserved from the shared budget and not yet released
@@ -494,8 +525,19 @@ class cache {
         }
         held = wn;
         pieces.clear();
+        std::size_t unused = 0;  // buffers reserved for runs that turned out to have nothing left to fetch
         for (std::size_t r = w; r < w + wn; ++r) {
-          auto const [i, j] = runs[r];
+          auto const [i, j0] = runs[r];
+          std::size_t j      = j0;
+          if (prefetch) {
+            std::size_t const k = claim_late(i, j0);
+            if (k + 1 <= j0) runs.emplace_back(k + 1, j0);  // what follows the stopping block is tried in a later wave
+            if (k == i) {
+              ++unused;
+              continue;
+            }
+            j = k - 1;
+          }
           piece p;
           p.first = i;
           p.last  = j;
@@ -508,6 +550,10 @@ class cache {
           st_.bytes_fetched += flen;
           if (prefetch) g_bytes_prefetched += flen;
           pieces.push_back(std::move(p));
+        }
+        if (unused > 0) {
+          budget.release(unused);
+          held -= unused;
         }
         // Phase 3: wait for the fetches, publish owned blocks, copy into dst.
         for (auto& p : pieces) {
@@ -909,16 +955,18 @@ void register_layout(std::string const& path, std::string const& table, std::vec
   cache::get().register_layout(path, table, columns, col_index, offsets, sizes);
 }
 std::vector<column_stats> get_column_stats() { return cache::get().column_snapshot(); }
-void warm_footers(std::vector<std::string> const& paths)
+void warm_footers(std::vector<std::string> const& paths, bool urgent)
 {
   std::vector<std::future<int>> futs;
   futs.reserve(paths.size());
+  // A scan waits for urgent footers: they must not queue behind (or be gated by) speculative read-ahead jobs.
+  io_pool& which = urgent ? pool() : prefetch_pool();
   for (auto const& p : paths) {
-    futs.push_back(prefetch_pool().submit([p] {
+    futs.push_back(which.submit([p, urgent] {
       try {
         auto f                = cache::get().open(p, 0);
         std::size_t const n   = std::min<std::size_t>(f->size, 1 << 20);
-        cache::get().read(*f, f->size - n, n, nullptr, true);
+        cache::get().read(*f, f->size - n, n, nullptr, true, urgent);
       } catch (...) {
         // best effort: the footer is read on demand later
       }

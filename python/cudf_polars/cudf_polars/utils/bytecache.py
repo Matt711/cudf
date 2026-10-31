@@ -299,7 +299,7 @@ class ScanPrefetcher:
                 _layout_errors.append(repr(err))
 
         if paths:
-            self._mod.warm_footers(paths)  # all footers into the cache at once, GIL released
+            self._mod.warm_footers(paths, False)  # speculative: all footers into the cache at once, GIL released
             with ThreadPoolExecutor(max_workers=min(32, len(paths))) as pool:
                 list(pool.map(one, paths))
 
