@@ -155,6 +155,10 @@ fetched) 179.9 s; **1 GB cache (footers cached, 1% data hit rate, 1144 GB fetche
 footer warming 107.4 s. So footer/open work is worth about 20 s with or without a data cache (180 -> 161 at 1 GB, 131 -> 107 at 100 GB) and the data cache about
 50 s (161 -> 107 with footers warmed): roughly additive, 180 -> 107 s in total. Read-ahead on top of the new build: 113.2 s (one run), still no gain.
 
+Cache size with the footer-warming build (100 GB: 107.4 s, 72% hit rate, 336 GB fetched; 75 GB: 135.1 s, 59%, 489 GB; 50 GB: 136.4 s, 43%, 672 GB) shows a
+cliff between 75 and 100 GB; process peak memory is 155, 176 and 205 GB. Raising the engine's device spill soft limit to 90% or 95% (`RAPIDSMPF_SPILL_DEVICE_LIMIT`)
+removed most spilling in q7, q9 and q13 but the total got worse (117.4 s, 118.1 s), so spilling is not what limits those queries.
+
 What the q1 profile showed (per-second cache counters): reads are issued in bursts of 1000 to 1900 (one scan task's reads), which
 saturate the 512-thread pool for about a second, and the pool then drains to zero running reads while the tasks decode, so
 the network is idle roughly half the time even though a plain kvikio microbenchmark reaches 10.9 GB/s at the same
