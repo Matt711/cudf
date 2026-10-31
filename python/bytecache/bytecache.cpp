@@ -372,6 +372,7 @@ class cache {
     if (!prefetch) st_.bytes_requested += n;
     counting_budget& budget = prefetch ? prefetch_budget() : get_budget();
     if (nslots_ == 0) {  // caching disabled: straight to the remote handle
+      if (dst == nullptr) return 0;  // read-ahead / footer warming has nothing to populate
       f.handle->pread(dst, n, off).get();
       st_.bytes_fetched += n;
       st_.gets_issued += 1;
