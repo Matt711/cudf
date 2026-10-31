@@ -37,6 +37,8 @@ struct stats {
   std::uint64_t ns_queue_wait{0};   ///< time jobs waited between submit and start on the I/O pool
   std::uint64_t host_reads{0};      ///< synchronous host_read calls (footers, metadata)
   std::uint64_t ns_host_read{0};    ///< time inside synchronous host_read calls
+  std::uint64_t inflight_now{0};      ///< device reads running right now
+  std::uint64_t queued_now{0};        ///< device reads submitted but not yet started
   std::uint64_t bytes_prefetched{0};  ///< bytes fetched by read-ahead (included in bytes_fetched)
   std::uint64_t prefetch_jobs{0};     ///< read-ahead requests submitted
   std::uint64_t max_inflight{0};    ///< peak number of device reads running at once
@@ -58,6 +60,10 @@ void register_layout(std::string const& path, std::string const& table, std::vec
                      std::vector<std::uint32_t> const& col_index, std::vector<std::uint64_t> const& offsets,
                      std::vector<std::uint64_t> const& sizes);
 std::vector<column_stats> get_column_stats();
+
+/// Open the given objects and read their last 1 MiB (the footers) into the cache, concurrently, on the prefetch pool. Blocks until done.
+/// Call it without holding the GIL: registering many files one footer at a time is dominated by serial round trips.
+void warm_footers(std::vector<std::string> const& paths);
 
 /// Read-ahead: start fetching, on the cache's prefetch pool, the byte ranges of `columns` of the file at `path`
 /// (its layout must be registered) into the cache. Blocks that the policy would not admit are skipped, and demand

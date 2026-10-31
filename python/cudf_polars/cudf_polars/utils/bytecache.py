@@ -69,6 +69,7 @@ def stats() -> dict[str, int] | None:
 
 
 _registered: set[str] = set()
+_warmed: set[str] = set()
 _layout_errors: list[str] = []
 
 
@@ -93,15 +94,26 @@ def _layout(info: Any) -> tuple[list[str], list[int], list[int], list[int]]:
     col_index: list[int] = []
     offsets: list[int] = []
     sizes: list[int] = []
-    for i, name in enumerate(columns):
-        opts = options([name])
-        reader = plc.io.experimental.HybridScanReader.from_metadata(
-            plc.io.experimental.HybridScanMetadata.from_parquet_metadata(fm, opts)
-        )
-        for rng in reader.all_column_chunks_byte_ranges(row_groups, opts):
-            col_index.append(i)
+    # One call with every column selected returns the chunks row-group-major (row group 0: every column, then row group 1, ...).
+    all_opts = options(columns)
+    ranges = plc.io.experimental.HybridScanReader.from_metadata(
+        plc.io.experimental.HybridScanMetadata.from_parquet_metadata(fm, all_opts)
+    ).all_column_chunks_byte_ranges(row_groups, all_opts)
+    if len(ranges) == len(row_groups) * len(columns):
+        for k, rng in enumerate(ranges):
+            col_index.append(k % len(columns))
             offsets.append(rng.offset)
             sizes.append(rng.size)
+    else:  # nested or unusual schema: one call per column
+        for i, name in enumerate(columns):
+            opts = options([name])
+            reader = plc.io.experimental.HybridScanReader.from_metadata(
+                plc.io.experimental.HybridScanMetadata.from_parquet_metadata(fm, opts)
+            )
+            for rng in reader.all_column_chunks_byte_ranges(row_groups, opts):
+                col_index.append(i)
+                offsets.append(rng.offset)
+                sizes.append(rng.size)
     return columns, col_index, offsets, sizes
 
 
@@ -184,6 +196,13 @@ def wrap_sources(
     if mod is None or not paths or not all(_is_remote(p) for p in paths):
         return None
     sizes = sizes if sizes is not None else [None] * len(paths)
+    # Open all not-yet-seen files and read their footers into the cache concurrently (GIL released), instead of one
+    # HEAD and one footer round trip at a time.
+    with _lock:
+        cold = [str(p) for p in paths if str(p) not in _warmed]
+        _warmed.update(cold)
+    if cold:
+        mod.warm_footers(cold)
     return [mod.CachedDatasource(str(p), int(s or 0)) for p, s in zip(paths, sizes, strict=True)]
 
 
@@ -237,6 +256,7 @@ class ScanPrefetcher:
                 _layout_errors.append(repr(err))
 
         if paths:
+            self._mod.warm_footers(paths)  # all footers into the cache at once, GIL released
             with ThreadPoolExecutor(max_workers=min(32, len(paths))) as pool:
                 list(pool.map(one, paths))
 

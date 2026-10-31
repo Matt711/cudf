@@ -140,6 +140,22 @@ q1's bytes in about 6 s, but inside the engine q1 takes 15 s at about 5 GB/s. Th
 about 56 ms in the 512-thread pool queue and then 81 ms in the read (3 ms for the GPU copy), so the pool of blocking
 reads is saturated and per-read latency inside the engine is about 1.6x the microbenchmark's.
 
+### 3.7 Concurrent footer warming (the largest single gain after the cache)
+
+Before any data moves, the engine opens every file of a scan (an HTTP HEAD for the size) and reads and parses its footer.
+That ran one file at a time: about 2 s per 60-file table on every query with the standard path, and about 5 s the first time
+with the cache. `bytecache.wrap_sources` now first calls `warm_footers(paths)` (C++, GIL released, on the prefetch pool): it
+opens all not-yet-seen files and reads their last 1 MiB into the cache concurrently. Later queries then find the footer
+bytes cached (0.3 s per 60-file table). Cold S3, 100 GB cache, SF1000, three runs: **106.9, 108.1, 107.3 s (mean 107.4 s)**
+against 131.3, 128.0, 133.7 s (mean 131.0 s) without it (q1 16.4 -> 10.9 s, q3 6.5 -> 4.7 s). Also in this change: the column
+layout of a file is now computed with one hybrid-reader call (chunks come back row-group-major), 14x faster than one call per column.
+
+What the q1 profile showed (per-second cache counters): reads are issued in bursts of 1000 to 1900 (one scan task's reads), which
+saturate the 512-thread pool for about a second, and the pool then drains to zero running reads while the tasks decode, so
+the network is idle roughly half the time even though a plain kvikio microbenchmark reaches 10.9 GB/s at the same
+concurrency. Read-ahead fills those gaps (pool saturated from t=4 s on, q1 14.1 s vs 16.1 s) but at that point started
+about 4 s late, because registering the layouts of 60 files took that long (footer parsing in `read_parquet_footers` holds the GIL).
+
 ### 3.4 Build and ABI notes
 
 - `build.sh` builds `_bytecache.abi3.so` against the conda env (libcudf, kvikio, pylibcudf). pylibcudf is built
@@ -188,6 +204,7 @@ memory (57 to 131 GB RSS seen without the cache). Do not use a cache so large th
 | + column-aware policy, 75 GB | 146.6 s (57% hit rate) | 692 GB |
 | column policy, 100 GB, **256 KiB blocks** (now the default) | 116.7, 131.3, 128.0, 133.7 s (four runs, **mean 127.4 s**, spread 117 to 134 s) | **336 GB** |
 | column policy, 100 GB, 128 KiB blocks | 125.0 s (73% hit rate) | 309 GB |
+| **+ concurrent footer warming (256 KiB blocks, 100 GB)** | **106.9, 108.1, 107.3 s (mean 107.4)** | 336 GB |
 
 The three block sizes (1 MiB, 256 KiB, 128 KiB) fetch 459, 336, 309 GB with the same hit rate (the rest was over-read: whole
 blocks fetched for sparse reads). The time effect is not established: the first 256 KiB run (116.7 s) was a low outlier,

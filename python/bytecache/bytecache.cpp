@@ -5,6 +5,7 @@
 #include <kvikio/remote_handle.hpp>
 
 #include <execinfo.h>
+#include <pthread.h>
 #include <signal.h>
 #include <cuda_runtime.h>
 #include <sys/mman.h>
@@ -63,10 +64,13 @@ struct remote_file {
   std::unique_ptr<kvikio::RemoteHandle> handle;
 };
 
+std::size_t env_size(char const* name, std::size_t def);
+
 /// Reusable staging buffers for fused GETs (avoids page-faulting a fresh 16 MiB buffer per request).
 class staging_pool {
  public:
   using buf = std::unique_ptr<std::uint8_t[]>;
+  staging_pool() : retain_(env_size("BYTECACHE_STAGING_RETAIN", 256)) {}
   buf acquire(std::size_t n)
   {
     {
@@ -83,22 +87,24 @@ class staging_pool {
   void release(buf b)
   {
     std::lock_guard l(m_);
-    if (free_.size() < 256) free_.push_back(std::move(b));
+    if (free_.size() < retain_) free_.push_back(std::move(b));
   }
 
  private:
   std::mutex m_;
   std::vector<buf> free_;
   std::size_t size_{0};
+  std::size_t retain_;
 };
 
 /// Fixed-size pool for blocking reads. Never destroyed (threads detach) so shutdown order cannot crash the process.
 class io_pool {
  public:
-  explicit io_pool(std::size_t n)
+  explicit io_pool(std::size_t n, char const* name = "bc-io")
   {
     for (std::size_t i = 0; i < n; ++i) {
-      std::thread([this] {
+      std::thread([this, name] {
+        pthread_setname_np(pthread_self(), name);
         for (;;) {
           std::function<void()> job;
           {
@@ -141,7 +147,7 @@ io_pool& pool()
   return *p;
 }
 
-std::atomic<std::uint64_t> g_ns_open{0}, g_ns_pinned_wait{0}, g_ns_read{0}, g_ns_h2d{0}, g_ns_budget_wait{0}, g_device_reads{0}, g_ns_queue_wait{0}, g_inflight{0}, g_max_inflight{0}, g_host_reads{0}, g_ns_host_read{0}, g_bytes_prefetched{0}, g_prefetch_jobs{0};
+std::atomic<std::uint64_t> g_ns_open{0}, g_ns_pinned_wait{0}, g_ns_read{0}, g_ns_h2d{0}, g_ns_budget_wait{0}, g_device_reads{0}, g_ns_queue_wait{0}, g_inflight{0}, g_max_inflight{0}, g_host_reads{0}, g_ns_host_read{0}, g_bytes_prefetched{0}, g_prefetch_jobs{0}, g_queued{0};
 
 constexpr std::size_t kMaxColumns = 4096;
 constexpr int kBuckets = 128;
@@ -284,7 +290,7 @@ pinned_pool& pinned()
 /// Read-ahead runs on its own threads and its own staging budget so it can never starve demand reads.
 io_pool& prefetch_pool()
 {
-  static io_pool* p = new io_pool(env_size("BYTECACHE_PREFETCH_THREADS", 256));
+  static io_pool* p = new io_pool(env_size("BYTECACHE_PREFETCH_THREADS", 256), "bc-pf");
   return *p;
 }
 
@@ -669,6 +675,7 @@ class cache {
     s.ns_budget_wait = g_ns_budget_wait; s.device_reads = g_device_reads;
     s.ns_queue_wait = g_ns_queue_wait; s.max_inflight = g_max_inflight; s.host_reads = g_host_reads; s.ns_host_read = g_ns_host_read;
     s.bytes_prefetched = g_bytes_prefetched; s.prefetch_jobs = g_prefetch_jobs;
+    s.inflight_now = g_inflight; s.queued_now = g_queued;
     std::lock_guard l(m_);
     s.blocks_resident = probation_.size() + protected_.size();
     return s;
@@ -864,6 +871,24 @@ void register_layout(std::string const& path, std::string const& table, std::vec
   cache::get().register_layout(path, table, columns, col_index, offsets, sizes);
 }
 std::vector<column_stats> get_column_stats() { return cache::get().column_snapshot(); }
+void warm_footers(std::vector<std::string> const& paths)
+{
+  std::vector<std::future<int>> futs;
+  futs.reserve(paths.size());
+  for (auto const& p : paths) {
+    futs.push_back(prefetch_pool().submit([p] {
+      try {
+        auto f                = cache::get().open(p, 0);
+        std::size_t const n   = std::min<std::size_t>(f->size, 1 << 20);
+        cache::get().read(*f, f->size - n, n, nullptr, true);
+      } catch (...) {
+        // best effort: the footer is read on demand later
+      }
+      return 0;
+    }));
+  }
+  for (auto& f : futs) f.get();
+}
 std::uint64_t prefetch_columns(std::string const& path, std::string const& table, std::vector<std::string> const& columns)
 {
   return cache::get().prefetch_columns(path, table, columns);
@@ -1039,9 +1064,11 @@ std::future<std::size_t> cached_source::device_read_async(std::size_t offset, st
   auto file = p_->file;
   g_device_reads += 1;
   g_hist_submit[bucket_now()] += 1;
+  g_queued += 1;
   auto const t_submit = std::chrono::steady_clock::now();
   return pool().submit([file, offset, size, dst, stream, t_submit] {
     t_job = job_times{};
+    g_queued -= 1;
     auto const t_start = std::chrono::steady_clock::now();
     t_job.queue_ms     = std::chrono::duration<double, std::milli>(t_start - t_submit).count();
     g_ns_queue_wait += static_cast<std::uint64_t>(t_job.queue_ms * 1e6);

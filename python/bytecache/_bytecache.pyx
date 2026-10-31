@@ -30,6 +30,8 @@ cdef extern from "bytecache.hpp" namespace "bytecache" nogil:
         uint64_t device_reads
         uint64_t ns_queue_wait
         uint64_t max_inflight
+        uint64_t inflight_now
+        uint64_t queued_now
         uint64_t bytes_prefetched
         uint64_t prefetch_jobs
         uint64_t host_reads
@@ -42,6 +44,7 @@ cdef extern from "bytecache.hpp" namespace "bytecache" nogil:
         uint64_t fetched_bytes
         uint64_t resident_blocks
     void c_register_layout "bytecache::register_layout"(const string&, const string&, const vector[string]&, const vector[uint32_t]&, const vector[uint64_t]&, const vector[uint64_t]&) except +
+    void c_warm "bytecache::warm_footers"(const vector[string]&) nogil
     uint64_t c_prefetch "bytecache::prefetch_columns"(const string&, const string&, const vector[string]&) except +
     vector[column_stats] c_get_column_stats "bytecache::get_column_stats"()
     void c_configure "bytecache::configure"(const config&) except +
@@ -83,6 +86,8 @@ def get_stats():
         "device_reads": s.device_reads,
         "ns_queue_wait": s.ns_queue_wait,
         "max_inflight": s.max_inflight,
+        "inflight_now": s.inflight_now,
+        "queued_now": s.queued_now,
         "bytes_prefetched": s.bytes_prefetched,
         "prefetch_jobs": s.prefetch_jobs,
         "host_reads": s.host_reads,
@@ -96,6 +101,15 @@ def register_layout(str path, str table, list columns, list col_index, list offs
     for c in columns:
         cols.push_back((<str>c).encode())
     c_register_layout(path.encode(), table.encode(), cols, col_index, offsets, sizes)
+
+
+def warm_footers(list paths):
+    """Read the footers of many objects into the cache concurrently (GIL released)."""
+    cdef vector[string] ps
+    for p in paths:
+        ps.push_back((<str>p).encode())
+    with nogil:
+        c_warm(ps)
 
 
 def prefetch_columns(str path, str table, list columns):
