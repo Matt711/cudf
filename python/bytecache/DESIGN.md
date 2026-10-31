@@ -165,6 +165,13 @@ scan task (all row groups of its file(s), about 660 column chunks for a q1 task)
 Setting `CUDF_POLARS__PARQUET_OPTIONS__PASS_READ_LIMIT=2GiB` makes q1's I/O smooth (no idle seconds, steady 5.5 to 8.5 GB/s) but the full run is worse
 (122.7 s; 128.5 s with 8 GiB; 107.4 s default), because smaller passes slow the other queries (q4 4.2 -> 6.0 s, q13 6.2 -> 7.8 s, q21 9.9 -> 11.9 s). The limit is global.
 
+Hybrid scan (`CUDF_POLARS__PARQUET_OPTIONS__USE_HYBRID_SCAN=true`, used only for split tasks of scans with a pushed-down predicate) now reads through the cache
+(`_read_with_hybrid_scan` uses `bytecache.wrap_sources`) and validates 22/22 at SF1000, but is slower: 148.5 s with the 100 GB cache (107.4 s standard), 225.5 s with
+no cache (171 to 181 s standard), 133.9 s with the cache and the internal stats-pruning step off. Reads, spill volumes and memory waits are close to the standard path's,
+so the cost is per-task overhead in the hybrid path (the stats step alone is about 15 s on this data, where it can never prune a row group). It would need that
+overhead removed before it could serve as the hook for a scan manager. Gated read-ahead (prefetch only while at most 64 or 256 demand reads are running or queued,
+`BYTECACHE_PREFETCH_GATE`) also did not help: 116.2 s and 117.5 s against 107.4 s (86 and 100 GB prefetched).
+
 What the q1 profile showed (per-second cache counters): reads are issued in bursts of 1000 to 1900 (one scan task's reads), which
 saturate the 512-thread pool for about a second, and the pool then drains to zero running reads while the tasks decode, so
 the network is idle roughly half the time even though a plain kvikio microbenchmark reaches 10.9 GB/s at the same

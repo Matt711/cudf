@@ -371,6 +371,16 @@ class cache {
     n = std::min(n, f.size - off);
     if (!prefetch) st_.bytes_requested += n;
     counting_budget& budget = prefetch ? prefetch_budget() : get_budget();
+    if (prefetch) {
+      // Demand never waits for read-ahead: only fetch speculatively while few demand reads are running or queued
+      // (BYTECACHE_PREFETCH_GATE, 0 = no gating). During a burst the prefetch backs off and fills the gaps between bursts.
+      static std::size_t const gate = env_size("BYTECACHE_PREFETCH_GATE", 64);
+      if (std::getenv("BYTECACHE_PREFETCH_GATE") == nullptr || gate > 0) {
+        for (int spins = 0; static_cast<std::size_t>(g_inflight.load() + g_queued.load()) > gate && spins < 20000; ++spins) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+    }
     if (nslots_ == 0) {  // caching disabled: straight to the remote handle
       if (dst == nullptr) return 0;  // read-ahead / footer warming has nothing to populate
       f.handle->pread(dst, n, off).get();
