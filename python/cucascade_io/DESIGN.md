@@ -97,3 +97,12 @@ SF1000, 2 iterations, 22/22 validated, held state (S3 bytes are per pass):
 | patched, 512 KiB, 128 conn, batch 0.02 | 118.1 s | 111.2 s | 418 GB | 321 GB |
 | bytecache (tuned kvikio) | 104.2 s | 87.1 s | 332 GB | 206 GB |
 Priority alone barely moves the numbers; admitting everything is worse (refusing low-value columns matters); the win needs small chunks (small columns stop wasting cache, and l_suppkey / l_partkey get partly cached, as in bytecache) together with small eviction batches (otherwise each pass flushes a quarter of the cache, hot chunks first, and 256 KiB chunks thrash: 611 k evictions) and 128 connections per reactor (256 KiB requests are smaller). Run-to-run spread is about 7%.
+
+## Committed defaults, measured with no environment overrides (SF1000, held state, 22/22 validated)
+| run | cold | warm | S3 received |
+|---|---|---|---|
+| single pass 1 | 112.1 s | n/a | 413 GB |
+| single pass 2 | 116.4 s | n/a | 399 GB |
+| 2 iterations | 118.2 s | 104.1 s | 648 GB |
+
+With the earlier env-var runs of the same settings (cold 111.6 and 119.1 s, warm 95.8 and 104.6 s): single pass 112 to 116 s (bytecache 104.1 to 104.6 s), 2-iteration cold 112 to 119 s (bytecache 104.2 s), warm 96 to 105 s (bytecache 87.1 s). Run-to-run spread about 5 to 9%.
