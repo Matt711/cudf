@@ -1,0 +1,175 @@
+diff --git a/include/cucascade/cudf/datasource.hpp b/include/cucascade/cudf/datasource.hpp
+index bdc80cc..1466635 100644
+--- a/include/cucascade/cudf/datasource.hpp
++++ b/include/cucascade/cudf/datasource.hpp
+@@ -191,7 +191,9 @@ class datasource : public cudf::io::datasource {
+   /// cache is unavailable.  A second inserting call while an active handle is
+   /// already stored is a caller bug and only logs a warning: the datasource
+   /// lifecycle expects one insert per scan.
+-  void fadvise(std::span<const cudf::io::text::byte_range_info> ranges, std::optional<int> dev_id);
++  void fadvise(std::span<const cudf::io::text::byte_range_info> ranges,
++               std::optional<int> dev_id,
++               std::uint8_t priority = 0);
+ 
+   /// Drive the stashed handle's consumer stage to @p site.
+   void update(cache::scan_stage site);
+diff --git a/include/cucascade/io/cache/config.hpp b/include/cucascade/io/cache/config.hpp
+index 31d534f..68f8126 100644
+--- a/include/cucascade/io/cache/config.hpp
++++ b/include/cucascade/io/cache/config.hpp
+@@ -116,6 +116,10 @@ struct config {
+   /// Start evicting once the pool fills to this fraction of its capacity.
+   double eviction_threshold_fraction{0.8};
+ 
++  /// Share of the pool's allocated chunks the evictor frees in one pass once it starts evicting (the default 0.25 frees a quarter of the cache
++  /// at a time; a smaller value evicts just enough to stay under the threshold).
++  double eviction_batch_fraction{0.25};
++
+   /// Derived from @ref eviction by @ref apply_mode; not settable on its own.
+   bool dispose_on_idle{false};
+ 
+diff --git a/include/cucascade/io/cache/fs_cache.hpp b/include/cucascade/io/cache/fs_cache.hpp
+index 72b6925..8df4ad4 100644
+--- a/include/cucascade/io/cache/fs_cache.hpp
++++ b/include/cucascade/io/cache/fs_cache.hpp
+@@ -418,7 +418,8 @@ class fs_cache {
+ 
+   [[nodiscard]] cache_handle initiate_prefetching_request(const io_object& obj,
+                                                           std::span<const byte_range> ranges,
+-                                                          std::optional<int> gpu_id = {});
++                                                          std::optional<int> gpu_id = {},
++                                                          std::uint8_t priority     = 0);
+ 
+   /// Attach staging buffers to @p handle's request, so a following @ref prefetch
+   /// has chunks it can claim: a chunk without a buffer cannot be taken for
+diff --git a/include/cucascade/io/cache/types.hpp b/include/cucascade/io/cache/types.hpp
+index 30c4381..8d1ea46 100644
+--- a/include/cucascade/io/cache/types.hpp
++++ b/include/cucascade/io/cache/types.hpp
+@@ -930,6 +930,8 @@ struct cached_chunk {
+   std::size_t offset{0};
+   std::uint8_t* data{nullptr};
+   std::int32_t numa_node{-1};
++  /// Eviction priority: the evictor reclaims lower values first. Raised (never lowered) by every request that names the chunk.
++  std::atomic<std::uint8_t> priority{0};
+ };
+ 
+ static_assert(sizeof(cached_chunk) == 32, "cached_chunk should stay 4 per cache line");
+diff --git a/src/cudf/datasource.cpp b/src/cudf/datasource.cpp
+index 4e44a0f..d264fdb 100644
+--- a/src/cudf/datasource.cpp
++++ b/src/cudf/datasource.cpp
+@@ -216,7 +216,8 @@ std::unique_ptr<datasource> datasource::duplicate() const
+ }
+ 
+ void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges,
+-                         std::optional<int> dev_id)
++                         std::optional<int> dev_id,
++                         std::uint8_t priority)
+ {
+   auto* cache = _io_ctx->cache();
+   if (cache == nullptr || !_io_ctx->can_use_fs_cache()) { return; }
+@@ -245,7 +246,7 @@ void datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges
+   // Hand the ranges to the cache.  It returns an empty handle when it didn't
+   // enqueue any new work (dormant cache, every range coalesced with an existing
+   // entry); we only stash a real handle.
+-  auto handle = cache->initiate_prefetching_request(*_io_object, converted, dev_id);
++  auto handle = cache->initiate_prefetching_request(*_io_object, converted, dev_id, priority);
+   if (handle) { _prefetch_handle = std::move(handle); }
+ }
+ 
+diff --git a/src/io/cache/fs_cache.cpp b/src/io/cache/fs_cache.cpp
+index 8dfa4f4..02cc63c 100644
+--- a/src/io/cache/fs_cache.cpp
++++ b/src/io/cache/fs_cache.cpp
+@@ -34,6 +34,7 @@
+ #include <cuda_runtime.h>
+ 
+ #include <algorithm>
++#include <bitset>
+ #include <cassert>
+ #include <chrono>
+ #include <cmath>
+@@ -574,7 +575,8 @@ std::size_t fs_cache::retired_generation_count() const noexcept
+ 
+ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
+                                                     std::span<const byte_range> ranges,
+-                                                    std::optional<int> gpu_id)
++                                                    std::optional<int> gpu_id,
++                                                    std::uint8_t priority)
+ {
+   if (!_armed) { return cache_handle(); }
+ 
+@@ -667,6 +669,10 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
+ 
+   auto chunks_to_fetch = file.update_and_get_chunks(chunk_offsets, desired);
+   std::erase(chunks_to_fetch, nullptr);  // offsets past EOF have no slot
++  for (auto* c : chunks_to_fetch) {      // raise (never lower) the eviction priority of every chunk this request names
++    auto cur = c->priority.load(std::memory_order_relaxed);
++    while (cur < priority && !c->priority.compare_exchange_weak(cur, priority, std::memory_order_relaxed)) {}
++  }
+   req.chunks = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
+   // Resolve the preferred NUMA node for staging buffers from the target GPU's
+   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
+@@ -1600,7 +1606,7 @@ void fs_cache::evict_loop(const std::stop_token& st)
+       need = std::numeric_limits<size_t>::max();
+     } else {
+       if (_pool->should_start_evicting()) {
+-        need = static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) * 0.25);
++        need = std::max<size_t>(1, static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) * _cfg.eviction_batch_fraction));
+       }
+       // Rounded up: freeing whole chunks is the only granularity there is, so a
+       // demand for part of one still costs the whole thing.
+@@ -1623,23 +1629,37 @@ void fs_cache::evict_loop(const std::stop_token& st)
+     // is still subscribed to is not idle.
+     size_t reclaimed   = 0;
+     int const n_passes = _cfg.dispose_on_idle ? 1 : 2;
++    // Chunks carry an eviction priority (raised by the requests that name them); lower priorities are reclaimed first, and within one
++    // priority the oldest request first. The distinct priorities present are collected up front so a pass costs one sweep per level.
++    std::bitset<256> levels;
++    for (auto& er : eviction_batch) {
++      if (!er.released || !er.req || !er.req.chunks) { continue; }
++      for (cached_chunk* c : *er.req.chunks) {
++        levels.set(c->priority.load(std::memory_order_relaxed));
++      }
++    }
+     for (int pass = 0; pass < n_passes && reclaimed < need; ++pass) {
+       bool const respect_subscribers = (pass == 0);
+-      for (auto& er : eviction_batch) {
+-        if (!er.released || !er.req || !er.req.chunks) { continue; }
+-        for (cached_chunk* c : *er.req.chunks) {
+-          if (reclaimed >= need) { break; }
+-          // A single relaxed load answers the whole question: does this chunk
+-          // hold a reclaimable buffer, and is anybody still subscribed to it?
+-          auto const snap = c->state.load();
+-          if (!snap.is_reclaimable()) { continue; }
+-          if (respect_subscribers && snap.subscribers() != 0) { continue; }
+-          if (!c->state.mark_evicting(respect_subscribers)) { continue; }
+-          reclaim_by_numa[c->numa_node].push_back(reinterpret_cast<std::byte*>(c->data));
+-          c->data     = nullptr;
+-          std::ignore = c->state.mark_empty();  // also clears the populated extent
+-          ++reclaimed;
+-          _counters.evictions.fetch_add(1, std::memory_order_relaxed);
++      for (std::size_t level = 0; level < levels.size() && reclaimed < need; ++level) {
++        if (!levels.test(level)) { continue; }
++        for (auto& er : eviction_batch) {
++          if (!er.released || !er.req || !er.req.chunks) { continue; }
++          for (cached_chunk* c : *er.req.chunks) {
++            if (reclaimed >= need) { break; }
++            if (c->priority.load(std::memory_order_relaxed) != level) { continue; }
++            // A single relaxed load answers the whole question: does this chunk
++            // hold a reclaimable buffer, and is anybody still subscribed to it?
++            auto const snap = c->state.load();
++            if (!snap.is_reclaimable()) { continue; }
++            if (respect_subscribers && snap.subscribers() != 0) { continue; }
++            if (!c->state.mark_evicting(respect_subscribers)) { continue; }
++            reclaim_by_numa[c->numa_node].push_back(reinterpret_cast<std::byte*>(c->data));
++            c->data     = nullptr;
++            std::ignore = c->state.mark_empty();  // also clears the populated extent
++            c->priority.store(0, std::memory_order_relaxed);
++            ++reclaimed;
++            _counters.evictions.fetch_add(1, std::memory_order_relaxed);
++          }
+         }
+       }
+     }

@@ -2,7 +2,7 @@
 
 Reads `s3://` parquet through cuCascade's REST backend and prefetching cache (`cucascade::io::datasource`, a `cudf::io::datasource`) instead of the byte cache in `python/bytecache`. Enabled with `CUDF_POLARS_CUCASCADE_GB` (cache size); off by default. Goal: reproduce bytecache's SF1000 numbers (104 s cold, 87 s warm) with cuCascade, then upstream.
 
-Build: `python/cucascade_io/build.sh` (needs a cuCascade build, see the script variables, and liburing). Settings (env, all `CUDF_POLARS_CUCASCADE_*`): `GB` (cache size, enables the backend), `REACTORS` (REST reactors, default 16; cuCascade's own default 2 peaks at 1.6 GB/s), `CONNECTIONS` (per reactor, 64), `BLOCK_KB` (cache chunk size, default 1024), `BUDGET` (share of the cache the admission policy may fill, 0.9, counted in chunk-aligned bytes), `EVICT_THRESHOLD` (cuCascade eviction_threshold_fraction, 0.95; its default 0.8 caps the usable cache), `COLUMN_POLICY` (1), `ADVISE_MIN_BYTES`, `EVICTION` (lru|idle), `VERBOSE` (exit report). Glue-only env: `CC_PREFETCH=1` (separate prefetch step, off), `CC_NO_ALIGN=1` (do not widen advised ranges to whole chunks), `CC_RANK_MARGIN` (1.5), `CC_ASYNC_THREADS` (128).
+Build: `python/cucascade_io/build.sh` (needs a cuCascade build, see the script variables, and liburing). Settings (env, all `CUDF_POLARS_CUCASCADE_*`): `GB` (cache size, enables the backend), `REACTORS` (REST reactors, default 16; cuCascade's own default 2 peaks at 1.6 GB/s), `CONNECTIONS` (per reactor, default 128), `BLOCK_KB` (cache chunk size, default 256), `EVICT_BATCH` (cuCascade eviction_batch_fraction, default 0.02, needs the patch below), `BUDGET` (share of the cache the admission policy may fill, 0.9, counted in chunk-aligned bytes), `EVICT_THRESHOLD` (cuCascade eviction_threshold_fraction, 0.95; its default 0.8 caps the usable cache), `COLUMN_POLICY` (1), `ADVISE_MIN_BYTES`, `EVICTION` (lru|idle), `VERBOSE` (exit report). Glue-only env: `CC_PREFETCH=1` (separate prefetch step, off), `CC_NO_ALIGN=1` (do not widen advised ranges to whole chunks), `CC_RANK_MARGIN` (1.5), `CC_ASYNC_THREADS` (128).
 
 ## What was learned (cuCascade main b09010a, libcudf 26.12, SF300, g7e.8xlarge)
 - Credentials: cuCascade's REST factory takes static credentials plus an explicit endpoint only (no env or role chain); the glue passes the AWS_* env values in memory.
@@ -79,3 +79,21 @@ Small chunks: in a pure I/O test (128 threads, 8 MiB reads, no eviction) through
 | bytecache (tuned kvikio) | n/a | 104.2 s | 87.1 s | 332 GB | 206 GB |
 
 More connections cut the cold cost of 256 KiB chunks (164.5 s at 64 connections, 137.5 s at 128). Smaller chunks lower the warm pass but the cold pass fetches the same 490 to 530 GB at every chunk size, so the cold-pass gap to bytecache (about 150 GB, about 20 s) is not a footprint or capacity effect; it is which columns are resident as the pass proceeds. A rank-driven eviction (or a per-request priority on fadvise) inside cuCascade is the missing piece; with LRU plus sticky admission in the glue the cold pass converges late.
+
+## Update 4: patch to cuCascade (eviction priority, small eviction batches) closes most of the gap
+**The glue now needs a patched cuCascade**: `cucascade-evict-priority.patch` (apply to NVIDIA/cuCascade at b09010a with `git apply`; local clone only, not pushed anywhere). What it does (about 50 lines in 6 files):
+- `cached_chunk` gets an `std::atomic<uint8_t> priority` (fits the existing 32-byte layout); `fadvise(..., priority)` raises (never lowers) the priority of every chunk the request names; the evictor reclaims the lowest priority first and the oldest request first within a level (it used to walk requests in arrival order, so the chunks loaded first, which are the hot ones, went first, and a hit did not move a chunk back in line).
+- `cache::config::eviction_batch_fraction` (default 0.25 = old behaviour). The evictor used to free 25% of all allocated chunks in one pass whenever the pool crossed its threshold; the glue sets 0.02.
+- The glue sets a column's priority to 1 + 2 x rank (reads per full column) on every advised read.
+
+SF1000, 2 iterations, 22/22 validated, held state (S3 bytes are per pass):
+| config | cold | warm | cold pass | warm pass |
+|---|---|---|---|---|
+| unpatched, 1 MiB chunks, 64 conn (previous best) | 125.3 s | 108.3 s | 487 GB | 410 GB |
+| patched, priority + sticky admission, 1 MiB, batch 0.05 | 129.0 s | 115.6 s | 470 GB | 387 GB |
+| patched, priority, admit everything (no policy), 1 MiB | 138.5 s | 117.0 s | 628 GB | 418 GB |
+| **patched, 256 KiB, 128 conn, batch 0.02 (default)** | **119.1 s, 111.6 s** | **104.6 s, 95.8 s** | 371 / 370 GB | 276 / 280 GB |
+| patched, 256 KiB, 128 conn, batch 0.005 | 114.5 s | 104.4 s | 366 GB | 276 GB |
+| patched, 512 KiB, 128 conn, batch 0.02 | 118.1 s | 111.2 s | 418 GB | 321 GB |
+| bytecache (tuned kvikio) | 104.2 s | 87.1 s | 332 GB | 206 GB |
+Priority alone barely moves the numbers; admitting everything is worse (refusing low-value columns matters); the win needs small chunks (small columns stop wasting cache, and l_suppkey / l_partkey get partly cached, as in bytecache) together with small eviction batches (otherwise each pass flushes a quarter of the cache, hot chunks first, and 256 KiB chunks thrash: 611 k evictions) and 128 connections per reactor (256 KiB requests are smaller). Run-to-run spread is about 7%.

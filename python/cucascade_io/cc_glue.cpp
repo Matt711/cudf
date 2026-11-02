@@ -79,6 +79,14 @@ double col_rank(std::uint32_t c)
   return reg ? static_cast<double>(g_cols[c]->requested.load()) / static_cast<double>(reg) : 0.0;
 }
 
+bool g_priority = std::getenv("CC_NO_PRIORITY") == nullptr;  // eviction priority = column rank (cuCascade evicts lowest first)
+/// Eviction priority of a column's chunks: 1 + 2 x rank (reads per full column), capped; 0 stays reserved for unranked data.
+std::uint8_t col_priority(std::uint32_t c)
+{
+  std::lock_guard l(g_pm);
+  return static_cast<std::uint8_t>(std::min(250.0, 1.0 + 2.0 * col_rank(c)));
+}
+
 bool admit_range(std::uint32_t col, std::string const& path, std::uint64_t bytes)
 {
   std::lock_guard l(g_pm);
@@ -199,19 +207,23 @@ class advising_source : public cudf::io::datasource {
   {
     if (n < min_bytes_) return *base_;
     std::vector<cudf::io::text::byte_range_info> r;
-    if (g_column_policy) {
-      auto lay = layout_of(path_);
-      if (lay) {  // registered file: advise only the pieces of columns that rank within the budget; the rest is read straight through
-        std::uint64_t const lo = off, hi = off + n;
-        auto it = std::upper_bound(lay->begin(), lay->end(), lo, [](std::uint64_t v, segment const& sg) { return v < sg.end; });
-        for (; it != lay->end() && it->start < hi; ++it) {
-          std::uint64_t const a = std::max(lo, it->start), b = std::min(hi, it->end);
-          g_cols[it->col]->requested += b - a;
-          if (admit_range(it->col, path_, b - a)) { r.emplace_back(static_cast<int64_t>(a), static_cast<int64_t>(b - a)); g_cols[it->col]->admitted += b - a; }
-          else g_cols[it->col]->refused += b - a;
+    std::uint8_t prio = 0;
+    if (auto lay = layout_of(path_)) {  // registered file: account the read per column, set the eviction priority, and (policy on) admit by column
+      std::uint64_t const lo = off, hi = off + n;
+      auto it = std::upper_bound(lay->begin(), lay->end(), lo, [](std::uint64_t v, segment const& sg) { return v < sg.end; });
+      for (; it != lay->end() && it->start < hi; ++it) {
+        std::uint64_t const a = std::max(lo, it->start), b = std::min(hi, it->end);
+        g_cols[it->col]->requested += b - a;
+        bool const ok = !g_column_policy || admit_range(it->col, path_, b - a);
+        if (ok) {
+          r.emplace_back(static_cast<int64_t>(a), static_cast<int64_t>(b - a));
+          g_cols[it->col]->admitted += b - a;
+          if (g_priority) prio = std::max(prio, col_priority(it->col));
+        } else {
+          g_cols[it->col]->refused += b - a;
         }
-        if (r.empty()) return *base_;
       }
+      if (r.empty()) return *base_;
     }
     if (r.empty()) r.emplace_back(static_cast<int64_t>(off), static_cast<int64_t>(n));
     if (g_align) {  // widen each range to whole cache chunks (clipped to the object) and merge overlaps
@@ -227,7 +239,7 @@ class advising_source : public cudf::io::datasource {
     auto t0 = now_ns();
     auto dup = base_->duplicate();
     auto t1 = now_ns();
-    dup->fadvise(r, std::nullopt);
+    dup->fadvise(r, std::nullopt, prio);
     auto t2 = now_ns();
     auto const pr = dup->prepare_prefetch(true);
     auto t3 = now_ns();
@@ -273,6 +285,7 @@ void init(options const& o)
   cfg.rest.max_connections     = o.max_connections;
   cfg.cache.mode               = cucascade::io::cache::cache_mode::cucs;
   cfg.cache.eviction_threshold_fraction = o.evict_threshold;
+  cfg.cache.eviction_batch_fraction     = o.evict_batch;
   cfg.cache.eviction           = o.lru ? cucascade::io::cache::eviction_policy::lru : cucascade::io::cache::eviction_policy::idle;
   cfg.object_store.endpoint      = o.endpoint;
   cfg.object_store.region        = o.region;
