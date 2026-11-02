@@ -69,3 +69,13 @@ cuCascade records the valid part of a chunk as an edge-anchored extent (prefix o
 Fix in the glue: advise chunk-aligned ranges (default; `CC_NO_ALIGN=1` turns it off), so the first fill of a chunk is the whole chunk. Repeat of l_discount: 0.5 MB (the footer probe), 0 misses. Cost: edge chunks are fetched whole (first read of l_extendedprice 688 MB vs 590 MB).
 SF1000, 2 iterations, 1 MiB chunks, budget 0.9, sticky: cold 125.3 s, warm 108.3 s (before: 125.3 to 128.4 / 119.5 to 121.1); S3 487 GB cold pass, 410 GB warm pass (before 514 / 485). Warm bytes are now dominated by columns the budget refuses (about 360 GB), so what remains is capacity and footprint.
 Small chunks: in a pure I/O test (128 threads, 8 MiB reads, no eviction) throughput falls with chunk size (1 MiB 8.3 to 9.0 GB/s, 512 KiB 9.0, 256 KiB 3.5 to 6.6, 64 KiB 2.4); no thread is CPU-saturated. A plausible cause is bytes in flight = connections x request size (request size follows the chunk), but the microbenchmark is noisy (same setting 3.5, 5.3, 6.6 GB/s) and 256 connections per reactor was worse than 128, so this is not shown.
+
+## Chunk size with aligned advising and 128 connections per reactor (SF1000, 2 iterations, held state, 22/22 validated, one run each)
+| chunk | connections | cold | warm | S3 cold pass | S3 warm pass |
+|---|---|---|---|---|---|
+| 1 MiB (default) | 64 | 125.3 s | 108.3 s | 487 GB | 410 GB |
+| 512 KiB | 128 | 146.9 s | 102.4 s | 529 GB | 304 GB |
+| 256 KiB | 128 | 137.5 s | 98.4 s | 512 GB | 275 GB |
+| bytecache (tuned kvikio) | n/a | 104.2 s | 87.1 s | 332 GB | 206 GB |
+
+More connections cut the cold cost of 256 KiB chunks (164.5 s at 64 connections, 137.5 s at 128). Smaller chunks lower the warm pass but the cold pass fetches the same 490 to 530 GB at every chunk size, so the cold-pass gap to bytecache (about 150 GB, about 20 s) is not a footprint or capacity effect; it is which columns are resident as the pass proceeds. A rank-driven eviction (or a per-request priority on fadvise) inside cuCascade is the missing piece; with LRU plus sticky admission in the glue the cold pass converges late.
