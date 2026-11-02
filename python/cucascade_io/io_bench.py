@@ -11,7 +11,7 @@ cc.init(cache_bytes=int(float(os.environ.get("CC_CACHE_GB", "20")) * 2**30), end
 paths = [f"s3://rapids-tpch/tpch-rs/scale-100/lineitem/part.{i}.parquet" for i in range(NF)]
 dss = [cc.CucascadeDatasource(p) for p in paths]
 sizes = [3_100_000_000] * NF
-jobs = [(i, o) for i in range(NF) for o in range(0, 2_000_000_000, RNG)]
+jobs = [(i, o) for i in range(NF) for o in range(0, int(os.environ.get('SPAN', '2000000000')), RNG)]
 bufs = [np.empty(RNG, dtype=np.uint8) for _ in range(NT)]
 import threading; tl = threading.local(); idx = iter(range(NT)); lk = threading.Lock()
 def rx():

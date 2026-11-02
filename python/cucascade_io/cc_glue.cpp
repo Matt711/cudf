@@ -38,7 +38,7 @@ std::size_t g_min_advise = 0;
 std::atomic<std::uint64_t> g_ns_dup{0}, g_ns_fadvise{0}, g_ns_prepare{0}, g_ns_lock{0}, g_n_pick{0};
 inline std::uint64_t now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 std::size_t g_block = std::size_t{1} << 20;
-bool g_align = std::getenv("CC_ALIGN") != nullptr;  // advise whole chunks (needs the prefetch to fill them)
+bool g_align = std::getenv("CC_NO_ALIGN") == nullptr;  // advise whole chunks: a cached chunk cannot be widened later, so a partly filled one makes the neighbouring range miss on every repeat
 bool g_prefetch = std::getenv("CC_PREFETCH") != nullptr;  // the separate low-priority prefetch starves demand reads (see DESIGN notes); off by default
 
 
