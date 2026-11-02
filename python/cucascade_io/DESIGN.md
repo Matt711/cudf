@@ -117,3 +117,18 @@ With the earlier env-var runs of the same settings (cold 111.6 and 119.1 s, warm
 Bytes fall 25 to 40% (below bytecache's) but time barely moves, so the remaining 5 to 9 s gap to bytecache is not fetch volume. Per query the cold gap is 8.5 s in total, no query more than 1.5 s slower, and queries that read nothing from S3 are also slower (warm q3 3.8 vs 3.2 s and q4 2.4 vs 1.9 s at 0 GB on the wire), which points at a per-read cost on the cached path (per-read datasource duplicate and fadvise, 256 KiB chunk bookkeeping, copy out). Not yet profiled.
 Cache size units: CUDF_POLARS_CUCASCADE_GB is GiB (100 = 107.4 GB); bytecache's CUDF_POLARS_BYTECACHE_GB is GB (100 = 100 GB), so the 100 GiB cuCascade cache is 7% larger than bytecache's.
 Startup: creating the cache pins it all at engine start, measured at 29.7 s for 100 GiB (about 0.3 s per GiB, the same with 1 or 8 pinning threads); available host memory falls from 160 to 59 GB. This is not in the benchmark's total time, so process launch to end of the 22 queries is about 30 s longer than the tables for cuCascade. Sirius host tiers on this machine for comparison (one pass, LRU, not validated): 100 GB 136.5 s, 120 GB 129.9 s, 160 GB 120.0 s, 180 GB 108.9 s, 200 GB 96 to 109 s (405 to 438 GB read), 220 GB 100.9 s; the 22 queries need about 186 GB of distinct columns.
+
+## Cached read path is not the gap (warm microbenchmark, host only)
+
+warm_bench.py: 64 threads read 12 GB of SF100 lineitem ranges through the cuCascade datasource (20 GiB cache, 256 KiB chunks, 128 connections).
+Pass 1 fills from S3, passes 2 and 3 are pure cache hits (0 wire bytes).
+
+| range | fill (S3) | warm hits |
+|---|---|---|
+| 8 MiB | 2.3 GB/s | 77 to 86 GB/s |
+| 1 MiB | 1.0 GB/s | 17.6 to 18.0 GB/s |
+
+The SF1000 queries need about 3.6 GB/s on average (400 GB in 110 s), so a cached read is about 5x to 20x faster than needed.
+Per-read steps (duplicate, fadvise, prepare) total 2 to 3 s of thread time over a whole 22-query run, also negligible.
+So the 7 to 15 s gap to bytecache is not per-read overhead on hits. Remaining suspects: miss-path concurrency (bytes in flight while a
+query waits), eviction and refetch volume, and the unit difference in cache size (cuCascade 100 GiB is 7% larger than bytecache 100 GB).
