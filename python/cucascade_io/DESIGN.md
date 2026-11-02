@@ -18,3 +18,21 @@ Build: `python/cucascade_io/build.sh` (needs a cuCascade build, see the script v
 | bytecache | 34.7 s | 23.3 s | 57 GB |
 | cuCascade, first integration (nothing cached) | 59.3 s | 60.8 s | 632 GB |
 | cuCascade, advised reads, no prefetch | 47.3 s | 27.3 s | 117 GB |
+
+## Update: what limited SF1000 (one pass, 2 iterations; same machine, held driver state, tuned-kvikio env, all 22/22 validated)
+- Read throughput scales with reads in flight (one 8 MiB read is one ~110 ms round trip): 0.57 GB/s at 8 threads, 2.6 at 32, 8.2 at 128 (direct reads).
+- cuCascade's host space pre-allocates only `initial_number_pools` (default 4 x 128 MiB) and grows; with the cache armed every `prepare_prefetch` then waits (231 ms average, advised reads capped at 2.9 GB/s). Pre-allocating pools for the whole cache gives 9.2 GB/s in the same test. The glue now pre-allocates (pins) the cache in `bytecache.warm_up()` at engine start, so q1 does not pay for it (q1 39 s -> 10 s).
+- LRU alone over 100 GB reads about 800 to 850 GB per pass at SF1000 (like Sirius at 100 to 120 GB host: 862 to 981 GB, 130 to 146 s). Sirius' 96 to 109 s uses a 200 GB host tier.
+- Column-aware admission (rank by requested/registered, advise only columns that fit `budget_fraction` of the cache) helps; the budget must stay below cuCascade's 80% eviction threshold. SF1000, 1 iteration:
+
+| config | cold | S3 received |
+|---|---|---|
+| LRU, lazy pools (2 it.) | 196.6 s (cold of 2) | 1623 GB (2 it.) |
+| policy, budget 0.9 | 168.8 s | 847 GB |
+| policy, budget 0.6, 1 MiB chunks (default) | 152.8 s | 662 GB |
+| policy, budget 0.6, 256 KiB chunks | 177.6 s | 502 GB |
+| budget 0.6, 1 MiB, aligned ranges + prefetch step (CC_ALIGN=1 CC_PREFETCH=1) | 1309.5 s | 657 GB |
+| same, 512 KiB chunks | 715.4 s | 553 GB |
+| bytecache, tuned kvikio (for reference, 2 it. cold) | 104.2 s | 547 GB (2 it.) |
+
+- Smaller chunks keep small columns cacheable (a read that covers part of a chunk cannot be recorded as cached) but cut throughput; the prefetch step starves demand reads (cause not shown). Both off by default.

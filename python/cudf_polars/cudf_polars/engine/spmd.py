@@ -74,6 +74,7 @@ from cudf_polars.quent._runtime import (
 from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
 from cudf_polars.streaming.actor_graph.utils import set_memory_resource
 from cudf_polars.unstable import unstable
+from cudf_polars.utils import bytecache
 from cudf_polars.utils.cleanup import run_cleanup_steps
 from cudf_polars.utils.config import (
     MemoryResourceConfig,
@@ -645,6 +646,7 @@ class SPMDEngine(StreamingEngine):
             request_ceiling=executor_options["kvikio_request_ceiling"],
         )
 
+        bytecache.warm_up()
         self.rapidsmpf_options = resolve_rapidsmpf_options(rapidsmpf_options)
         mr_config: MemoryResourceConfig = engine_options.get(
             "memory_resource_config", MemoryResourceConfig.default()

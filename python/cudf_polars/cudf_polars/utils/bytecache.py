@@ -63,6 +63,9 @@ def _load_cucascade() -> Any:
                 session_token=os.environ.get("AWS_SESSION_TOKEN", ""),
                 rest_reactors=int(os.environ.get("CUDF_POLARS_CUCASCADE_REACTORS", "2")),
                 max_connections=int(os.environ.get("CUDF_POLARS_CUCASCADE_CONNECTIONS", "64")),
+                block_bytes=int(float(os.environ.get("CUDF_POLARS_CUCASCADE_BLOCK_KB", "1024")) * 1024),
+                budget_fraction=float(os.environ.get("CUDF_POLARS_CUCASCADE_BUDGET", "0.6")),
+                column_policy=os.environ.get("CUDF_POLARS_CUCASCADE_COLUMN_POLICY", "1") == "1",
                 advise_min_bytes=int(os.environ.get("CUDF_POLARS_CUCASCADE_ADVISE_MIN_BYTES", str(256 << 10))),
                 lru=os.environ.get("CUDF_POLARS_CUCASCADE_EVICTION", "lru") == "lru",
             )
@@ -70,7 +73,7 @@ def _load_cucascade() -> Any:
             if os.environ.get("CUDF_POLARS_CUCASCADE_VERBOSE"):
                 import atexit  # noqa: PLC0415
 
-                atexit.register(lambda: print(f"[cucascade] advise calls={_advise_calls} rc={_advise_rc} | {mod.cache_summary()}", file=sys.stderr, flush=True))
+                atexit.register(lambda: print(f"[cucascade] advise calls={_advise_calls} rc={_advise_rc} | {mod.cache_summary()}", file=sys.stderr, flush=True) or print(mod.column_report(), file=sys.stderr, flush=True))
         _cc_checked = True
     return _cc
 
@@ -94,6 +97,11 @@ def _load() -> Any:
             _mod = mod
         _checked = True
     return _mod
+
+
+def warm_up() -> None:
+    """Create the cuCascade io context (pins the whole cache) at engine start, so the first query does not pay for it."""
+    _load_cucascade()
 
 
 def enabled() -> bool:
@@ -164,7 +172,8 @@ def register_layouts(infos: Sequence[Any]) -> None:
     The layout only drives per-column accounting and, later, eviction and read-ahead; a failure here
     never affects the query.
     """
-    mod = _load()
+    cc = _load_cucascade()
+    mod = cc if cc is not None else _load()
     if mod is None:
         return
     if os.environ.get("CUDF_POLARS_BYTECACHE_VERBOSE"):
@@ -193,7 +202,8 @@ def register_layouts_from_sources(paths: Sequence[str], sources: Sequence[Any]) 
     Reads each unregistered file's footer through its cache-backed source (the footer blocks stay cached,
     so this costs one small read per file per process), then registers the column layout.
     """
-    mod = _load()
+    cc = _load_cucascade()
+    mod = cc if cc is not None else _load()
     if mod is None:
         return
     import types  # noqa: PLC0415

@@ -15,11 +15,15 @@ namespace ccglue {
 
 struct options {
   std::size_t cache_bytes{std::size_t{100} << 30};  ///< host (pinned) memory space capacity = prefetching cache budget
-  std::size_t initial_pools{4};                     ///< pinned pools allocated up front (see cuCascade host_memory_space_config)
+  std::size_t block_bytes{std::size_t{1} << 20};     ///< cache chunk size (= pinned host block = REST staging block)
+  std::size_t initial_pools{0};                     ///< 128 MiB pinned pools allocated up front; 0 = enough for the whole cache (a growing pool makes every prefetch wait, see DESIGN)
+  std::size_t pool_threads{8};                      ///< threads that pin the initial pools
   std::size_t rest_reactors{2};
   std::size_t max_connections{64};
   std::string endpoint, region, access_key, secret_key, session_token;
   std::size_t advise_min_bytes{std::size_t{256} << 10};  ///< reads of at least this size are advised to the cache first (0 = never)
+  double budget_fraction{0.6};  ///< columns admitted by rank must fit this fraction of the cache (cuCascade's LRU starts evicting at 80%)
+  bool column_policy{true};  ///< advise only columns that rank within the cache budget (needs register_layout); false = advise every read
   bool lru{true};  ///< cache eviction: LRU (keep idle chunks) vs idle (drop on idle)
 };
 
@@ -30,6 +34,12 @@ std::unique_ptr<cudf::io::datasource> open(std::string const& path, std::uint64_
 /// Register the byte ranges (offset, size) a scan is about to read so the cache keeps those chunks (cuCascade only caches advised ranges).
 /// With start=true also attaches staging buffers and issues the (low priority) prefetch; returns prepare_result*10 + prefetch_refusal, or -1 when not started.
 int fadvise(cudf::io::datasource* ds, std::vector<std::pair<std::uint64_t, std::uint64_t>> const& ranges, bool start);
+/// Column layout of one file (column chunk byte ranges), used by the column-aware admission policy: only columns that rank high enough by how often
+/// they are read, and fit the cache budget, are advised to the cache. dir groups files of one table; names/col_index/offsets/sizes as in bytecache.
+void register_layout(std::string const& path, std::string const& dir, std::vector<std::string> const& names, std::vector<std::uint32_t> const& col_index,
+                     std::vector<std::uint64_t> const& offsets, std::vector<std::uint64_t> const& sizes);
+/// Per-column admission accounting (registered / requested / admitted / refused bytes), one line per column.
+std::string column_report();
 /// fs_cache counters (reads, hits, misses, evictions) as text; empty when the cache is off.
 std::string cache_summary();
 /// Drain the cache and reactors; datasources must be destroyed first.
