@@ -18,11 +18,12 @@ struct options {
   std::size_t block_bytes{std::size_t{1} << 20};     ///< cache chunk size (= pinned host block = REST staging block)
   std::size_t initial_pools{0};                     ///< 128 MiB pinned pools allocated up front; 0 = enough for the whole cache (a growing pool makes every prefetch wait, see DESIGN)
   std::size_t pool_threads{8};                      ///< threads that pin the initial pools
-  std::size_t rest_reactors{2};
+  std::size_t rest_reactors{16};
   std::size_t max_connections{64};
   std::string endpoint, region, access_key, secret_key, session_token;
   std::size_t advise_min_bytes{std::size_t{256} << 10};  ///< reads of at least this size are advised to the cache first (0 = never)
-  double budget_fraction{0.6};  ///< columns admitted by rank must fit this fraction of the cache (cuCascade's LRU starts evicting at 80%)
+  double evict_threshold{0.95};  ///< cuCascade eviction_threshold_fraction: usable share of the pool (and where LRU eviction starts); its default is 0.8
+  double budget_fraction{0.9};  ///< admitted pieces (counted in chunk-aligned bytes) may fill this fraction of the cache
   bool column_policy{true};  ///< advise only columns that rank within the cache budget (needs register_layout); false = advise every read
   bool lru{true};  ///< cache eviction: LRU (keep idle chunks) vs idle (drop on idle)
 };

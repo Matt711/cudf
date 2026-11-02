@@ -12,10 +12,16 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <future>
+#include <thread>
 #include <chrono>
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <optional>
 #include <stdexcept>
 
@@ -54,21 +60,103 @@ std::shared_ptr<const std::vector<segment>> layout_of(std::string const& path)
   return it == g_layouts.end() ? nullptr : it->second;
 }
 
-/// Columns ranked at least as high as `col` (higher requested/registered first, earlier-seen first on ties) must fit the budget together with it.
-bool admit_column(std::uint32_t col)
+/// Sticky admission. A (file, column) piece that was admitted stays admitted (cuCascade's LRU would otherwise evict hot chunks instead of stale
+/// ones whenever the policy changes its mind). New pieces are admitted while the admitted set fits the budget; when it does not, a column that
+/// ranks clearly higher than the lowest-ranked admitted column (rank = requested/registered) replaces that column entirely (its chunks then age out).
+struct admitted_state {
+  std::unordered_set<std::uint64_t> pieces;                    // key = col << 40 ^ hash(path)
+  std::unordered_map<std::uint32_t, std::vector<std::uint64_t>> by_col;
+  std::unordered_map<std::uint32_t, std::uint64_t> col_bytes;  // admitted bytes per column
+  std::uint64_t total{0};
+} g_adm;
+std::unordered_map<std::uint64_t, std::uint64_t> g_fc_bytes;  // total bytes of one column in one file, from the layout
+inline std::uint64_t piece_key(std::uint32_t col, std::string const& path) { return (static_cast<std::uint64_t>(col) << 40) ^ (std::hash<std::string>{}(path) & ((std::uint64_t{1} << 40) - 1)); }
+double g_margin = std::getenv("CC_RANK_MARGIN") ? std::atof(std::getenv("CC_RANK_MARGIN")) : 1.5;
+
+double col_rank(std::uint32_t c)
+{
+  auto const reg = g_cols[c]->registered.load();
+  return reg ? static_cast<double>(g_cols[c]->requested.load()) / static_cast<double>(reg) : 0.0;
+}
+
+bool admit_range(std::uint32_t col, std::string const& path, std::uint64_t bytes)
 {
   std::lock_guard l(g_pm);
-  auto const rank = [&](std::uint32_t c) {
-    auto const reg = g_cols[c]->registered.load();
-    return reg ? static_cast<double>(g_cols[c]->requested.load()) / static_cast<double>(reg) : 0.0;
-  };
-  double const pc = rank(col);
-  std::uint64_t ahead = 0;
-  for (std::uint32_t c = 0; c < g_cols.size(); ++c) {
-    double const pj = rank(c);
-    if (pj > pc || (pj == pc && g_cols[c]->seen <= g_cols[col]->seen)) ahead += g_cols[c]->registered.load();
+  auto const key = piece_key(col, path);
+  if (g_adm.pieces.count(key)) return true;
+  if (auto it = g_fc_bytes.find(key); it != g_fc_bytes.end()) bytes = it->second;  // account the whole column chunk set of this file
+  if (g_adm.total + bytes > g_budget) {
+    // find the lowest-ranked admitted column; replace it only if this column ranks clearly higher
+    std::uint32_t low = col;
+    double lr         = 1e300;
+    for (auto const& [c, b] : g_adm.col_bytes) {
+      if (b == 0 || c == col) continue;
+      double const r = col_rank(c);
+      if (r < lr) { lr = r; low = c; }
+    }
+    if (low == col || col_rank(col) <= lr * g_margin) return false;
+    for (auto k : g_adm.by_col[low]) g_adm.pieces.erase(k);
+    g_adm.total -= g_adm.col_bytes[low];
+    g_adm.col_bytes[low] = 0;
+    g_adm.by_col[low].clear();
+    if (g_adm.total + bytes > g_budget) return false;
   }
-  return ahead <= g_budget;
+  g_adm.pieces.insert(key);
+  g_adm.by_col[col].push_back(key);
+  g_adm.col_bytes[col] += bytes;
+  g_adm.total += bytes;
+  return true;
+}
+
+/// Fixed thread pool for the waiting half of an advised async read: with the prefetch step cuCascade blocks the *calling* thread until the
+/// prefetch lands, but libcudf submits its async reads from a handful of threads, so without this each read would be synchronous.
+class wait_pool {
+ public:
+  explicit wait_pool(std::size_t n)
+  {
+    for (std::size_t i = 0; i < n; ++i) threads_.emplace_back([this] { loop(); });
+  }
+  ~wait_pool()
+  {
+    { std::lock_guard l(m_); stop_ = true; }
+    cv_.notify_all();
+    for (auto& t : threads_) t.join();
+  }
+  template <class F>
+  auto submit(F&& f) -> std::future<decltype(f())>
+  {
+    using R = decltype(f());
+    auto task = std::make_shared<std::packaged_task<R()>>(std::forward<F>(f));
+    auto fut  = task->get_future();
+    { std::lock_guard l(m_); q_.emplace_back([task] { (*task)(); }); }
+    cv_.notify_one();
+    return fut;
+  }
+ private:
+  void loop()
+  {
+    for (;;) {
+      std::function<void()> job;
+      {
+        std::unique_lock l(m_);
+        cv_.wait(l, [this] { return stop_ || !q_.empty(); });
+        if (q_.empty()) return;
+        job = std::move(q_.front());
+        q_.pop_front();
+      }
+      job();
+    }
+  }
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> q_;
+  std::vector<std::thread> threads_;
+  bool stop_{false};
+};
+wait_pool& async_pool()
+{
+  static wait_pool p(static_cast<std::size_t>(std::getenv("CC_ASYNC_THREADS") ? std::atoi(std::getenv("CC_ASYNC_THREADS")) : 128));
+  return p;
 }
 
 /// Wraps a cuCascade datasource so every sizeable read is first registered with the prefetching cache: cuCascade only keeps chunks that a
@@ -85,13 +173,25 @@ class advising_source : public cudf::io::datasource {
 
   size_t host_read(size_t off, size_t n, uint8_t* dst) override { return pick(off, n).host_read(off, n, dst); }
   std::unique_ptr<buffer> host_read(size_t off, size_t n) override { return pick(off, n).host_read(off, n); }
-  std::future<size_t> host_read_async(size_t off, size_t n, uint8_t* dst) override { return pick(off, n).host_read_async(off, n, dst); }
-  std::future<std::unique_ptr<buffer>> host_read_async(size_t off, size_t n) override { return pick(off, n).host_read_async(off, n); }
+  std::future<size_t> host_read_async(size_t off, size_t n, uint8_t* dst) override
+  {
+    auto& d = pick(off, n);
+    if (!g_prefetch || &d == base_.get()) return d.host_read_async(off, n, dst);
+    return async_pool().submit([&d, off, n, dst] { return d.host_read(off, n, dst); });  // the read waits for its prefetch: not on the caller's thread
+  }
+  std::future<std::unique_ptr<buffer>> host_read_async(size_t off, size_t n) override
+  {
+    auto& d = pick(off, n);
+    if (!g_prefetch || &d == base_.get()) return d.host_read_async(off, n);
+    return async_pool().submit([&d, off, n] { return d.host_read(off, n); });
+  }
   std::unique_ptr<buffer> device_read(size_t off, size_t n, cucascade::io::cudf_stream_type s) override { return pick(off, n).device_read(off, n, s); }
   size_t device_read(size_t off, size_t n, uint8_t* dst, cucascade::io::cudf_stream_type s) override { return pick(off, n).device_read(off, n, dst, s); }
   std::future<size_t> device_read_async(size_t off, size_t n, uint8_t* dst, cucascade::io::cudf_stream_type s) override
   {
-    return pick(off, n).device_read_async(off, n, dst, s);
+    auto& d = pick(off, n);
+    if (!g_prefetch || &d == base_.get()) return d.device_read_async(off, n, dst, s);
+    return async_pool().submit([&d, off, n, dst, s] { return d.device_read(off, n, dst, s); });
   }
 
  private:
@@ -107,7 +207,7 @@ class advising_source : public cudf::io::datasource {
         for (; it != lay->end() && it->start < hi; ++it) {
           std::uint64_t const a = std::max(lo, it->start), b = std::min(hi, it->end);
           g_cols[it->col]->requested += b - a;
-          if (admit_column(it->col)) { r.emplace_back(static_cast<int64_t>(a), static_cast<int64_t>(b - a)); g_cols[it->col]->admitted += b - a; }
+          if (admit_range(it->col, path_, b - a)) { r.emplace_back(static_cast<int64_t>(a), static_cast<int64_t>(b - a)); g_cols[it->col]->admitted += b - a; }
           else g_cols[it->col]->refused += b - a;
         }
         if (r.empty()) return *base_;
@@ -172,6 +272,7 @@ void init(options const& o)
   cfg.rest_n_reactors          = o.rest_reactors;
   cfg.rest.max_connections     = o.max_connections;
   cfg.cache.mode               = cucascade::io::cache::cache_mode::cucs;
+  cfg.cache.eviction_threshold_fraction = o.evict_threshold;
   cfg.cache.eviction           = o.lru ? cucascade::io::cache::eviction_policy::lru : cucascade::io::cache::eviction_policy::idle;
   cfg.object_store.endpoint      = o.endpoint;
   cfg.object_store.region        = o.region;
@@ -234,6 +335,10 @@ void register_layout(std::string const& path, std::string const& dir, std::vecto
   }
   for (std::size_t k = 0; k < col_index.size(); ++k) {
     segs->push_back({offsets[k], offsets[k] + sizes[k], ids[col_index[k]]});
+    {  // budget accounting uses the cache footprint: the chunk-aligned span of the range (a 0.5 MB column chunk still occupies whole chunks)
+      std::uint64_t const B = g_block, lo = (offsets[k] / B) * B, hi = ((offsets[k] + sizes[k] + B - 1) / B) * B;
+      g_fc_bytes[piece_key(ids[col_index[k]], path)] += hi - lo;
+    }
     g_cols[ids[col_index[k]]]->registered += sizes[k];
   }
   std::sort(segs->begin(), segs->end(), [](segment const& a, segment const& b) { return a.start < b.start; });
@@ -244,8 +349,13 @@ std::string column_report()
 {
   std::lock_guard l(g_pm);
   std::string out;
-  for (auto const& c : g_cols)
-    out += c->name + " reg=" + std::to_string(c->registered.load() >> 20) + "MiB req=" + std::to_string(c->requested.load() >> 20) + "MiB admitted=" + std::to_string(c->admitted.load() >> 20) + "MiB refused=" + std::to_string(c->refused.load() >> 20) + "MiB\n";
+  for (std::uint32_t id = 0; id < g_cols.size(); ++id) {
+    auto const& c = g_cols[id];
+    auto it       = g_adm.col_bytes.find(id);
+    out += "[adm_aligned=" + std::to_string((it == g_adm.col_bytes.end() ? 0 : it->second) >> 20) + "MiB rank=" + std::to_string(col_rank(id)) + "] ";
+    out += c->name + " reg=" + std::to_string(c->registered.load() >> 20) + "MiB req=" + std::to_string(c->requested.load() >> 20) + "MiB admitted=" +
+           std::to_string(c->admitted.load() >> 20) + "MiB refused=" + std::to_string(c->refused.load() >> 20) + "MiB\n";
+  }
   return out;
 }
 

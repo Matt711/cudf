@@ -2,7 +2,7 @@
 
 Reads `s3://` parquet through cuCascade's REST backend and prefetching cache (`cucascade::io::datasource`, a `cudf::io::datasource`) instead of the byte cache in `python/bytecache`. Enabled with `CUDF_POLARS_CUCASCADE_GB` (cache size); off by default. Goal: reproduce bytecache's SF1000 numbers (104 s cold, 87 s warm) with cuCascade, then upstream.
 
-Build: `python/cucascade_io/build.sh` (needs a cuCascade build, see the script variables, and liburing). Settings: `CUDF_POLARS_CUCASCADE_REACTORS` (default 2; 16 is much better), `_CONNECTIONS` (per reactor, 64), `_ADVISE_MIN_BYTES`, `_EVICTION` (lru|idle), `_VERBOSE`.
+Build: `python/cucascade_io/build.sh` (needs a cuCascade build, see the script variables, and liburing). Settings (env, all `CUDF_POLARS_CUCASCADE_*`): `GB` (cache size, enables the backend), `REACTORS` (REST reactors, default 16; cuCascade's own default 2 peaks at 1.6 GB/s), `CONNECTIONS` (per reactor, 64), `BLOCK_KB` (cache chunk size, default 1024), `BUDGET` (share of the cache the admission policy may fill, 0.9, counted in chunk-aligned bytes), `EVICT_THRESHOLD` (cuCascade eviction_threshold_fraction, 0.95; its default 0.8 caps the usable cache), `COLUMN_POLICY` (1), `ADVISE_MIN_BYTES`, `EVICTION` (lru|idle), `VERBOSE` (exit report). Glue-only env: `CC_PREFETCH=1`, `CC_ALIGN=1` (prefetch step, off), `CC_RANK_MARGIN` (1.5), `CC_ASYNC_THREADS` (128).
 
 ## What was learned (cuCascade main b09010a, libcudf 26.12, SF300, g7e.8xlarge)
 - Credentials: cuCascade's REST factory takes static credentials plus an explicit endpoint only (no env or role chain); the glue passes the AWS_* env values in memory.
@@ -36,3 +36,18 @@ Build: `python/cucascade_io/build.sh` (needs a cuCascade build, see the script v
 | bytecache, tuned kvikio (for reference, 2 it. cold) | 104.2 s | 547 GB (2 it.) |
 
 - Smaller chunks keep small columns cacheable (a read that covers part of a chunk cannot be recorded as cached) but cut throughput; the prefetch step starves demand reads (cause not shown). Both off by default.
+
+## Update 2: sticky admission, footprint accounting, chunk size (SF1000, 2 iterations, held state, 22/22 validated)
+- The prefetch step stalled because cuCascade's async read blocks the calling thread until the prefetch lands (`await_inflight_prefetch`), and libcudf submits async reads from a few threads, so each read became synchronous (q19 alone: 232 s at 0.3 GB/s). The wait now runs on a glue thread pool (q19 alone: 11.5 s at 8 to 10 GB/s). The REST reactor ignores io_priority (only the uring reactor has tiers), so priority was not the cause. With the stall fixed, prefetch + aligned ranges still did not beat plain advised reads (cold 146.6 s vs 134.2 s), so it stays off.
+- Admission is sticky: a (file, column) piece that was admitted stays admitted; new pieces are admitted while the admitted set fits `BUDGET`; a column is replaced only by one that ranks 1.5x higher (rank = requested / registered). Rank-driven re-admission made LRU evict hot chunks instead of stale ones.
+- The budget must be counted in chunk-aligned bytes: a 0.5 MB column chunk still occupies whole 1 MiB chunks (l_orderkey 1.8 GB raw = 7.4 GB footprint, l_discount 2.9 -> 8.5, l_shipdate 8.7 -> 14.3, l_extendedprice 33 -> 38.6). With raw sizes the cold pass evicted 328 k chunks (631 GB fetched); with aligned sizes 21.8 k (514 GB).
+
+| config (budget 0.9, sticky, aligned) | cold | warm | S3 cold pass | S3 warm pass |
+|---|---|---|---|---|
+| 1 MiB chunks (default) | 125.3 to 128.4 s | 119.5 to 121.1 s | 514 GB | 485 GB |
+| 512 KiB chunks | 141.8 s | 104.7 s | 517 GB | 337 GB |
+| 256 KiB chunks | 164.5 s | 100.6 s | 511 GB | 293 GB |
+| bytecache (tuned kvikio) | 104.2 s | 87.1 s | 332 GB | 206 GB |
+
+- Smaller chunks keep small columns from wasting cache (warm bytes fall) but cost cold time without extra bytes: per-chunk CPU/bookkeeping in the cache (evictions 612 k at 256 KiB). The REST reactor already fuses contiguous chunk fills into GETs of up to 16 MiB, so request size is not the reason.
+- Remaining gap to bytecache (cold 20 to 25 s, warm 15 to 35 s): footprint inflation of small columns (about 24 GB of the 92 GB admitted set), LRU instead of rank-driven eviction, and per-chunk overhead at small chunk sizes. Ideas for cuCascade itself: sub-chunk validity so a partly covered chunk can be cached; an eviction hook or per-request priority so a caller can say which chunks are cold; a lower per-chunk cost.
