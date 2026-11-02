@@ -41,7 +41,9 @@ struct segment {
 struct column_info {
   std::string name;
   std::atomic<std::uint64_t> registered{0}, requested{0}, hit{0}, fetched{0}, resident{0};
-  std::set<std::uint64_t> keys;  ///< keys of resident blocks, ordered (guarded by the cache mutex)
+  std::set<std::uint64_t> keys;   ///< keys of resident main-region blocks, ordered (guarded by the cache mutex)
+  std::set<std::uint64_t> rkeys;  ///< keys of resident recency-region blocks, ordered (guarded by the cache mutex)
+  std::uint64_t rstamp{0};        ///< last time a recency-region block of this column was admitted or hit
 };
 
 struct block {
@@ -52,6 +54,7 @@ struct block {
   std::uint32_t pins{};  // readers/fetchers currently using the block
   block_state st{block_state::loading};
   bool is_protected{false};
+  bool recent{false};  ///< lives in the recency region (admitted regardless of column rank)
   bool in_list{false};
   std::list<block*>::iterator it{};
 };
@@ -354,6 +357,10 @@ class cache {
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
       if (p == MAP_FAILED) throw std::runtime_error("bytecache: mmap of the arena failed");
       arena_ = static_cast<std::uint8_t*>(p);
+      if (char const* r = std::getenv("BYTECACHE_RECENT_GB"); r != nullptr && column_policy_) {
+        recent_cap_ = static_cast<std::size_t>(std::atof(r) * 1073741824.0) / c.block_size;
+        recent_cap_ = std::min(recent_cap_, nslots_ / 2);
+      }
       free_slots_.reserve(nslots_);
       for (std::size_t i = nslots_; i-- > 0;) free_slots_.push_back(static_cast<std::uint32_t>(i));
     }
@@ -441,11 +448,13 @@ class cache {
           continue;
         }
         std::uint32_t slot;
-        if (!alloc_slot(col, slot)) {
+        bool rec;
+        if (!alloc_slot(col, slot, rec)) {
           items[i] = {nullptr, kind::uncached, col};
           continue;
         }
         auto* b = new block;
+        b->recent = rec;
         b->col  = col;
         b->key  = key;
         b->slot = slot;
@@ -484,11 +493,13 @@ class cache {
           break;
         }
         std::uint32_t slot;
-        if (!alloc_slot(items[k].col, slot)) {
+        bool rec;
+        if (!alloc_slot(items[k].col, slot, rec)) {
           items[k].k = kind::uncached;
           break;
         }
         auto* b = new block;
+        b->recent = rec;
         b->col  = items[k].col;
         b->key  = key;
         b->slot = slot;
@@ -797,7 +808,7 @@ class cache {
   {
     probation_.push_back(b);
     cols_[b->col]->resident += 1;
-    cols_[b->col]->keys.insert(b->key);
+    (b->recent ? cols_[b->col]->rkeys : cols_[b->col]->keys).insert(b->key);
     b->it         = std::prev(probation_.end());
     b->in_list    = true;
     b->is_protected = false;
@@ -806,6 +817,7 @@ class cache {
   void touch(block* b)
   {
     if (!b->in_list) return;
+    if (b->recent) cols_[b->col]->rstamp = ++recent_seq_;
     if (b->is_protected) {
       protected_.splice(protected_.end(), protected_, b->it);
     } else {
@@ -819,7 +831,8 @@ class cache {
   void evict_block(block* b)
   {
     (b->is_protected ? protected_ : probation_).erase(b->it);
-    cols_[b->col]->keys.erase(b->key);
+    (b->recent ? cols_[b->col]->rkeys : cols_[b->col]->keys).erase(b->key);
+    (b->recent ? recent_count_ : main_count_) -= 1;
     cols_[b->col]->resident -= 1;
     map_.erase(b->key);
     delete b;
@@ -835,14 +848,17 @@ class cache {
     return reg ? static_cast<double>(cols_[col]->requested.load()) / static_cast<double>(reg) : 0.0;
   }
 
-  /// Find a slot for a block of column `incoming`. Column policy: a block is only admitted if its column ranks above the
-  /// lowest-ranked resident column, which then gives up its highest-offset block (so a partly cached column keeps a stable
-  /// prefix instead of thrashing under repeated sequential scans); otherwise the block bypasses the cache.
-  bool alloc_slot(std::uint32_t incoming, std::uint32_t& slot)
+  /// Find a slot for a block of column `incoming`. Column policy: a block is only admitted to the main region if its column
+  /// ranks above the lowest-ranked resident column, which then gives up its highest-offset block (so a partly cached column
+  /// keeps a stable prefix instead of thrashing under repeated sequential scans). A block the main region refuses goes to the
+  /// recency region (BYTECACHE_RECENT_GB, off by default) if there is one; otherwise it bypasses the cache.
+  bool alloc_slot(std::uint32_t incoming, std::uint32_t& slot, bool& recent)
   {
-    if (!free_slots_.empty()) {
+    recent = false;
+    if (!free_slots_.empty() && main_count_ < nslots_ - recent_cap_) {
       slot = free_slots_.back();
       free_slots_.pop_back();
+      main_count_ += 1;
       return true;
     }
     if (column_policy_) {
@@ -858,17 +874,19 @@ class cache {
           have   = true;
         }
       }
-      if (!have || pv >= priority(incoming)) return false;
-      auto& ks = cols_[victim]->keys;
-      for (auto it = ks.rbegin(); it != ks.rend(); ++it) {
-        block* b = map_.find(*it)->second;
-        if (b->pins != 0) continue;
-        slot = b->slot;
-        evict_block(b);
-        st_.blocks_evicted += 1;
-        return true;
+      if (have && pv < priority(incoming)) {
+        auto& ks = cols_[victim]->keys;
+        for (auto it = ks.rbegin(); it != ks.rend(); ++it) {
+          block* b = map_.find(*it)->second;
+          if (b->pins != 0) continue;
+          slot = b->slot;
+          evict_block(b);
+          main_count_ += 1;
+          st_.blocks_evicted += 1;
+          return true;
+        }
       }
-      return false;
+      return recent_cap_ != 0 && alloc_recent(incoming, slot, recent);
     }
     for (auto* lst : {&probation_, &protected_}) {
       for (auto it = lst->begin(); it != lst->end(); ++it) {
@@ -876,10 +894,50 @@ class cache {
         if (b->pins != 0) continue;
         slot = b->slot;
         evict_block(b);
+        main_count_ += 1;
         st_.blocks_evicted += 1;
         return true;
       }
     }
+    return false;
+  }
+
+  /// Recency region: admits any column. When full, the column admitted longest ago gives up its highest-offset block, so a
+  /// column larger than the region keeps a stable prefix for the next pass; the incoming column never evicts itself.
+  bool alloc_recent(std::uint32_t incoming, std::uint32_t& slot, bool& recent)
+  {
+    recent = true;
+    cols_[incoming]->rstamp = ++recent_seq_;
+    if (recent_count_ < recent_cap_ && !free_slots_.empty()) {
+      slot = free_slots_.back();
+      free_slots_.pop_back();
+      recent_count_ += 1;
+      return true;
+    }
+    std::uint32_t victim = 0;
+    std::uint64_t oldest = ~std::uint64_t{0};
+    bool have            = false;
+    for (std::uint32_t id = 0; id < cols_.size(); ++id) {
+      if (id == incoming || cols_[id]->rkeys.empty()) continue;
+      if (cols_[id]->rstamp < oldest) {
+        oldest = cols_[id]->rstamp;
+        victim = id;
+        have   = true;
+      }
+    }
+    if (have) {
+      auto& ks = cols_[victim]->rkeys;
+      for (auto it = ks.rbegin(); it != ks.rend(); ++it) {
+        block* b = map_.find(*it)->second;
+        if (b->pins != 0) continue;
+        slot = b->slot;
+        evict_block(b);
+        recent_count_ += 1;
+        st_.blocks_evicted += 1;
+        return true;
+      }
+    }
+    recent = false;
     return false;
   }
 
@@ -888,6 +946,7 @@ class cache {
     if (--b->pins == 0 && b->st == block_state::failed) {
       map_.erase(b->key);
       free_slots_.push_back(b->slot);
+      (b->recent ? recent_count_ : main_count_) -= 1;
       delete b;
     }
   }
@@ -929,6 +988,8 @@ class cache {
   std::vector<std::uint32_t> free_slots_;
   std::unordered_map<std::uint64_t, block*> map_;
   std::list<block*> probation_, protected_;
+  std::size_t recent_cap_{0}, recent_count_{0}, main_count_{0};
+  std::uint64_t recent_seq_{0};
   std::unordered_map<std::string, std::shared_ptr<remote_file>> files_;
   std::uint32_t next_file_id_{1};
   staging_pool pool_;

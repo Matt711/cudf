@@ -366,3 +366,9 @@ q4 -0.8 s, q3 -0.7 s, q18 -0.6 s, q21 -0.6 s, against q7 +1.1 s, q13 +1.3 s and 
 +-2 to 3 s noise band. So lookahead-1 prefetch with perfect knowledge of the next query is worth about nothing; a fair history-driven
 predictor cannot beat it, and is not worth building in this form. Plain baseline with the fix: 104.1 s (no regression). New test:
 `selftest_prefetch.py` (prefetch jobs racing demand reads, compared with standard reads, 0 mismatches at 8, 64 and 256 MiB).
+
+### 9.5 Recency region (BYTECACHE_RECENT_GB, off by default)
+
+The column policy refuses blocks of columns that rank below the lowest resident column, so a column read by only a few queries is fetched again on every repeat. With `BYTECACHE_RECENT_GB=N` the cache sets aside N GB of slots for blocks the main region refuses. When that region is full, the column admitted longest ago gives up its highest-offset blocks (a column larger than the region keeps a stable prefix; the incoming column never evicts itself).
+
+Measured at SF1000, default kvikio, held state, 2 iterations, 15 GB: warm 110.0-111.3 s to 106.5 s, iteration-2 S3 refetch 206 GB to 142 GB; cold 125-126 s to 129.0 s, iteration-1 fetch 332 GB to 364 GB (the protected hot set is 15% smaller). SF300: cold 34.8 to 31.7 s, warm 23.5 to 23.0 s. One run each, so the 3 to 4 s cold cost is not settled. Off by default because it only helps repeated workloads.
