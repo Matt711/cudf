@@ -106,3 +106,14 @@ Priority alone barely moves the numbers; admitting everything is worse (refusing
 | 2 iterations | 118.2 s | 104.1 s | 648 GB |
 
 With the earlier env-var runs of the same settings (cold 111.6 and 119.1 s, warm 95.8 and 104.6 s): single pass 112 to 116 s (bytecache 104.1 to 104.6 s), 2-iteration cold 112 to 119 s (bytecache 104.2 s), warm 96 to 105 s (bytecache 87.1 s). Run-to-run spread about 5 to 9%.
+
+## Larger cache: 120 GiB (SF1000, 2 iterations, held state, 22/22 validated, one run)
+| cache | cold | warm | S3 cold pass | S3 warm pass |
+|---|---|---|---|---|
+| cuCascade 100 GiB (committed defaults, 3 runs) | 111.6 to 119.1 s | 95.8 to 104.6 s | 370 to 371 GB | 276 to 280 GB |
+| cuCascade 120 GiB | 112.7 s | 92.5 s | 283 GB | 165 GB |
+| bytecache 100 GB | 104.2 s | 87.1 s | 332 GB | 206 GB |
+
+Bytes fall 25 to 40% (below bytecache's) but time barely moves, so the remaining 5 to 9 s gap to bytecache is not fetch volume. Per query the cold gap is 8.5 s in total, no query more than 1.5 s slower, and queries that read nothing from S3 are also slower (warm q3 3.8 vs 3.2 s and q4 2.4 vs 1.9 s at 0 GB on the wire), which points at a per-read cost on the cached path (per-read datasource duplicate and fadvise, 256 KiB chunk bookkeeping, copy out). Not yet profiled.
+Cache size units: CUDF_POLARS_CUCASCADE_GB is GiB (100 = 107.4 GB); bytecache's CUDF_POLARS_BYTECACHE_GB is GB (100 = 100 GB), so the 100 GiB cuCascade cache is 7% larger than bytecache's.
+Startup: creating the cache pins it all at engine start, measured at 29.7 s for 100 GiB (about 0.3 s per GiB, the same with 1 or 8 pinning threads); available host memory falls from 160 to 59 GB. This is not in the benchmark's total time, so process launch to end of the 22 queries is about 30 s longer than the tables for cuCascade. Sirius host tiers on this machine for comparison (one pass, LRU, not validated): 100 GB 136.5 s, 120 GB 129.9 s, 160 GB 120.0 s, 180 GB 108.9 s, 200 GB 96 to 109 s (405 to 438 GB read), 220 GB 100.9 s; the 22 queries need about 186 GB of distinct columns.
