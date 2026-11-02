@@ -17,6 +17,7 @@ import importlib
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -28,12 +29,50 @@ __all__ = [
     "register_layouts_from_sources",
     "start_scan_prefetch",
     "stats",
+    "advise",
     "wrap_sources",
 ]
 
 _lock = threading.Lock()
 _mod: Any = None
 _checked = False
+_cc: Any = None  # the cuCascade glue module when CUDF_POLARS_CUCASCADE_GB is set (an alternative backend to the byte cache)
+_cc_checked = False
+
+
+def _load_cucascade() -> Any:
+    global _cc, _cc_checked  # noqa: PLW0603
+    if _cc_checked:
+        return _cc
+    with _lock:
+        if _cc_checked:
+            return _cc
+        gb = os.environ.get("CUDF_POLARS_CUCASCADE_GB")
+        if gb:
+            path = os.environ.get("CUDF_POLARS_CUCASCADE_PATH")
+            if path and path not in sys.path:
+                sys.path.insert(0, path)
+            mod = importlib.import_module("_cucascade_io")
+            region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-east-1"
+            mod.init(
+                cache_bytes=int(float(gb) * (1 << 30)),
+                endpoint=os.environ.get("CUDF_POLARS_CUCASCADE_ENDPOINT", f"https://s3.{region}.amazonaws.com"),
+                region=region,
+                access_key=os.environ["AWS_ACCESS_KEY_ID"],
+                secret_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+                session_token=os.environ.get("AWS_SESSION_TOKEN", ""),
+                rest_reactors=int(os.environ.get("CUDF_POLARS_CUCASCADE_REACTORS", "2")),
+                max_connections=int(os.environ.get("CUDF_POLARS_CUCASCADE_CONNECTIONS", "64")),
+                advise_min_bytes=int(os.environ.get("CUDF_POLARS_CUCASCADE_ADVISE_MIN_BYTES", str(256 << 10))),
+                lru=os.environ.get("CUDF_POLARS_CUCASCADE_EVICTION", "lru") == "lru",
+            )
+            _cc = mod
+            if os.environ.get("CUDF_POLARS_CUCASCADE_VERBOSE"):
+                import atexit  # noqa: PLC0415
+
+                atexit.register(lambda: print(f"[cucascade] advise calls={_advise_calls} rc={_advise_rc} | {mod.cache_summary()}", file=sys.stderr, flush=True))
+        _cc_checked = True
+    return _cc
 
 
 def _load() -> Any:
@@ -180,6 +219,21 @@ def register_layouts_from_sources(paths: Sequence[str], sources: Sequence[Any]) 
     )
 
 
+_advise_calls = 0
+_advise_rc: dict[int, int] = {}
+
+
+def advise(sources: Sequence[Any] | None, reader: Any, row_groups: Sequence[int], options: Any) -> None:
+    """With the cuCascade backend, tell its cache which column chunks this scan is about to read (it only caches advised ranges)."""
+    if _cc is None or not sources or not row_groups:
+        return
+    ranges = reader.all_column_chunks_byte_ranges(list(row_groups), options)
+    global _advise_calls  # noqa: PLW0603
+    rc = sources[0].fadvise([r.offset for r in ranges], [r.size for r in ranges])
+    _advise_calls += 1
+    _advise_rc[rc] = _advise_rc.get(rc, 0) + 1
+
+
 def _is_remote(path: str) -> bool:
     return "://" in str(path)
 
@@ -192,6 +246,16 @@ def wrap_sources(
 
     The caller must keep the returned list alive for as long as the sources are read.
     """
+    cc = _load_cucascade()
+    if cc is not None:
+        if not paths or not all(_is_remote(p) for p in paths):
+            return None
+        sizes = sizes if sizes is not None else [None] * len(paths)
+        args = [(str(p), int(s or 0)) for p, s in zip(paths, sizes, strict=True)]
+        if len(args) == 1:
+            return [cc.CucascadeDatasource(*args[0])]
+        with ThreadPoolExecutor(min(32, len(args))) as ex:  # opens (HEAD + footer probe) release the GIL
+            return list(ex.map(lambda a: cc.CucascadeDatasource(*a), args))
     mod = _load()
     if mod is None or not paths or not all(_is_remote(p) for p in paths):
         return None
