@@ -51,3 +51,15 @@ Build: `python/cucascade_io/build.sh` (needs a cuCascade build, see the script v
 
 - Smaller chunks keep small columns from wasting cache (warm bytes fall) but cost cold time without extra bytes: per-chunk CPU/bookkeeping in the cache (evictions 612 k at 256 KiB). The REST reactor already fuses contiguous chunk fills into GETs of up to 16 MiB, so request size is not the reason.
 - Remaining gap to bytecache (cold 20 to 25 s, warm 15 to 35 s): footprint inflation of small columns (about 24 GB of the 92 GB admitted set), LRU instead of rank-driven eviction, and per-chunk overhead at small chunk sizes. Ideas for cuCascade itself: sub-chunk validity so a partly covered chunk can be cached; an eviction hook or per-request priority so a caller can say which chunks are cold; a lower per-chunk cost.
+
+## REST tuning sweep (SF1000, 1 iteration, current defaults, held state, 22/22 validated, one run each)
+| reactors | connections per reactor | cold | S3 received |
+|---|---|---|---|
+| 16 | 64 | 121.5 s | 539 GB |
+| 8 | 64 | 148.0 s | 554 GB |
+| 24 | 64 | 129.0 s | 542 GB |
+| 32 | 64 | 135.1 s | 559 GB |
+| 16 | 32 | 143.7 s | 542 GB |
+| 16 | 128 | 136.3 s | 576 GB |
+
+16 x 64 is the best of the six and matches Sirius' own sweep (8 reactors much slower; 32 no better). Run-to-run noise is about 5 to 7%, so the 24 and 32 results are not clearly worse. This is the counterpart of the kvikio 48 reactors / 512 ceiling setting. bytecache single pass with tuned kvikio: 104.1 to 104.6 s.
