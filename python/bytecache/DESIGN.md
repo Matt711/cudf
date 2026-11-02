@@ -381,7 +381,7 @@ Cold = sum of first-iteration query times, warm = sum of second-iteration times.
 |---|---|---|---|
 | SF300 | default (24 reactors / 256 ceiling) | 37.0 s | 23.8 s |
 | SF300 | tuned (48 / 512) | 34.7 s | 23.3 s |
-| SF1000 | default, 4 runs | 125.2 to 145.4 s | 110.0 to 132.1 s |
+| SF1000 | default, 7 runs | 125.2 to 145.4 s (last five: 134.7 to 145.4 s) | 110.0 to 132.1 s (last five: 114.0 to 132.1 s) |
 | SF1000 | tuned, 3 runs | 104.2 to 106.5 s | 87.1 to 93.0 s |
 
-Tuned kvikio is repeatable (2% cold spread) and worth 20 to 40 s cold at SF1000; default kvikio varies by about 20 s between identical runs. All SF1000 runs fetched 545 to 547 GB from S3. Not tested: a fresh driver state with tuned kvikio over 2 iterations, and a kvikio sweep beyond these two settings.
+Tuned kvikio is repeatable (2% cold spread) and worth 20 to 40 s cold at SF1000; default kvikio varies by about 20 s between identical runs, and the earliest two runs (125 to 126 s) were the fastest; the cause is not established (the slower runs had about 7% lower network rate, which is a correlation, not a measured S3 cause). All SF1000 runs fetched 545 to 547 GB from S3. Not tested: a fresh driver state with tuned kvikio over 2 iterations, and a kvikio sweep beyond these two settings.
