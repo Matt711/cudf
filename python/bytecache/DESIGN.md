@@ -372,3 +372,16 @@ predictor cannot beat it, and is not worth building in this form. Plain baseline
 The column policy refuses blocks of columns that rank below the lowest resident column, so a column read by only a few queries is fetched again on every repeat. With `BYTECACHE_RECENT_GB=N` the cache sets aside N GB of slots for blocks the main region refuses. When that region is full, the column admitted longest ago gives up its highest-offset blocks (a column larger than the region keeps a stable prefix; the incoming column never evicts itself).
 
 Measured at SF1000, default kvikio, held state, 2 iterations, 15 GB: warm 110.0-111.3 s to 106.5 s, iteration-2 S3 refetch 206 GB to 142 GB; cold 125-126 s to 129.0 s, iteration-1 fetch 332 GB to 364 GB (the protected hot set is 15% smaller). SF300: cold 34.8 to 31.7 s, warm 23.5 to 23.0 s. One run each, so the 3 to 4 s cold cost is not settled. Off by default because it only helps repeated workloads.
+
+### 9.6 Final 2-iteration results (reference, SF300 and SF1000, 100 GB cache, held driver state)
+
+Cold = sum of first-iteration query times, warm = sum of second-iteration times. All runs validated 22/22.
+
+| scale | kvikio | cold | warm |
+|---|---|---|---|
+| SF300 | default (24 reactors / 256 ceiling) | 37.0 s | 23.8 s |
+| SF300 | tuned (48 / 512) | 34.7 s | 23.3 s |
+| SF1000 | default, 4 runs | 125.2 to 145.4 s | 110.0 to 132.1 s |
+| SF1000 | tuned, 3 runs | 104.2 to 106.5 s | 87.1 to 93.0 s |
+
+Tuned kvikio is repeatable (2% cold spread) and worth 20 to 40 s cold at SF1000; default kvikio varies by about 20 s between identical runs. All SF1000 runs fetched 545 to 547 GB from S3. Not tested: a fresh driver state with tuned kvikio over 2 iterations, and a kvikio sweep beyond these two settings.
