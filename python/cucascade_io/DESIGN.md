@@ -266,3 +266,9 @@ Per-query comparison, one cold iteration each:
 - Full single pass, three cuCascade runs: 114.6, 110.8, 112.7 s (and 116.0 with a tight stall detector) against bytecache 107.2 s. The gap is 3 to 7 s, about the size of run-to-run noise plus one random 3 to 4 s query stall per run.
 - Admitted footprint (about 90 GB) covers the same hot columns bytecache keeps, and the 107 GB cache is larger than bytecache's 100 GB, so capacity is not the explanation at this size.
 - The stalls show up as seconds of 0.1 GB/s network. The REST stall detector (CC_STALL_KB, CC_STALL_S, opt-in) at 512 KiB/s for 2 s did not remove them (116.0 and 112.7 s vs 110.8 s default), so they are not slow GETs that the detector can retry.
+
+## First-byte stragglers (diagnostic only, no fix found)
+
+`CUCASCADE_SLOW_GET_LOG=<ms>` (in the patch, off by default) logs every data GET slower than that. In a 100 GiB cold pass, 3602 GETs took over 300 ms (3546 of them under 500 ms), 55 took 500 to 1000 ms, and one took 4.2 s: a 256 KiB GET with 4.2 s to first byte (connect 3 ms) that was the last request in flight, so its query waited on it. That is an S3 first-byte straggler, the same shape as the 3 to 4 s stalls seen once per run.
+
+Retrying a GET that has received no byte for 1 s (`CC_STALL_B=1 CC_STALL_S=1`) did not change the result: cold passes took 117.8, 110.2, 117.5 s with it and 125.7, 109.6 s without, with the same trickle seconds and outliers. Same-config runs vary by 16 s (109.6 to 125.7), more than any effect tested. Bytecache the same day: 102.4 and 107.2 s. cuCascade is 5 to 10 s behind on average, and one-run comparisons cannot resolve less than that.

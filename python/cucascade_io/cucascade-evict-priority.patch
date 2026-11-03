@@ -220,3 +220,30 @@ index 8dfa4f4..b5ca465 100644
          }
        }
      }
+diff --git a/src/io/rest/rest_reactor.cpp b/src/io/rest/rest_reactor.cpp
+index 0458638..f435321 100644
+--- a/src/io/rest/rest_reactor.cpp
++++ b/src/io/rest/rest_reactor.cpp
+@@ -2073,6 +2073,22 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
+ 
+         long http_status = 0;
+         curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &http_status);
++        {
++          static long const slow_ms = std::getenv("CUCASCADE_SLOW_GET_LOG") != nullptr ? std::atol(std::getenv("CUCASCADE_SLOW_GET_LOG")) : -1;
++          if (slow_ms >= 0) {
++            curl_off_t total = 0, ttfb = 0, conn = 0, size = 0;
++            curl_easy_getinfo(handle, CURLINFO_TOTAL_TIME_T, &total);
++            curl_easy_getinfo(handle, CURLINFO_STARTTRANSFER_TIME_T, &ttfb);
++            curl_easy_getinfo(handle, CURLINFO_CONNECT_TIME_T, &conn);
++            curl_easy_getinfo(handle, CURLINFO_SIZE_DOWNLOAD_T, &size);
++            if (total > slow_ms * 1000) {
++              std::fprintf(stderr, "[slow_get] t=%.0f total_ms=%ld ttfb_ms=%ld connect_ms=%ld bytes=%ld result=%d status=%ld inflight=%zu\n",
++                           std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),
++                           static_cast<long>(total / 1000), static_cast<long>(ttfb / 1000), static_cast<long>(conn / 1000), static_cast<long>(size),
++                           static_cast<int>(message->data.result), http_status, static_cast<std::size_t>(inflight));
++            }
++          }
++        }
+         auto const index = static_cast<std::size_t>(reinterpret_cast<std::intptr_t>(private_data));
+         curl_multi_remove_handle(multi.get(), handle);
+         --inflight;
