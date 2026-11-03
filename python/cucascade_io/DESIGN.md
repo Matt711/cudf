@@ -237,3 +237,23 @@ instead of failing when the cache pool is full), and one slice per run of contig
 At 100 GiB the gap is 9 to 10% in time and 11% in bytes. Starting point of this task was 196.6 s cold / 132.2 s warm. The goal (90 to 100 s cold)
 is not met by either engine at 100 GB; bytecache is at 102 to 104 s. Next lever: a larger cache (Sirius ran a 200 GB host tier at 96 to 109 s),
 which needs a driver reload to fit in this host state.
+
+## Larger caches after a driver reload (fresh state: 245 GB free), committed defaults, SF1000
+
+Both runs were stopped by the memory guard (host MemAvailable under 20 GB) in the second iteration of query 17, so queries 1 to 17 of both
+iterations completed; Q18 to Q22 are taken from the same-day bytecache run to estimate a full pass (estimates, not measurements).
+
+| cache | Q1-17 cold | Q1-17 warm | estimated full cold / warm | S3 bytes through Q17 |
+|---|---|---|---|---|
+| cuCascade 100 GiB | 77.7 s | 70.1 s | 107 / 95 s | |
+| cuCascade 150 GiB (161 GB) | 74.1 s | 58.4 s | 103 / 84 s | 248 GB |
+| cuCascade 186 GiB (200 GB, Sirius host tier size) | 78.1 s | 58.6 s | 107 / 84 s | 210 GB |
+| bytecache 100 GB, same day | 73.5 s | 64.1 s | 102 / 89 s | |
+
+- A bigger cache helps the warm pass (70 to 58 s for Q1-17) and does nothing for the cold pass: a first pass reads every distinct byte once,
+  so the cold time is set by how fast first-touch data moves, not by capacity. Cold is about 102 to 107 s in every configuration here, bytecache included.
+- The engine needs about 30 GB of host memory beyond the cache at its peak (second iteration of q17), so on this 249 GB host the largest usable
+  cache is about 140 to 145 GiB; a 186 GiB cache does not fit (Sirius fits it because it uses host memory differently).
+- Each run leaves about 35 GB held by the driver (host used 3 -> 39 -> 74 GB), so a reload buys about one large run.
+- Cold network profile: median 2 to 3.6 GB/s per 5 s window against a raw S3 capacity well above that, so the lever for the cold pass is
+  overlapping first-touch I/O with compute, which bytecache's own read-ahead experiments did not improve either.
