@@ -188,3 +188,40 @@ Before the change the same setting gave 385 to 390 GB. Higher budgets save a few
 Time per S3 byte is now the same as bytecache (0.32 vs 0.31 s/GB), so the remaining gap (368 vs 332 GB per pass) is bytes only.
 Upstream: the 0.9 default means any cache size asked for is 10% smaller in practice, including Sirius host tier sizes.
 cucascade-evict-priority.patch now also adds pool occupancy to fs_cache::summary().
+
+## Staging shares the cache pool: why 0.99 was unsafe, and what did not help (SF1000, held state, 100 GiB unless stated)
+
+The REST reactor stages every uncached device read (about 290 GB per pass, the columns the policy refuses to cache) through pinned blocks taken
+from the same host pool as the cache chunks, and a staging allocation that finds no free block FAILS the read ("pinned staging exhausted").
+Eviction starts when cache plus staging usage passes threshold x capacity, so the threshold must leave headroom for the requests in flight
+(connections x GET size). With the hidden 0.9 reservation limit removed, threshold 0.99 left about 1% free, which is why prefetch, 256
+connections and merged slices each segfaulted or raised out_of_memory in 1 of 2 runs. Default is now 0.97 (3% headroom, about 12k blocks).
+
+| single pass, 100 GiB | time | S3 bytes | CPU user + system |
+|---|---|---|---|
+| threshold 0.95 | 114.6 s | 360 GB | 863 s |
+| threshold 0.97 (default) | 108.8 s | 347 GB | 818 s |
+| threshold 0.99 | 114.1, 114.2 s | 348, 345 GB | 827 s |
+| 0.97 + adjacent miss slices merged to 512 KiB | 114.0 s | 354 GB | 850 s |
+| 0.97 + merged to 1 MiB | 116.4 s | 348 GB | 779 s |
+| 0.99 + merged to 2 MiB or 16 MiB | crash (staging exhausted) | | |
+| 256 connections (0.99) | 116.7 s, then crash | | |
+| 32 reactors x 128 | 134.5 s | | |
+| prefetch on (0.99) | 137.0 s, then crash | | |
+
+Findings:
+- Every demand read is split into one slice per 256 KiB chunk position, and the reactor sizes a GET per slice, so there are about 1.5M GETs per
+  pass (1.1M uncached, 0.4M fills). Merging adjacent uncached slices (CUCASCADE_MERGE_MISS_KB, off by default, in the patch) cuts CPU a little and
+  does not change time: GET size is not what limits the cold pass.
+- The Cython datasource releases the GIL for every call; it is not a Python bottleneck.
+- Cached-read microbenchmark (warm_bench.py) shows 64 KiB to 1 MiB chunks and 16 to 128 threads all land at 13 to 21 GB/s for 1 MiB reads (Python
+  thread pool bound), so it cannot isolate cache cost.
+- The interleaved default vs 256-connection pair (114.1, 114.2 vs 116.7) shows run-to-run spread of about 2 to 3% at fixed bytes; the earlier
+  111.5 to 119 s spread was mostly S3 noise.
+- Same-day bytecache (100 GB, 2 iterations): 102.4 s cold, 89.4 s warm, 546 GB over both passes. cuCascade 100 GiB (7% more memory): 115.7 / 98.1 s,
+  599 GB. The 13 s and 9 s gaps match the 10% extra bytes. bytecache at 120 GB does not fit this host state (memory guard stopped it at 19 GB free).
+- Per-query cold times at 120 GiB: +1 s on most queries (broad), warm gap concentrated in Q12, Q14, Q17, Q19 (they read the refused columns
+  l_partkey, l_commitdate, l_receiptdate).
+
+Upstream candidates: reservation_limit_fraction default 0.9 (silently 10% smaller cache), staging allocated from its own pool (or waiting
+instead of failing when the cache pool is full), and one slice per run of contiguous chunks in the device-read path.

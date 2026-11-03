@@ -79,10 +79,18 @@ index 4e44a0f..d264fdb 100644
  }
  
 diff --git a/src/io/cache/fs_cache.cpp b/src/io/cache/fs_cache.cpp
-index 8dfa4f4..c04f502 100644
+index 8dfa4f4..b5ca465 100644
 --- a/src/io/cache/fs_cache.cpp
 +++ b/src/io/cache/fs_cache.cpp
-@@ -34,6 +34,7 @@
+@@ -16,6 +16,7 @@
+  * limitations under the License.
+  */
+ 
++#include <cstdlib>
+ #include <cucascade/cuda/device_copy_batch.hpp>
+ #include <cucascade/exec/semi_future.hpp>
+ #include <cucascade/exec/try.hpp>
+@@ -34,6 +35,7 @@
  #include <cuda_runtime.h>
  
  #include <algorithm>
@@ -90,7 +98,7 @@ index 8dfa4f4..c04f502 100644
  #include <cassert>
  #include <chrono>
  #include <cmath>
-@@ -574,7 +575,8 @@ std::size_t fs_cache::retired_generation_count() const noexcept
+@@ -574,7 +576,8 @@ std::size_t fs_cache::retired_generation_count() const noexcept
  
  cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
                                                      std::span<const byte_range> ranges,
@@ -100,7 +108,7 @@ index 8dfa4f4..c04f502 100644
  {
    if (!_armed) { return cache_handle(); }
  
-@@ -667,6 +669,10 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
+@@ -667,6 +670,10 @@ cache_handle fs_cache::initiate_prefetching_request(const io_object& obj,
  
    auto chunks_to_fetch = file.update_and_get_chunks(chunk_offsets, desired);
    std::erase(chunks_to_fetch, nullptr);  // offsets past EOF have no slot
@@ -111,7 +119,30 @@ index 8dfa4f4..c04f502 100644
    req.chunks = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
    // Resolve the preferred NUMA node for staging buffers from the target GPU's
    // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
-@@ -1308,9 +1314,14 @@ std::string fs_cache::summary() const
+@@ -1169,6 +1176,22 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
+           continue;
+         }
+ 
++        // Adjacent uncached pieces of one read go out as one slice: the REST reactor sizes a GET per slice,
++        // so one slice per chunk position would turn a multi-MiB read into many chunk-sized GETs.
++        static std::size_t const max_merged_miss = [] {
++          auto const* kb = std::getenv("CUCASCADE_MERGE_MISS_KB");
++          return kb == nullptr ? std::size_t{0} : static_cast<std::size_t>(std::atoll(kb)) << 10;
++        }();
++        if (max_merged_miss != 0 && !prepared.empty()) {
++          auto& prev = prepared.back();
++          if (prev.needs_staging() && prev.on_complete == nullptr && prev.has_device_request() &&
++              prev.rng.end() == needed.offset && prev.d_buffer.data + prev.rng.size == device_dst &&
++              prev.rng.size + needed.size <= max_merged_miss) {
++            prev.rng.size += needed.size;
++            ++misses;
++            continue;
++          }
++        }
+         prepared.emplace_back(needed, device_buffer{device_dst, stream, device_id.value()});
+         ++misses;
+       }
+@@ -1308,9 +1331,14 @@ std::string fs_cache::summary() const
    uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
  
    return std::format(
@@ -127,7 +158,7 @@ index 8dfa4f4..c04f502 100644
      reads,
      hits,
      h2d,
-@@ -1600,7 +1611,7 @@ void fs_cache::evict_loop(const std::stop_token& st)
+@@ -1600,7 +1628,7 @@ void fs_cache::evict_loop(const std::stop_token& st)
        need = std::numeric_limits<size_t>::max();
      } else {
        if (_pool->should_start_evicting()) {
@@ -136,7 +167,7 @@ index 8dfa4f4..c04f502 100644
        }
        // Rounded up: freeing whole chunks is the only granularity there is, so a
        // demand for part of one still costs the whole thing.
-@@ -1623,23 +1634,37 @@ void fs_cache::evict_loop(const std::stop_token& st)
+@@ -1623,23 +1651,37 @@ void fs_cache::evict_loop(const std::stop_token& st)
      // is still subscribed to is not idle.
      size_t reclaimed   = 0;
      int const n_passes = _cfg.dispose_on_idle ? 1 : 2;

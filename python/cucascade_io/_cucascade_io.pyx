@@ -47,7 +47,7 @@ cdef extern from "cudf/io/datasource.hpp" namespace "cudf::io" nogil:
 
 
 def init(*, size_t cache_bytes, str endpoint, str region, str access_key, str secret_key, str session_token="",
-         size_t rest_reactors=16, size_t max_connections=128, size_t initial_pools=0, size_t pool_threads=8, size_t block_bytes=262144, size_t advise_min_bytes=262144, double evict_batch=0.02, double evict_threshold=0.99, double budget_fraction=0.9, bint column_policy=True, bint lru=True):
+         size_t rest_reactors=16, size_t max_connections=128, size_t initial_pools=0, size_t pool_threads=8, size_t block_bytes=262144, size_t advise_min_bytes=262144, double evict_batch=0.02, double evict_threshold=0.97, double budget_fraction=0.9, bint column_policy=True, bint lru=True):
     cdef options o
     o.cache_bytes = cache_bytes
     o.initial_pools = initial_pools
