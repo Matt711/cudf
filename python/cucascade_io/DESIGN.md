@@ -272,3 +272,23 @@ Per-query comparison, one cold iteration each:
 `CUCASCADE_SLOW_GET_LOG=<ms>` (in the patch, off by default) logs every data GET slower than that. In a 100 GiB cold pass, 3602 GETs took over 300 ms (3546 of them under 500 ms), 55 took 500 to 1000 ms, and one took 4.2 s: a 256 KiB GET with 4.2 s to first byte (connect 3 ms) that was the last request in flight, so its query waited on it. That is an S3 first-byte straggler, the same shape as the 3 to 4 s stalls seen once per run.
 
 Retrying a GET that has received no byte for 1 s (`CC_STALL_B=1 CC_STALL_S=1`) did not change the result: cold passes took 117.8, 110.2, 117.5 s with it and 125.7, 109.6 s without, with the same trickle seconds and outliers. Same-config runs vary by 16 s (109.6 to 125.7), more than any effect tested. Bytecache the same day: 102.4 and 107.2 s. cuCascade is 5 to 10 s behind on average, and one-run comparisons cannot resolve less than that.
+
+## Four alternating cold passes, and why the late queries are slower (100 GiB vs bytecache 100 GB, same day)
+
+Cold passes (one iteration each, alternating): bytecache 108.8, 104.5, 100.7, 102.7 s (mean 104.2); cuCascade 119.2, 105.2, 113.2, 108.4 s (mean 111.5). cuCascade's best run equals bytecache; it has more bad runs.
+
+Per query, bytecache is steady. cuCascade has two separate effects:
+
+1. Random stalls: one run lost 4 s in Q5, 2.8 s in Q12 and 3.7 s in Q21; another run, none. Slow-GET logging (`CUCASCADE_SLOW_GET_LOG=<ms>`) found one 256 KiB GET with 4.2 s to first byte as the last request in flight. Retrying zero-byte GETs after 1 s (`CC_STALL_B=1 CC_STALL_S=1`) did not change the totals (115.2 vs 117.7 s means over 5 runs; same-config spread is 16 s). Not fixed.
+2. A systematic gap on Q14, Q15, Q17, Q19, Q20 (sum 19.9 s on average vs 16.1 s for bytecache). Cause: capacity. The pool is full (97 GiB budget of 100 GiB at threshold 0.97) and the admitted columns are padded to whole chunks, so the columns bytecache holds in 100 GB (including all 21 GB of l_partkey) do not fit: l_partkey is admitted 5 GB (budget 0.9) or 10 GB (budget 0.95) of 21 GB. Padding costs about 14 GB (l_orderkey 1.8 -> 3.2, l_shipdate 8.7 -> 10.1, l_quantity 4.3 -> 5.7, l_discount 2.9 -> 4.3, l_partkey and others).
+
+| config | cold | five late queries |
+|---|---|---|
+| 100 GiB, budget 0.9 | 108.2, 114.5 | 20.1, 24.7 |
+| 100 GiB, budget 0.95 | 109.7, 114.9 | 19.0, 20.0 |
+| 105 GiB, budget 0.95 | 109.4, 108.4 | 19.4, 18.4 (l_partkey 15 GB admitted) |
+| bytecache 100 GB | 100.7 to 108.8 | about 16.1 |
+
+128 KiB chunks halve the padding but are much slower (127.9 and 128.8 s against 112.7 and 111.7 s for 256 KiB in the same session), so chunk size stays at 256 KiB.
+
+Next: remove the padding rather than shrink the chunk, for example tail chunks sized to the data, or a boundary chunk shared by neighbouring columns counted once. That is a cuCascade change (upstream).
