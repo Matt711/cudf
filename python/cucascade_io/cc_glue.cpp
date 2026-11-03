@@ -285,6 +285,8 @@ void init(options const& o)
   cfg.backend                  = cucascade::io::io_backend::native;
   cfg.rest_n_reactors          = o.rest_reactors;
   cfg.rest.max_connections     = o.max_connections;
+  if (auto const* kb = std::getenv("CC_STALL_KB")) cfg.rest.stall_speed_limit_bytes = std::atol(kb) << 10;  // a GET below this rate for CC_STALL_S seconds is aborted and retried
+  if (auto const* s = std::getenv("CC_STALL_S")) cfg.rest.stall_time_s = std::atol(s);
   cfg.cache.mode               = cucascade::io::cache::cache_mode::cucs;
   cfg.cache.eviction_threshold_fraction = o.evict_threshold;
   cfg.cache.eviction_batch_fraction     = o.evict_batch;

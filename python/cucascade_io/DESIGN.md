@@ -257,3 +257,12 @@ iterations completed; Q18 to Q22 are taken from the same-day bytecache run to es
 - Each run leaves about 35 GB held by the driver (host used 3 -> 39 -> 74 GB), so a reload buys about one large run.
 - Cold network profile: median 2 to 3.6 GB/s per 5 s window against a raw S3 capacity well above that, so the lever for the cold pass is
   overlapping first-touch I/O with compute, which bytecache's own read-ahead experiments did not improve either.
+
+## Where the remaining cold gap is (same day, 100 GiB vs bytecache 100 GB)
+
+Per-query comparison, one cold iteration each:
+
+- Q13 alone cold: cuCascade 8.7 s, bytecache 9.8 s. Q10,12,13 in sequence: 25.1 s vs 24.6 s. Q1 three alternating repeats: 11.07 s vs 10.93 s. Q1 to Q13 in sequence: cuCascade 4.8 s slower in total, about 0.4 s per query. The cold read path is level with bytecache; the single-query gaps in earlier full runs (Q13 +4 s, Q12 +3.8 s) did not repeat.
+- Full single pass, three cuCascade runs: 114.6, 110.8, 112.7 s (and 116.0 with a tight stall detector) against bytecache 107.2 s. The gap is 3 to 7 s, about the size of run-to-run noise plus one random 3 to 4 s query stall per run.
+- Admitted footprint (about 90 GB) covers the same hot columns bytecache keeps, and the 107 GB cache is larger than bytecache's 100 GB, so capacity is not the explanation at this size.
+- The stalls show up as seconds of 0.1 GB/s network. The REST stall detector (CC_STALL_KB, CC_STALL_S, opt-in) at 512 KiB/s for 2 s did not remove them (116.0 and 112.7 s vs 110.8 s default), so they are not slow GETs that the detector can retry.
