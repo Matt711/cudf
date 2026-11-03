@@ -132,3 +132,15 @@ The SF1000 queries need about 3.6 GB/s on average (400 GB in 110 s), so a cached
 Per-read steps (duplicate, fadvise, prepare) total 2 to 3 s of thread time over a whole 22-query run, also negligible.
 So the 7 to 15 s gap to bytecache is not per-read overhead on hits. Remaining suspects: miss-path concurrency (bytes in flight while a
 query waits), eviction and refetch volume, and the unit difference in cache size (cuCascade 100 GiB is 7% larger than bytecache 100 GB).
+
+## Equal cache size to bytecache (93.1 GiB = 100 GB), SF1000, held state, 22/22 validated
+
+| run | cuCascade 93.1 GiB | cuCascade 100 GiB (earlier) | bytecache 100 GB |
+|---|---|---|---|
+| single pass | 129.3 s, 471 GB from S3 | 112.1 / 116.4 s, 413 / 399 GB | 104.1 to 104.6 s, 332 GB |
+| 2 iterations, cold / warm | 133.6 / 115.7 s | 111.6 to 119.1 / 95.8 to 104.6 s | 104.2 / 87.1 s |
+
+One run each, so the run-to-run spread (5 to 9%) applies. Even so, the 7% smaller cache costs about 15% in time and 14% more S3 bytes
+(471 vs 413 GB), a steeper cliff than the size change alone explains. At equal size cuCascade fetches 140 GB (42%) more than bytecache
+per pass, so the gap is bytes, not per-read overhead (see the warm microbenchmark above). Likely causes: usable capacity lost to
+budget_fraction 0.9, the 0.95 eviction threshold and chunk-aligned footprint, plus LRU eviction of pieces bytecache keeps pinned.
