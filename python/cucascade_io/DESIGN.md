@@ -225,3 +225,15 @@ Findings:
 
 Upstream candidates: reservation_limit_fraction default 0.9 (silently 10% smaller cache), staging allocated from its own pool (or waiting
 instead of failing when the cache pool is full), and one slice per run of contiguous chunks in the device-read path.
+
+## Committed defaults (threshold 0.97, reservation 1.0), 2 iterations, SF1000, held state, 22/22 validated both passes
+
+| run | cold | warm | S3 total |
+|---|---|---|---|
+| cuCascade 93.1 GiB (= 100 GB) | 120.1 s | 105.2 s | 652 GB |
+| cuCascade 100 GiB (107 GB) | 111.8 s | 98.4 s | 605 GB |
+| bytecache 100 GB, same day | 102.4 s | 89.4 s | 546 GB |
+
+At 100 GiB the gap is 9 to 10% in time and 11% in bytes. Starting point of this task was 196.6 s cold / 132.2 s warm. The goal (90 to 100 s cold)
+is not met by either engine at 100 GB; bytecache is at 102 to 104 s. Next lever: a larger cache (Sirius ran a 200 GB host tier at 96 to 109 s),
+which needs a driver reload to fit in this host state.
