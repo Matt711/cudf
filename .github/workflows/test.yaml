@@ -25,6 +25,22 @@ on:
 permissions: {}
 
 jobs:
+  polars-main:
+    needs: wheel-tests-cudf-polars
+    if: ${{ inputs.build_type == 'nightly' && inputs.branch == 'main' && vars.POLARS_MAIN_ENABLED == 'true' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Start independent Polars main compatibility tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CUDF_SHA: ${{ inputs.sha }}
+          ARTIFACT_DATE: ${{ inputs.date }}
+        run: |
+          gh workflow run polars-main.yaml --repo "$GITHUB_REPOSITORY" --ref main \
+              --field cudf_sha="$CUDF_SHA" --field date="$ARTIFACT_DATE"
   conda-cpp-checks:
     permissions:
       actions: read

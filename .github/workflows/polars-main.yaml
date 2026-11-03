@@ -1,0 +1,175 @@
+name: Polars main compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      cudf_sha:
+        description: cuDF commit matching available nightly wheel artifacts
+        type: string
+      date:
+        description: Nightly artifact date (YYYY-MM-DD)
+        type: string
+      polars_sha:
+        description: Exact Polars commit (defaults to resolving main once)
+        type: string
+      repair_pr:
+        description: Repair PR to test at its recorded snapshot instead of main
+        type: string
+        default: '0'
+  push:
+    branches: ['bot/polars-main-*']
+  pull_request:
+    paths:
+      - .github/workflows/polars-main.yaml
+      - ci/cudf_polars/upstream*.py
+      - ci/cudf_polars/tests/**
+      - ci/*polars_main.sh
+
+concurrency:
+  group: polars-main-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  controller-tests:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - run: python -m unittest discover -s ci/cudf_polars/tests -v
+
+  target:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      cudf_sha: ${{ steps.target.outputs.cudf_sha }}
+      source_sha: ${{ steps.target.outputs.source_sha }}
+      polars_sha: ${{ steps.target.outputs.polars_sha }}
+      date: ${{ steps.target.outputs.date }}
+      pr: ${{ steps.target.outputs.pr }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Resolve immutable test targets
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CUDF_SHA: ${{ inputs.cudf_sha }}
+          ARTIFACT_DATE: ${{ inputs.date }}
+          POLARS_SHA: ${{ inputs.polars_sha }}
+          REPAIR_PR: ${{ inputs.repair_pr || '0' }}
+          PUSH_SHA: ${{ github.event_name == 'push' && github.sha || '' }}
+          BRANCH: ${{ github.ref_name }}
+        run: >-
+          python ci/cudf_polars/upstream_ci.py prepare
+          --cudf-sha "$CUDF_SHA" --date "$ARTIFACT_DATE"
+          --polars-sha "$POLARS_SHA" --pr "$REPAIR_PR"
+          --push-sha "$PUSH_SHA" --branch "$BRANCH"
+
+  build:
+    needs: target
+    runs-on: linux-amd64-cpu16
+    timeout-minutes: 90
+    container:
+      image: python:3.12-bookworm # zizmor: ignore[unpinned-images]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: cache
+        with:
+          path: polars-main-build
+          key: polars-main-linux-py312-${{ needs.target.outputs.polars_sha }}-${{ hashFiles('ci/build_polars_main.sh') }}
+      - name: Install Rust and build Polars
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          POLARS_SHA: ${{ needs.target.outputs.polars_sha }}
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
+          sh rustup-init.sh -y --profile minimal --default-toolchain none
+          export PATH="$HOME/.cargo/bin:$PATH"
+          bash ci/build_polars_main.sh "$POLARS_SHA" polars-main-build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: polars-main-build-${{ github.run_attempt }}
+          path: polars-main-build
+          retention-days: 30
+          if-no-files-found: error
+
+  test:
+    needs: [target, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [unit, in-memory, spmd, spmd-small]
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      packages: read
+      pull-requests: read
+    uses: rapidsai/shared-workflows/.github/workflows/custom-job.yaml@main
+    secrets: inherit # zizmor: ignore[secrets-inherit]
+    with:
+      build_type: nightly
+      branch: main
+      sha: ${{ needs.target.outputs.cudf_sha }}
+      date: ${{ needs.target.outputs.date }}
+      node_type: gpu-l4-latest-1
+      container_image: rapidsai/citestwheel:26.12-cuda12.9-ubuntu24.04-py3.12
+      container-options: '--cap-add CAP_SYS_PTRACE --shm-size=8g'
+      script: bash ci/test_cudf_polars_main.sh ${{ needs.target.outputs.source_sha }} ${{ matrix.suite }}
+      file_to_upload: polars-main-results
+      artifact-name: polars-main-results-${{ matrix.suite }}-${{ github.run_attempt }}
+
+  report:
+    if: ${{ always() && needs.target.result == 'success' }}
+    needs: [target, build, test]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: needs.build.result == 'success'
+        with:
+          pattern: polars-main-results-*-${{ github.run_attempt }}
+          path: results
+      - name: Publish result and request optional repair
+        env:
+          GH_TOKEN: ${{ secrets.POLARS_MAIN_BOT_TOKEN || github.token }}
+          POLARS_MAIN_REPAIR_ENABLED: ${{ vars.POLARS_MAIN_REPAIR_ENABLED }}
+          BOT_TOKEN_CONFIGURED: ${{ secrets.POLARS_MAIN_BOT_TOKEN != '' }}
+          CUDF_SHA: ${{ needs.target.outputs.cudf_sha }}
+          SOURCE_SHA: ${{ needs.target.outputs.source_sha }}
+          POLARS_SHA: ${{ needs.target.outputs.polars_sha }}
+          ARTIFACT_DATE: ${{ needs.target.outputs.date }}
+          REPAIR_PR: ${{ needs.target.outputs.pr }}
+        run: |
+          if [[ "$POLARS_MAIN_REPAIR_ENABLED" == true && "$BOT_TOKEN_CONFIGURED" != true ]]; then
+              echo 'Automatic repair requires POLARS_MAIN_BOT_TOKEN so CodeRabbit receives the requests.'
+              exit 1
+          fi
+          python ci/cudf_polars/upstream_ci.py report \
+              --cudf-sha "$CUDF_SHA" --source-sha "$SOURCE_SHA" \
+              --polars-sha "$POLARS_SHA" --date "$ARTIFACT_DATE" --pr "$REPAIR_PR"
