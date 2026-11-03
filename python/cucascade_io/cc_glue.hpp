@@ -23,7 +23,7 @@ struct options {
   std::string endpoint, region, access_key, secret_key, session_token;
   std::size_t advise_min_bytes{std::size_t{256} << 10};  ///< reads of at least this size are advised to the cache first (0 = never)
   double evict_batch{0.02};  ///< cuCascade eviction_batch_fraction (patched cuCascade): share of the pool freed per eviction pass
-  double evict_threshold{0.95};  ///< cuCascade eviction_threshold_fraction: usable share of the pool (and where LRU eviction starts); its default is 0.8
+  double evict_threshold{0.99};  ///< cuCascade eviction_threshold_fraction: usable share of the pool (and where LRU eviction starts); its default is 0.8
   double budget_fraction{0.9};  ///< admitted pieces (counted in chunk-aligned bytes) may fill this fraction of the cache
   bool column_policy{true};  ///< advise only columns that rank within the cache budget (needs register_layout); false = advise every read
   bool lru{true};  ///< cache eviction: LRU (keep idle chunks) vs idle (drop on idle)

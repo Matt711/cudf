@@ -65,7 +65,7 @@ def _load_cucascade() -> Any:
                 max_connections=int(os.environ.get("CUDF_POLARS_CUCASCADE_CONNECTIONS", "128")),
                 block_bytes=int(float(os.environ.get("CUDF_POLARS_CUCASCADE_BLOCK_KB", "256")) * 1024),
                 evict_batch=float(os.environ.get("CUDF_POLARS_CUCASCADE_EVICT_BATCH", "0.02")),
-                evict_threshold=float(os.environ.get("CUDF_POLARS_CUCASCADE_EVICT_THRESHOLD", "0.95")),
+                evict_threshold=float(os.environ.get("CUDF_POLARS_CUCASCADE_EVICT_THRESHOLD", "0.99")),
                 budget_fraction=float(os.environ.get("CUDF_POLARS_CUCASCADE_BUDGET", "0.9")),
                 column_policy=os.environ.get("CUDF_POLARS_CUCASCADE_COLUMN_POLICY", "1") == "1",
                 advise_min_bytes=int(os.environ.get("CUDF_POLARS_CUCASCADE_ADVISE_MIN_BYTES", str(256 << 10))),

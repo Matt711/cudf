@@ -144,3 +144,30 @@ One run each, so the run-to-run spread (5 to 9%) applies. Even so, the 7% smalle
 (471 vs 413 GB), a steeper cliff than the size change alone explains. At equal size cuCascade fetches 140 GB (42%) more than bytecache
 per pass, so the gap is bytes, not per-read overhead (see the warm microbenchmark above). Likely causes: usable capacity lost to
 budget_fraction 0.9, the 0.95 eviction threshold and chunk-aligned footprint, plus LRU eviction of pieces bytecache keeps pinned.
+
+## Eviction threshold 0.99 (new default), SF1000, held state, 22/22 validated
+
+Chunk occupancy runs above the admitted footprint, so with budget 0.9 and threshold 0.95 the evictor fired on data the policy had
+admitted (about 400k chunk evictions per pass). Single passes at 93.1 GiB (one run each, spread 5 to 9%; time moves with S3 noise, bytes are steadier):
+
+| budget / threshold | time | S3 bytes | evictions |
+|---|---|---|---|
+| 0.9 / 0.95 (old default) | 129.3, 142.4 s | 471, 468 GB | 404k |
+| 0.8 / 0.95 | 126.6 s | 430 GB | 72k |
+| 0.85 / 0.95 | 116.4 s | 423 GB | 117k |
+| 0.87 / 0.95 | 122.5 s | 404 GB | 72k |
+| 0.9 / 0.99 | 118.3 s | 390 GB | 75k |
+| 0.93 / 0.99 | 121.8 s | 399 GB | 183k |
+| 0.95 / 0.995 | 123.4 s | 423 GB | 320k |
+| 1.0 / 0.99 | 125.2 s | 451 GB | 529k |
+
+Default threshold is now 0.99 (budget stays 0.9). Two-iteration runs with the new defaults:
+
+| cache | cold / warm | S3 total | before |
+|---|---|---|---|
+| 93.1 GiB (= bytecache 100 GB) | 117.3 / 100.2 s | 666 GB | 133.6 / 115.7 s, 821 GB |
+| 100 GiB | 119.0 / 110.3 s | 628 GB | 111.6 to 119.1 / 95.8 to 104.6 s |
+
+Clear gain at 93.1 GiB; at 100 GiB it is neutral within noise. bytecache at 100 GB is still ahead (104.2 / 87.1 s, 332 GB per pass).
+The per-column report shows the aligned footprint is 1.4 GiB above the registered size per big column (256 KiB padding per chunk edge),
+about 7 GiB of the 84 GiB budget is padding. That is the next lever (smaller chunks or tail-sharing).
