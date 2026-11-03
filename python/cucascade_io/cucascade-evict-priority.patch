@@ -79,7 +79,7 @@ index 4e44a0f..d264fdb 100644
  }
  
 diff --git a/src/io/cache/fs_cache.cpp b/src/io/cache/fs_cache.cpp
-index 8dfa4f4..02cc63c 100644
+index 8dfa4f4..c04f502 100644
 --- a/src/io/cache/fs_cache.cpp
 +++ b/src/io/cache/fs_cache.cpp
 @@ -34,6 +34,7 @@
@@ -111,7 +111,23 @@ index 8dfa4f4..02cc63c 100644
    req.chunks = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
    // Resolve the preferred NUMA node for staging buffers from the target GPU's
    // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
-@@ -1600,7 +1606,7 @@ void fs_cache::evict_loop(const std::stop_token& st)
+@@ -1308,9 +1314,14 @@ std::string fs_cache::summary() const
+   uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
+ 
+   return std::format(
+-    "fs_cache: "
++    "fs_cache: pool[chunks={} alloc_MiB={} system_MiB={} budget_MiB={} reserved_MiB={}] "
+     "global[reads={} hits={} h2d={} miss={} evictions={}] "
+     "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
++    _pool->total_allocated_chunks(),
++    _pool->total_allocated_bytes() >> 20,
++    _pool->max_system_wide_usage() >> 20,
++    _pool->max_allowed_budget_for_prefetching() >> 20,
++    _pool->reservation_size_for_prefetching() >> 20,
+     reads,
+     hits,
+     h2d,
+@@ -1600,7 +1611,7 @@ void fs_cache::evict_loop(const std::stop_token& st)
        need = std::numeric_limits<size_t>::max();
      } else {
        if (_pool->should_start_evicting()) {
@@ -120,7 +136,7 @@ index 8dfa4f4..02cc63c 100644
        }
        // Rounded up: freeing whole chunks is the only granularity there is, so a
        // demand for part of one still costs the whole thing.
-@@ -1623,23 +1629,37 @@ void fs_cache::evict_loop(const std::stop_token& st)
+@@ -1623,23 +1634,37 @@ void fs_cache::evict_loop(const std::stop_token& st)
      // is still subscribed to is not idle.
      size_t reclaimed   = 0;
      int const n_passes = _cfg.dispose_on_idle ? 1 : 2;

@@ -270,6 +270,8 @@ void init(options const& o)
   auto s = std::make_unique<state>();
   cucascade::memory::host_memory_space_config host;
   host.memory_capacity     = o.cache_bytes;
+  // cuCascade's default 0.9 silently makes only 90% of the configured capacity usable; the cache size we ask for should be usable.
+  host.reservation_limit_fraction = std::getenv("CC_RESV") != nullptr ? std::atof(std::getenv("CC_RESV")) : 1.0;
   host.pool_size            = (std::size_t{128} << 20) / o.block_bytes;
   host.initial_number_pools = o.initial_pools != 0 ? o.initial_pools : (o.cache_bytes + (std::size_t{128} << 20) - 1) / (std::size_t{128} << 20);
   host.initial_pool_threads = o.pool_threads;

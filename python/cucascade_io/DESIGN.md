@@ -171,3 +171,20 @@ Default threshold is now 0.99 (budget stays 0.9). Two-iteration runs with the ne
 Clear gain at 93.1 GiB; at 100 GiB it is neutral within noise. bytecache at 100 GB is still ahead (104.2 / 87.1 s, 332 GB per pass).
 The per-column report shows the aligned footprint is 1.4 GiB above the registered size per big column (256 KiB padding per chunk edge),
 about 7 GiB of the 84 GiB budget is padding. That is the next lever (smaller chunks or tail-sharing).
+
+## Hidden 10% of the pool: host reservation_limit_fraction (default 0.9)
+
+cuCascade's host_memory_space_config.reservation_limit_fraction defaults to 0.9, so the usable pool (and the evictor's budget) is 90% of
+the configured capacity. Measured with the new pool[...] line in fs_cache::summary(): at 93.1 GiB the eviction budget was 83.0 GiB
+(0.99 x 0.9 x 93.1). The glue now sets it to 1.0 (env CC_RESV overrides). Single passes at 93.1 GiB, threshold 0.99, SF1000, one run each:
+
+| admission budget | time | S3 bytes | evictions |
+|---|---|---|---|
+| 0.9 (default) | 118.0 s | 368 GB | 38k |
+| 0.95 | 124.1 s | 365 GB | 75k |
+| 0.98 | 134.8 s | 360 GB | 121k |
+
+Before the change the same setting gave 385 to 390 GB. Higher budgets save a few GB but evict more, which costs more time than the bytes save.
+Time per S3 byte is now the same as bytecache (0.32 vs 0.31 s/GB), so the remaining gap (368 vs 332 GB per pass) is bytes only.
+Upstream: the 0.9 default means any cache size asked for is 10% smaller in practice, including Sirius host tier sizes.
+cucascade-evict-priority.patch now also adds pool occupancy to fs_cache::summary().
