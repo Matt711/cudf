@@ -39,6 +39,8 @@ class FanoutInfo(NamedTuple):
     """The number of consumers."""
     unbounded: bool
     """Whether the node needs unbounded fanout."""
+    feeds_blocking_op: bool = False
+    """Whether a consumer must consume all of the node's output before producing anything."""
 
 
 class GenState(TypedDict):

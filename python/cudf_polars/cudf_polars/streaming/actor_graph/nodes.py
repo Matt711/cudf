@@ -40,6 +40,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     send_metadata,
     shutdown_on_error,
 )
+from cudf_polars.utils.config import get_total_device_memory
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -51,7 +52,7 @@ if TYPE_CHECKING:
 
     from cudf_polars.containers import DataFrame
     from cudf_polars.dsl.ir import IRExecutionContext
-    from cudf_polars.streaming.actor_graph.dispatch import SubNetGenerator
+    from cudf_polars.streaming.actor_graph.dispatch import FanoutInfo, SubNetGenerator
 
     type PartitioningCallback = Callable[
         [Sequence[ChannelMetadata], Context],
@@ -670,6 +671,56 @@ def _(
     return nodes, channels
 
 
+RESCAN_MIN_DEVICE_FRACTION = 0.25
+"""
+Smallest estimated scan output, as a fraction of device memory, that is rescanned for each
+consumer instead of buffered by an unbounded fanout.
+"""
+
+
+def _rescan_instead_of_fanout(
+    ir: IR, fanout_info: FanoutInfo, rec: SubNetGenerator
+) -> bool:
+    """
+    Whether to give every consumer of ``ir`` its own scan instead of one fanned-out scan.
+
+    When one consumer must consume a scan's whole output before producing anything (a
+    group-by or distinct) and another consumer waits for that result (a join of the
+    aggregate with the same scan), an unbounded fanout has to keep the entire output
+    for the waiting consumer, spilling it out of device memory and back. Reading the
+    scan a second time is cheaper once that output is large compared with the device.
+    """
+    from cudf_polars.streaming.io import StreamingScan
+
+    if not (
+        isinstance(ir, StreamingScan)
+        and fanout_info.unbounded
+        and fanout_info.feeds_blocking_op
+    ):
+        return False
+    device_memory = get_total_device_memory()
+    if device_memory is None:
+        return False
+    estimated_bytes = (
+        rec.state["partition_info"][ir].count
+        * rec.state["config_options"].executor.target_partition_size
+    )
+    return estimated_bytes >= RESCAN_MIN_DEVICE_FRACTION * device_memory
+
+
+class _PerConsumerChannels:
+    """Hands each consumer the output channel of its own copy of the producer."""
+
+    def __init__(self, managers: list[ChannelManager]) -> None:
+        self._managers = managers
+        self._next = 0
+
+    def reserve_output_slot(self) -> Channel[TableChunk]:
+        manager = self._managers[self._next]
+        self._next += 1
+        return manager.reserve_output_slot()
+
+
 def generate_ir_sub_network_wrapper(
     ir: IR, rec: SubNetGenerator
 ) -> tuple[dict[IR, list[Any]], dict[IR, ChannelManager]]:
@@ -696,6 +747,15 @@ def generate_ir_sub_network_wrapper(
     # Check if this node needs fanout
     if (fanout_info := rec.state["fanout_nodes"].get(ir)) is not None:
         count = fanout_info.num_consumers
+        if _rescan_instead_of_fanout(ir, fanout_info, rec):
+            # Every further consumer gets its own scan of the same tasks.
+            managers = [channels[ir]]
+            for _ in range(count - 1):
+                extra_nodes, extra_channels = generate_ir_sub_network(ir, rec)
+                nodes[ir].extend(extra_nodes[ir])
+                managers.append(extra_channels[ir])
+            channels[ir] = _PerConsumerChannels(managers)  # type: ignore[assignment]
+            return nodes, channels
         manager = ChannelManager(rec.state["context"], count=count)
         ir_context = ir_context_for_node(rec, ir)
         fanout_node: Any

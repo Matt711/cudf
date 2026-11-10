@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 from rapidsmpf.streaming.core.leaf_actor import pull_from_channel
 
 from cudf_polars.dsl.ir import (
+    Distinct,
+    GroupBy,
     Join,
     Union,
 )
@@ -196,6 +198,24 @@ def determine_fanout_nodes(
                 # Broadcasting operation - children need unbounded fanout
                 _mark_children_unbounded(node)
 
+    parents: defaultdict[IR, list[IR]] = defaultdict(list)
+    for node in traversal([ir]):
+        for child in node.children:
+            parents[child].append(node)
+
+    def _feeds_blocking_op(node: IR) -> bool:
+        # A consumer chain that reaches a group-by or distinct before any join or union
+        # consumes all of the node's output before it produces anything.
+        for parent in parents[node]:
+            current = parent
+            while True:
+                if isinstance(current, (GroupBy, Distinct)):
+                    return True
+                if isinstance(current, (Join, Union)) or len(parents[current]) != 1:
+                    break
+                current = parents[current][0]
+        return False
+
     # Build result dictionary: only include nodes with multiple consumers
     fanout_nodes: dict[IR, FanoutInfo] = {}
     for node, count in ir_dep_count.items():
@@ -203,6 +223,7 @@ def determine_fanout_nodes(
             fanout_nodes[node] = FanoutInfo(
                 num_consumers=count,
                 unbounded=node in unbounded,
+                feeds_blocking_op=_feeds_blocking_op(node),
             )
 
     return fanout_nodes
