@@ -242,16 +242,21 @@ def plan(task: ParquetScanTask, stream: Stream) -> RemotePlan:
             passes["payload"] = reader.payload_column_chunks_byte_ranges(row_groups, options)
         else:
             passes["all"] = reader.all_column_chunks_byte_ranges(row_groups, options)
-    rows = 0
+    # Estimated decoded bytes: per column, the larger of rows x its fixed width and its
+    # uncompressed size in the footer (which counts the characters of string columns).
+    decoded = 0
+    columns = with_columns if with_columns is not None else list(base_scan.schema)
     for footer, rgs in zip(footers, bounds.row_groups, strict=True):
         counts = footer.file_metadata.row_group_num_rows
-        rows += sum(counts[rg] for rg in rgs if rg < len(counts))
-    width = 0
-    for name in with_columns if with_columns is not None else list(base_scan.schema):
-        try:
-            width += plc.types.size_of(base_scan.schema[name].plc_type)
-        except Exception:  # noqa: BLE001  (strings and nested types: offsets plus data)
-            width += 16
+        rows = sum(counts[rg] for rg in rgs if rg < len(counts))
+        uncompressed = footer.file_metadata.columnchunk_metadata
+        for name in columns:
+            try:
+                fixed = rows * plc.types.size_of(base_scan.schema[name].plc_type)
+            except Exception:  # noqa: BLE001  (strings and nested types: offsets plus data)
+                fixed = rows * 16
+            sizes = uncompressed.get(name, ())
+            decoded += max(fixed, sum(sizes[rg] for rg in rgs if rg < len(sizes)))
     result = RemotePlan(
         reader,
         row_groups,
@@ -261,7 +266,7 @@ def plan(task: ParquetScanTask, stream: Stream) -> RemotePlan:
         empty,
         two_pass,
         passes,
-        rows * width * (2 if plc_filter is not None or residual is not None else 1),
+        decoded * (2 if plc_filter is not None or residual is not None else 1),
     )
     _merge(result)
     return result
