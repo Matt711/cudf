@@ -31,11 +31,8 @@ from rapidsmpf.statistics import Statistics
 from rapidsmpf.streaming.core.actor import run_actor_network
 
 from cudf_polars.containers import DataFrame
+from cudf_polars.streaming import remote_io
 from cudf_polars.dsl.ir import IRExecutionContext
-from cudf_polars.dsl.utils.io import (
-    attach_cached_parquet_metadata,
-    prefetch_parquet_file_metadata_for_ir,
-)
 from cudf_polars.quent._plan import build_quent_operator_map, emit_plan
 from cudf_polars.streaming.actor_graph.collectives import (
     ReserveOpIDs,
@@ -1003,13 +1000,9 @@ def _evaluate_on_rank(
         py_executor, get_cuda_stream=ctx.br().stream_pool.get_stream, query_id=query_id
     )
 
-    if config_options.parquet_options.should_prefetch_file_metadata:
-        cached_parquet_info_map = prefetch_parquet_file_metadata_for_ir(
-            ir,
-            ir_context.py_executor,
-            stats=stats,
-        )
-        attach_cached_parquet_metadata(ir, cached_parquet_info_map)
+    # Remote parquet footers are fetched by the scans themselves, in parallel and without a stage
+    # before the actor network; cold reads fetch them again for every query.
+    remote_io.begin_query()
 
     with ReserveOpIDs(ir, config_options) as collective_id_map:
         return execute_ir_on_rank(

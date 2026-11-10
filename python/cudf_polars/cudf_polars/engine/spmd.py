@@ -71,6 +71,7 @@ from cudf_polars.quent._runtime import (
 from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
 from cudf_polars.streaming.actor_graph.utils import set_memory_resource
 from cudf_polars.unstable import unstable
+from cudf_polars.streaming import remote_io
 from cudf_polars.utils import cucascade
 from cudf_polars.utils.cleanup import run_cleanup_steps
 from cudf_polars.utils.config import (
@@ -646,6 +647,18 @@ class SPMDEngine(StreamingEngine):
         )
 
         cucascade.configure_cucascade(executor_options["cucascade_cache_bytes"])
+        if (arena_mb := int(os.environ.get("CUDF_POLARS_SCAN_IO_ARENA_MB", "0"))) > 0:
+            # Remote parquet scans read with cuCascade's REST engine into a pinned arena, pinned
+            # here, at engine start; connections to the dataset's bucket are opened now too.
+            service = remote_io.configure_scan_io(
+                arena_bytes=arena_mb << 20,
+                reactors=int(os.environ.get("CUDF_POLARS_SCAN_IO_REACTORS", "8")),
+                connections=int(os.environ.get("CUDF_POLARS_SCAN_IO_CONNECTIONS", "32")),
+                footer_threads=int(os.environ.get("CUDF_POLARS_SCAN_IO_FOOTER_THREADS", "32")),
+                endpoint=os.environ.get("CUDF_POLARS_SCAN_IO_ENDPOINT") or None,
+            )
+            if warm := os.environ.get("CUDF_POLARS_SCAN_IO_WARMUP_URL"):
+                service.warmup(warm)
         self.rapidsmpf_options = resolve_rapidsmpf_options(rapidsmpf_options)
         mr_config: MemoryResourceConfig = engine_options.get(
             "memory_resource_config", MemoryResourceConfig.default()

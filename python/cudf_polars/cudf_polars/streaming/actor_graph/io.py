@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import dataclasses
 import functools
 import io
@@ -30,6 +31,7 @@ from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
     ir_context_for_node,
 )
+from cudf_polars.streaming.actor_graph import remote_fetch
 from cudf_polars.streaming.actor_graph.nodes import define_actor, shutdown_on_error
 from cudf_polars.streaming.actor_graph.scan_ordering import (
     parquet_metadata_ordering,
@@ -113,6 +115,11 @@ class Lineariser:
         """
         await self._producer_slots[producer_id].acquire()
         return self.input_channels[producer_id]
+
+    async def forwarded(self, producer_id: int) -> None:
+        """Wait until the producer's last message has been forwarded downstream."""
+        await self._producer_slots[producer_id].acquire()
+        self._producer_slots[producer_id].release()
 
     async def drain(self) -> None:
         """
@@ -569,6 +576,8 @@ async def read_chunk(
     ir_context: IRExecutionContext,
     estimated_chunk_bytes: int,
     tracer: ActorTracer | None = None,
+    fetched: Any = None,
+    after_decode: Any = None,
 ) -> None:
     """
     Read a chunk from disk and send it to the output channel.
@@ -615,17 +624,24 @@ async def read_chunk(
         net_memory_delta=estimated_chunk_bytes,
     )
     with opaque_memory_usage(reservation):
-        df = await ir_context.to_thread(
-            task.do_evaluate,
-            *task._non_child_args,
-            context=ir_context,
-        )
+        if fetched is not None:
+            df = await ir_context.to_thread(
+                remote_fetch.materialize, task, fetched, ir_context
+            )
+        else:
+            df = await ir_context.to_thread(
+                task.do_evaluate,
+                *task._non_child_args,
+                context=ir_context,
+            )
         chunk = TableChunk.from_pylibcudf_table(
             df.table,
             df.stream,
             exclusive_view=True,
             br=context.br(),
         )
+    if after_decode is not None:
+        await after_decode(chunk.data_alloc_size())
 
     await send_chunk(context, ch_out, chunk, seq_num, tracer=tracer)
 
@@ -728,9 +744,12 @@ async def scan_node(
             await ch_out.drain(context)
             return
 
-        # Use Lineariser to ensure ordered delivery
+        # Use Lineariser to ensure ordered delivery, unless no ordering is promised
+        # downstream: then producers send as they finish, so a slow task at the head of
+        # the order does not hold every later decoded chunk on the device.
         num_producers = min(num_producers, len(tasks))
-        lineariser = Lineariser(context, ch_out, num_producers)
+        unordered = bool(os.environ.get("CUDF_POLARS_SCAN_UNORDERED")) and partitioning is None
+        lineariser = None if unordered else Lineariser(context, ch_out, num_producers)
 
         # Assign tasks to producers using round-robin
         producer_tasks: list[list[tuple[int, ScanTask]]] = [
@@ -740,31 +759,85 @@ async def scan_node(
             producer_id = task_idx % num_producers
             producer_tasks[producer_id].append((task_idx, task))
 
+        dfa = (
+            remote_fetch.RemoteFetchAhead(tasks, ir_context)
+            if remote_fetch.enabled(tasks)
+            else None
+        )
+
         async def _producer(producer_id: int) -> None:
             for task_idx, task in producer_tasks[producer_id]:
-                ch_out = await lineariser.acquire(producer_id)
-                await read_chunk(
-                    context,
-                    task,
-                    task_idx,
-                    ch_out,
-                    ir_context,
-                    estimated_chunk_bytes,
-                    tracer=tracer,
+                fetched = await dfa.take(task_idx) if dfa is not None else None
+                released = False
+                decode_cost = 0
+
+                async def _after_decode(chunk_bytes: int | None = None) -> None:
+                    # The decode copied the task's block out of the stager's arena and
+                    # synchronized, so the block can go before the chunk is sent. Until
+                    # the chunk is forwarded it holds only its own size of the budget,
+                    # not the decode's estimated peak: a selective filter leaves little,
+                    # and a waiting probe side must not starve the scan of a build side.
+                    nonlocal released, decode_cost
+                    if dfa is not None and not released:
+                        released = True
+                        await dfa.release(fetched)
+                        if chunk_bytes is not None:
+                            decode_cost = await dfa.shrink_decode(decode_cost, chunk_bytes)
+
+                ch_dest = ch_out if lineariser is None else await lineariser.acquire(producer_id)
+                # The decode budget bounds the device memory of decodes and of decoded
+                # chunks not yet forwarded downstream: without it every producer decodes
+                # ahead and its chunk waits on the device (or is spilled and brought back)
+                # until the consumer reaches it. Budget is granted in task order, so a task
+                # only ever waits on earlier tasks, which the lineariser forwards first.
+                decode_cost = (
+                    await dfa.acquire_decode(task_idx, fetched) if dfa is not None else 0
                 )
+                try:
+                    await read_chunk(
+                        context,
+                        task,
+                        task_idx,
+                        ch_dest,
+                        ir_context,
+                        estimated_chunk_bytes,
+                        tracer=tracer,
+                        fetched=fetched,
+                        after_decode=_after_decode,
+                    )
+                    if lineariser is not None and decode_cost > 0:
+                        await lineariser.forwarded(producer_id)
+                finally:
+                    await _after_decode()
+                    if dfa is not None:
+                        await dfa.release_decode(decode_cost)
+            if lineariser is not None:
+                await ch_dest.drain(context)
+
+        async def _unordered_drain() -> None:
+            await gather_in_task_group(*(_producer(i) for i in range(num_producers)))
             await ch_out.drain(context)
 
         async with shutdown_on_error(
             context,
-            chs_aux=lineariser.input_channels,
+            chs_aux=lineariser.input_channels if lineariser is not None else (),
             trace_ir=ir,
             ir_context=ir_context,
         ) as inner_actor_scope:
             ir_context = inner_actor_scope.require_ir_context()
-            await gather_in_task_group(
-                lineariser.drain(),
-                *(_producer(i) for i in range(num_producers)),
-            )
+            if dfa is not None:
+                dfa.start()
+            try:
+                if lineariser is None:
+                    await _unordered_drain()
+                else:
+                    await gather_in_task_group(
+                        lineariser.drain(),
+                        *(_producer(i) for i in range(num_producers)),
+                    )
+            finally:
+                if dfa is not None:
+                    await dfa.close()
 
 
 @generate_ir_sub_network.register(StreamingScan)

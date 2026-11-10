@@ -7,7 +7,9 @@
 
 # The C++ that the Cython module wraps: the cudf::io::datasource subclass, and the scan cache that
 # opens it. cuCascade's libraries are linked statically, so the module carries what it needs.
-add_library(cudf_polars_cucascade_cpp STATIC cpp/cucascade_datasource.cpp cpp/scan_cache.cpp)
+add_library(
+  cudf_polars_cucascade_cpp STATIC cpp/cucascade_datasource.cpp cpp/scan_cache.cpp cpp/scan_io.cpp
+)
 target_include_directories(
   cudf_polars_cucascade_cpp PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/cpp"
                                    "${cuCascade_SOURCE_DIR}/include"
@@ -19,7 +21,9 @@ target_link_libraries(
 target_compile_features(cudf_polars_cucascade_cpp PUBLIC cxx_std_20)
 set_target_properties(cudf_polars_cucascade_cpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-set(cython_sources advising_datasource.pyx build_info.pyx column_admission.pyx scan_cache.pyx)
+set(cython_sources advising_datasource.pyx build_info.pyx column_admission.pyx scan_cache.pyx
+                   scan_io.pyx
+)
 set(linked_libraries cudf_polars_cucascade_cpp)
 rapids_cython_create_modules(
   CXX
