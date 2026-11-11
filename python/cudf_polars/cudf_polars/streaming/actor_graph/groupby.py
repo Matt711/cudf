@@ -19,7 +19,10 @@ from cudf_streaming.channel_metadata import (
     RowOrdering,
     RowOrderingScope,
 )
-from cudf_streaming.table_chunk import TableChunk
+from cudf_streaming.table_chunk import (
+    TableChunk,
+    make_table_chunks_available_or_wait,
+)
 from rapidsmpf.communicator.single import new_communicator as single_comm
 from rapidsmpf.config import Options, get_environment_variables
 from rapidsmpf.streaming.core.actor import define_actor
@@ -29,6 +32,7 @@ from cudf_polars.containers import DataType
 from cudf_polars.dsl.expr import Col, NamedExpr
 from cudf_polars.dsl.ir import IR, Distinct, GroupBy, Select
 from cudf_polars.dsl.utils.naming import names_to_indices, unique_names
+from cudf_polars.streaming.actor_graph import native
 from cudf_polars.streaming.actor_graph.collectives.ordering import adjust_ordering
 from cudf_polars.streaming.actor_graph.collectives.shuffle import ShuffleManager
 from cudf_polars.streaming.actor_graph.dispatch import (
@@ -99,6 +103,8 @@ class DecomposedGroupBy:
     """The output indices of the GroupBy keys."""
     shuffle_indices: tuple[int, ...]
     """The column indices to shuffle on."""
+    partials_in: bool = False
+    """Whether the input chunks are already piecewise aggregates (computed natively)."""
 
     @classmethod
     def from_ir(cls, ir: GroupBy | Distinct) -> DecomposedGroupBy:
@@ -241,12 +247,16 @@ async def _local_aggregation(
     pending: collections.deque[asyncio.Task] = collections.deque()
 
     async def _piecewise(msg: Any) -> TableChunk:
-        chunk = await evaluate_chunk(
-            context,
-            TableChunk.from_message(msg, br=context.br()),
-            decomposed.piecewise_ir,
-            ir_context=ir_context,
-        )
+        chunk = TableChunk.from_message(msg, br=context.br())
+        if decomposed.partials_in:
+            # Already aggregated, but it may have been spilled on the way.
+            chunk, _ = await make_table_chunks_available_or_wait(
+                context, chunk, reserve_extra=0, net_memory_delta=0
+            )
+        else:
+            chunk = await evaluate_chunk(
+                context, chunk, decomposed.piecewise_ir, ir_context=ir_context
+            )
         return _enforce_schema(chunk, decomposed.piecewise_ir.schema, context.br())
 
     while True:
@@ -854,6 +864,8 @@ async def groupby_actor(
     ch_in: Channel[TableChunk],
     target_partition_size: int,
     collective_ids: list[int],
+    *,
+    partials_in: bool = False,
 ) -> None:
     """
     Dynamic GroupBy or Distinct actor that selects the best strategy at runtime.
@@ -881,6 +893,8 @@ async def groupby_actor(
         The target partition size.
     collective_ids
         The collective IDs.
+    partials_in
+        Whether the input chunks are already piecewise aggregates.
     """
     async with shutdown_on_error(
         context,
@@ -955,6 +969,8 @@ async def groupby_actor(
             return
 
         decomposed = DecomposedGroupBy.from_ir(ir)
+        # Sums only: re-aggregating partials elsewhere stays correct.
+        decomposed.partials_in = partials_in
         assert not decomposed.need_preshuffle, "Should already be shuffled."
 
         aggregated, input_drained, chunks_received = await _local_aggregation(
@@ -1053,17 +1069,41 @@ def _(
     assert len(collective_ids) == 2, (
         f"{type(ir).__name__} requires 2 collective IDs, got {len(collective_ids)}"
     )
-    actors[ir] = [
+    ch_in = channels[ir.children[0]].reserve_output_slot()
+    actors[ir] = []
+    partials_in = False
+    if (
+        isinstance(ir, GroupBy)
+        and native.native_groupby_enabled()
+        and (plan := native.native_piecewise_plan(ir)) is not None
+    ):
+        # The piecewise aggregation runs in a C++ actor in front of this one.
+        piecewise_ir, stages = plan
+        ch_partials = rec.state["context"].create_channel()
+        actors[ir].append(
+            native.native_piecewise_actor(
+                rec.state["context"],
+                piecewise_ir,
+                ir_context,
+                ch_partials,
+                ch_in,
+                stages,
+            )
+        )
+        ch_in = ch_partials
+        partials_in = True
+    actors[ir].append(
         groupby_actor(
             rec.state["context"],
             rec.state["comm"],
             ir,
             ir_context,
             channels[ir].reserve_input_slot(),
-            channels[ir.children[0]].reserve_output_slot(),
+            ch_in,
             config_options.executor.target_partition_size,
             collective_ids,
+            partials_in=partials_in,
         )
-    ]
+    )
 
     return actors, channels

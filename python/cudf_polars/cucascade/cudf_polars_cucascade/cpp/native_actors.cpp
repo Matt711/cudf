@@ -228,6 +228,10 @@ struct chain_state {
   std::vector<build_table> builds;
   std::mutex mutex;
   std::vector<std::unique_ptr<cudf::table>> partials;
+  // ordered sends: chunks are numbered as they are received and sent in that order
+  bool ordered{false};
+  std::uint64_t next_received{0};
+  std::atomic<std::uint64_t> next_send{0};
 };
 
 std::unique_ptr<cudf::table> concat_tables(std::vector<std::unique_ptr<cudf::table>>& tables,
@@ -253,6 +257,11 @@ rs::Actor work(std::shared_ptr<rs::Context> ctx,
   while (true) {
     auto msg = co_await ch_in->receive();
     if (msg.empty()) { break; }
+    std::uint64_t turn = 0;
+    if (st->ordered) {
+      std::lock_guard lock(st->mutex);
+      turn = st->next_received++;
+    }
     auto const seq = msg.sequence_number();
     auto input     = msg.release<table_chunk>();
     auto chunk     = co_await input.make_available(ctx);
@@ -263,10 +272,13 @@ rs::Actor work(std::shared_ptr<rs::Context> ctx,
     }
     auto out = concat_tables(outs, stream);
     if (fold_keys < 0) {
-      if (!co_await ch_out->send(cudf_streaming::to_message(
-            seq, std::make_unique<table_chunk>(std::move(out), stream)))) {
-        break;
+      while (st->ordered && st->next_send.load() != turn) {
+        co_await ctx->executor()->yield();
       }
+      auto const sent = co_await ch_out->send(
+        cudf_streaming::to_message(seq, std::make_unique<table_chunk>(std::move(out), stream)));
+      if (st->ordered) { st->next_send.store(turn + 1); }
+      if (!sent) { break; }
       continue;
     }
     // Another worker may fold this partial on its own stream: it must be complete first.
@@ -364,7 +376,9 @@ rs::Actor chain(std::shared_ptr<rs::Context> ctx,
                 std::vector<std::vector<stage>> branches,
                 std::size_t concurrency,
                 int fold_keys,
-                std::vector<int> out_types)
+                std::vector<int> out_types,
+                bool forward_metadata,
+                bool ordered)
 {
   std::vector<std::shared_ptr<rs::Channel>> all_channels{ch_in, ch_out};
   all_channels.insert(all_channels.end(), ch_builds.begin(), ch_builds.end());
@@ -399,14 +413,17 @@ rs::Actor chain(std::shared_ptr<rs::Context> ctx,
   build_chunks.clear();
   debug(me, "chain: builds ready, receiving input metadata");
 
-  auto metadata = co_await ch_in->receive_metadata();
-  debug(me, "chain: input metadata received");
-  if (fold_keys < 0) {
-    co_await ch_out->send_metadata(std::move(metadata));
-  } else {
-    co_await ch_out->send_metadata(cudf_streaming::to_message(
-      0, std::make_unique<cudf_streaming::channel_metadata>(1)));
+  if (forward_metadata) {
+    auto metadata = co_await ch_in->receive_metadata();
+    debug(me, "chain: input metadata received");
+    if (fold_keys < 0) {
+      co_await ch_out->send_metadata(std::move(metadata));
+    } else {
+      co_await ch_out->send_metadata(cudf_streaming::to_message(
+        0, std::make_unique<cudf_streaming::channel_metadata>(1)));
+    }
   }
+  st->ordered = ordered;
   debug(me, "chain: metadata sent, running %zu workers", std::max<std::size_t>(1, concurrency));
   {
     std::vector<rs::Actor> workers;

@@ -43,6 +43,7 @@ from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import (
     AllGatherManager,
 )
+from cudf_polars.streaming.actor_graph import native
 from cudf_polars.streaming.actor_graph.collectives.ordering import adjust_ordering
 from cudf_polars.streaming.actor_graph.collectives.shuffle import (
     _global_shuffle,
@@ -654,6 +655,18 @@ async def broadcast_join(
     # completed. Besides making the data channel ready when advertised, this
     # permits a consumer to reuse the collective ID after receiving metadata.
     await send_metadata(ch_out, context, metadata_out)
+
+    if (
+        native.native_join_enabled()
+        and prefilter_statistics is None
+        and len(small_dfs) == 1
+        and (plan := native.native_probe_plan(ir, broadcast_side)) is not None
+    ):
+        # The per-chunk probes run in a C++ actor; this actor keeps the decisions.
+        await native.native_broadcast_probe(
+            context, small_dfs[0], *plan, large_ch, ch_out
+        )
+        return
 
     prebuilt = None
     how, nulls_equal = ir.options[0], ir.options[1]

@@ -20,6 +20,7 @@ from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
 
 from cudf_polars.dsl.ir import IR, Empty, HConcat, Join
+from cudf_polars.streaming.actor_graph import native
 from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
     ir_context_for_node,
@@ -27,7 +28,6 @@ from cudf_polars.streaming.actor_graph.dispatch import (
 from cudf_polars.streaming.actor_graph.hconcat import build_hconcat_partitioning
 from cudf_polars.streaming.actor_graph.partitioning import maybe_remap_partitioning
 from cudf_polars.streaming.actor_graph.tracing import send_chunk
-from cudf_polars.streaming.io import StreamingScan
 from cudf_polars.streaming.actor_graph.utils import (
     ChannelManager,
     _leading_order_keys,
@@ -41,6 +41,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     send_metadata,
     shutdown_on_error,
 )
+from cudf_polars.streaming.io import StreamingScan
 from cudf_polars.utils.config import get_total_device_memory
 
 if TYPE_CHECKING:
@@ -118,6 +119,15 @@ async def default_node_single(
             partitioning=partitioning,
             duplicated=metadata_in.duplicated,
         )
+        if (
+            native.native_chunkwise_enabled()
+            and metadata_in.local_count > 0
+            and (stages := native.native_chunkwise_plan((*fused, ir))) is not None
+        ):
+            # The per-chunk work runs in a C++ actor; this actor keeps the metadata.
+            await send_metadata(ch_out, context, metadata_out)
+            await native.native_chain(context, stages, ch_in, ch_out)
+            return
         # Process chunks (handle empty input for aggregation-like operations)
         await chunkwise_evaluate(
             context,

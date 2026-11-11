@@ -18,12 +18,15 @@ from cudf_streaming.table_chunk import (
 from rapidsmpf.streaming.core.actor import define_actor
 
 from cudf_polars.containers import DataFrame
+from cudf_polars.dsl import expr as E
+from cudf_polars.dsl.ir import GroupBy
 from cudf_polars.streaming import remote_io
 from cudf_polars.streaming.actor_graph import remote_fetch
 from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
     ir_context_for_node,
 )
+from cudf_polars.streaming.actor_graph.partitioning import maybe_remap_partitioning
 from cudf_polars.streaming.actor_graph.tracing import send_chunk
 from cudf_polars.streaming.actor_graph.utils import (
     ChannelManager,
@@ -36,13 +39,18 @@ from cudf_polars.streaming.actor_graph.utils import (
     shutdown_on_error,
 )
 from cudf_polars.streaming.native import NativeRegion
+from cudf_polars.streaming.native.expressions import NoMatch, compute
+from cudf_polars.streaming.native.region import (
+    translate_chunkwise,
+    translate_join,
+)
 from cudf_polars.streaming.utils import _concat
 
 if TYPE_CHECKING:
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
 
-    from cudf_polars.dsl.ir import IR, IRExecutionContext
+    from cudf_polars.dsl.ir import IR, IRExecutionContext, Join
     from cudf_polars.streaming.actor_graph.dispatch import SubNetGenerator
 
 
@@ -437,3 +445,216 @@ def _(
         )
     ]
     return actors, channels
+
+
+# ---------------------------------------------------------------- native operators
+
+
+def native_join_enabled() -> bool:
+    """Whether broadcast joins probe natively (``CUDF_POLARS_NATIVE_JOIN=1``)."""
+    return os.environ.get("CUDF_POLARS_NATIVE_JOIN") == "1"
+
+
+def native_probe_plan(
+    ir: Join, broadcast_side: str
+) -> tuple[list[dict[str, Any]], list[int]] | None:
+    """The native stages probing ``ir``'s broadcast side, and its key columns, or None."""
+    probe_left = broadcast_side == "right"
+    names = list(ir.children[0 if probe_left else 1].schema)
+    stages: list[dict[str, Any]] = []
+    builds: list[IR] = []
+    build_keys: list[list[int]] = []
+    try:
+        translate_join(
+            ir,
+            probe_left=probe_left,
+            names=names,
+            stages=stages,
+            builds=builds,
+            build_keys=build_keys,
+        )
+    except NoMatch:
+        return None
+    return stages, build_keys[0]
+
+
+async def native_broadcast_probe(
+    context: Context,
+    small: DataFrame,
+    stages: list[dict[str, Any]],
+    build_keys: list[int],
+    ch_large: Channel[TableChunk],
+    ch_out: Channel[TableChunk],
+) -> None:
+    """
+    Probe every chunk of ``ch_large`` against ``small`` in a C++ actor, in arrival order.
+
+    The caller has received both inputs' metadata and sent the output's; the actor drains
+    ``ch_out``.
+    """
+    from cudf_polars_cucascade.scan_io import chain_actor
+
+    from rapidsmpf.streaming.core.actor import when_all
+
+    ch_build: Channel[TableChunk] = context.create_channel()
+    actor = chain_actor(
+        context,
+        [ch_build],
+        [build_keys],
+        [[int(c.dtype.plc_type.id()) for c in small.columns]],
+        ch_large,
+        ch_out,
+        [stages],
+        int(os.environ.get("CUDF_POLARS_NATIVE_THREADS", "4")),
+        -1,
+        [],
+        forward_metadata=False,
+        ordered=True,
+    )
+
+    async def feed() -> None:
+        await send_metadata(ch_build, context, ChannelMetadata(local_count=1))
+        await send_chunk(
+            context,
+            ch_build,
+            TableChunk.from_pylibcudf_table(
+                small.table, small.stream, exclusive_view=False, br=context.br()
+            ),
+            0,
+            tracer=None,
+        )
+        await ch_build.drain(context)
+
+    await gather_in_task_group(feed(), when_all(context, [actor]))
+
+
+def native_chunkwise_enabled() -> bool:
+    """Whether chunkwise chains run natively (``CUDF_POLARS_NATIVE_CHUNKWISE=1``)."""
+    return os.environ.get("CUDF_POLARS_NATIVE_CHUNKWISE") == "1"
+
+
+def native_chunkwise_plan(nodes: tuple[IR, ...]) -> list[dict[str, Any]] | None:
+    """The native stages of a chain of chunkwise nodes, or None when unsupported."""
+    try:
+        return translate_chunkwise(nodes)
+    except NoMatch:
+        return None
+
+
+async def native_chain(
+    context: Context,
+    stages: list[dict[str, Any]],
+    ch_in: Channel[TableChunk],
+    ch_out: Channel[TableChunk],
+) -> None:
+    """
+    Run ``stages`` on every chunk of ``ch_in`` in a C++ actor, in arrival order.
+
+    The caller has received the input's metadata and sent the output's; the actor drains
+    ``ch_out``.
+    """
+    from cudf_polars_cucascade.scan_io import chain_actor
+
+    from rapidsmpf.streaming.core.actor import when_all
+
+    actor = chain_actor(
+        context,
+        [],
+        [],
+        [],
+        ch_in,
+        ch_out,
+        [stages],
+        int(os.environ.get("CUDF_POLARS_NATIVE_THREADS", "4")),
+        -1,
+        [],
+        forward_metadata=False,
+        ordered=True,
+    )
+    await when_all(context, [actor])
+
+
+def native_groupby_enabled() -> bool:
+    """Whether group-by partials are computed natively (``CUDF_POLARS_NATIVE_GROUPBY=1``)."""
+    return os.environ.get("CUDF_POLARS_NATIVE_GROUPBY") == "1"
+
+
+def native_piecewise_plan(
+    ir: GroupBy,
+) -> tuple[GroupBy, list[dict[str, Any]]] | None:
+    """
+    The piecewise group-by of ``ir`` and its native stages, or None.
+
+    Only group-bys whose aggregations are all sums: re-aggregating a sum's partials gives the
+    same sums, so every strategy the group-by actor picks stays correct.
+    """
+    from cudf_polars.streaming.actor_graph.groupby import (
+        DecomposedGroupBy,
+    )
+
+    if ir.zlice is not None or not all(
+        isinstance(req.value, E.Agg) and req.value.name == "sum"
+        for req in ir.agg_requests
+    ):
+        return None
+    piecewise = DecomposedGroupBy.from_ir(ir).piecewise_ir
+    assert isinstance(piecewise, GroupBy)
+    if not all(isinstance(k.value, E.Col) for k in piecewise.keys) or not all(
+        isinstance(req.value, E.Agg) and req.value.name == "sum"
+        for req in piecewise.agg_requests
+    ):
+        return None
+    names = list(piecewise.children[0].schema)
+    stages: list[dict[str, Any]] = []
+    try:
+        values = compute(
+            tuple(
+                E.NamedExpr(req.name, req.value.children[0])
+                for req in piecewise.agg_requests
+            ),
+            names,
+            stages,
+        )
+    except NoMatch:
+        return None
+    stages.append(
+        {
+            "op": "groupby",
+            "keys": [names.index(k.value.name) for k in piecewise.keys],
+            "sums": [names.index(v) for v in values],
+        }
+    )
+    return piecewise, stages
+
+
+@define_actor()
+async def native_piecewise_actor(
+    context: Context,
+    piecewise: GroupBy,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    ch_in: Channel[TableChunk],
+    stages: list[dict[str, Any]],
+) -> None:
+    """Compute each chunk's piecewise group-by natively, one output chunk per input chunk."""
+    async with shutdown_on_error(
+        context,
+        chs_in=(ch_in,),
+        chs_out=(ch_out,),
+        trace_ir=piecewise,
+        ir_context=ir_context,
+    ):
+        metadata_in = await recv_metadata(ch_in, context)
+        partitioning = maybe_remap_partitioning(
+            piecewise, metadata_in.partitioning, context=context
+        )
+        await send_metadata(
+            ch_out,
+            context,
+            ChannelMetadata(
+                local_count=metadata_in.local_count,
+                partitioning=partitioning,
+                duplicated=metadata_in.duplicated,
+            ),
+        )
+        await native_chain(context, stages, ch_in, ch_out)

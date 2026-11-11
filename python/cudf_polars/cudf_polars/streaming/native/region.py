@@ -23,7 +23,14 @@ if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.typing import Schema
 
-__all__ = ["NativeProgram", "NativeRegion", "enabled", "rewrite_native_regions"]
+__all__ = [
+    "NativeProgram",
+    "NativeRegion",
+    "enabled",
+    "rewrite_native_regions",
+    "translate_chunkwise",
+    "translate_join",
+]
 
 
 def enabled() -> bool:
@@ -107,6 +114,61 @@ def _contains(root: IR, node: IR) -> bool:
     return any(n == node for n in traversal([root]))
 
 
+def translate_join(
+    node: Join,
+    *,
+    probe_left: bool,
+    names: list[str],
+    stages: list[dict[str, Any]],
+    builds: list[IR],
+    build_keys: list[list[int]],
+) -> None:
+    """
+    Append the stages of an inner join probed by one side (its input is ``names``).
+
+    The other side is appended to ``builds``; the stages probe it by that index and leave the
+    join's output columns, in the join's order, in ``names``.
+    """
+    how, _nulls_equal, zlice, _suffix, coalesce, _order = node.options
+    if how != "Inner" or zlice is not None or node.predicate is not None:
+        raise NoMatch(f"join {how}")
+    left, right = node.children
+    build = right if probe_left else left
+    probe_on, build_on = (
+        (node.left_on, node.right_on) if probe_left else (node.right_on, node.left_on)
+    )
+    if not all(isinstance(ne.value, E.Col) for ne in (*probe_on, *build_on)):
+        raise NoMatch("join on expressions")
+    build_names = list(build.schema)
+    # The join's output: the left columns, then the right ones (right keys dropped when
+    # coalesced). Name collisions (suffixes) are not supported.
+    left_names = list(left.schema)
+    right_keys = {ne.value.name for ne in node.right_on}
+    right_kept = [n for n in right.schema if not (coalesce and n in right_keys)]
+    if set(left_names) & set(right_kept):
+        raise NoMatch("join suffix")
+    if left_names + right_kept != list(node.schema):
+        raise NoMatch("join output columns")
+    probe_kept, build_kept = (
+        (left_names, right_kept) if probe_left else (right_kept, left_names)
+    )
+    builds.append(build)
+    build_keys.append([build_names.index(ne.value.name) for ne in build_on])
+    stages.append(
+        {
+            "op": "join",
+            "build": len(builds) - 1,
+            "probe_keys": [names.index(ne.value.name) for ne in probe_on],
+            "keep_probe": [names.index(n) for n in probe_kept],
+            "keep_build": [build_names.index(n) for n in build_kept],
+        }
+    )
+    # The native output is the kept probe columns, then the kept build columns.
+    names[:] = [*probe_kept, *build_kept]
+    out = list(node.schema)
+    select(out, out, names, stages)
+
+
 def _translate(
     node: IR,
     names: list[str],
@@ -128,9 +190,6 @@ def _translate(
         target = list(node.schema)
         select([by_name.get(n, n) for n in target], target, names, stages)
     elif isinstance(node, Join):
-        how, _nulls_equal, zlice, _suffix, coalesce, _order = node.options
-        if how != "Inner" or zlice is not None or node.predicate is not None:
-            raise NoMatch(f"join {how}")
         left, right = node.children
         probe_left = _contains(left, scan)
         build = right if probe_left else left
@@ -142,43 +201,40 @@ def _translate(
             for n in traversal([build])
         ):
             raise NoMatch("a build side reads as much as the probe")
-        probe_on, build_on = (
-            (node.left_on, node.right_on)
-            if probe_left
-            else (node.right_on, node.left_on)
+        translate_join(
+            node,
+            probe_left=probe_left,
+            names=names,
+            stages=stages,
+            builds=builds,
+            build_keys=build_keys,
         )
-        if not all(isinstance(ne.value, E.Col) for ne in (*probe_on, *build_on)):
-            raise NoMatch("join on expressions")
-        build_names = list(build.schema)
-        # The join's output: the left columns, then the right ones (right keys dropped
-        # when coalesced). Name collisions (suffixes) are not supported.
-        left_names = list(left.schema)
-        right_keys = {ne.value.name for ne in node.right_on}
-        right_kept = [n for n in right.schema if not (coalesce and n in right_keys)]
-        if set(left_names) & set(right_kept):
-            raise NoMatch("join suffix")
-        if left_names + right_kept != list(node.schema):
-            raise NoMatch("join output columns")
-        probe_kept, build_kept = (
-            (left_names, right_kept) if probe_left else (right_kept, left_names)
-        )
-        builds.append(build)
-        build_keys.append([build_names.index(ne.value.name) for ne in build_on])
-        stages.append(
-            {
-                "op": "join",
-                "build": len(builds) - 1,
-                "probe_keys": [names.index(ne.value.name) for ne in probe_on],
-                "keep_probe": [names.index(n) for n in probe_kept],
-                "keep_build": [build_names.index(n) for n in build_kept],
-            }
-        )
-        # The native output is the kept probe columns, then the kept build columns.
-        names[:] = [*probe_kept, *build_kept]
-        out = list(node.schema)
-        select(out, out, names, stages)
     else:
         raise NoMatch(type(node).__name__)
+
+
+def translate_chunkwise(nodes: tuple[IR, ...]) -> list[dict[str, Any]]:
+    """
+    The native stages of a chain of projections, selections and column expressions.
+
+    ``nodes`` run in order, each on the previous one's output, the first on its child's.
+
+    Raises
+    ------
+    NoMatch
+        When a node or expression is outside what native stages support.
+    """
+    if not nodes:
+        raise NoMatch("empty chain")
+    names = list(nodes[0].children[0].schema)
+    stages: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, (Projection, Select, HStack)):
+            raise NoMatch(type(node).__name__)
+        _translate(node, names, stages, [], [], scan=None)  # type: ignore[arg-type]
+    if names != list(nodes[-1].schema):
+        raise NoMatch("output columns")
+    return stages
 
 
 def _probe_path(root: IR, scan: StreamingScan) -> list[IR]:

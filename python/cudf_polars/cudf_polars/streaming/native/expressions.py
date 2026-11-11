@@ -138,6 +138,8 @@ def compute(
             continue
         nodes: list[dict[str, Any]] = []
         compile_expr(ne.value, names, nodes)
+        if nodes[-1]["op"] in ("literal", "str_literal"):
+            raise NoMatch("a literal column (needs broadcasting)")
         exprs.append(nodes)
         tmp = f"__native_{len(names) + len(appended)}"
         appended.append(tmp)

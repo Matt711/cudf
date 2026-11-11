@@ -177,4 +177,6 @@ cdef extern from "native_actors.hpp" namespace "cudf_polars_cucascade::actor" no
         size_t concurrency,
         int fold_keys,
         vector[int] out_types,
+        bool forward_metadata,
+        bool ordered,
     ) except +ex_handler

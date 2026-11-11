@@ -480,13 +480,16 @@ def chain_actor(
     size_t concurrency,
     int fold_keys,
     list out_types,
+    bool forward_metadata=True,
+    bool ordered=False,
 ) -> CppActor:
     """
     A C++ actor running ``branches`` of stages on every chunk of ``ch_in``.
 
     Join stages probe the tables collected from ``ch_builds`` (by index). With
-    ``fold_keys < 0`` each result is sent on; otherwise the results are partial sums with
-    ``fold_keys`` key columns, folded into one chunk cast to ``out_types``.
+    ``fold_keys < 0`` each result is sent on (in arrival order when ``ordered``); otherwise the
+    results are partial sums with ``fold_keys`` key columns, folded into one chunk cast to
+    ``out_types``. With ``forward_metadata`` false the caller handles both channels' metadata.
     """
     cdef vector[shared_ptr[cpp_Channel]] c_builds
     for ch in ch_builds:
@@ -514,6 +517,8 @@ def chain_actor(
             concurrency,
             fold_keys,
             move(c_out_types),
+            forward_metadata,
+            ordered,
         )
     return CppActor.from_handle(make_unique[cpp_Actor](move(actor)), owner=None)
 

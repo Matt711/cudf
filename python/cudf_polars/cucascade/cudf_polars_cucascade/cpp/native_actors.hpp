@@ -73,8 +73,10 @@ rapidsmpf::streaming::Actor scan_source(std::shared_ptr<rapidsmpf::streaming::Co
  * First collects each build channel into one table and builds its hash table; join stages probe
  * them by index. Then @p concurrency coroutines take chunks, reserve device memory, and run every
  * branch on each (the branch outputs are concatenated: a union). With @p fold_keys < 0 each result
- * is sent with its chunk's sequence number; otherwise every result holds @p fold_keys key columns
- * then sums, and one chunk with the folded sums, cast to @p out_types, is sent at the end.
+ * is sent with its chunk's sequence number (in arrival order when @p ordered); otherwise every
+ * result holds @p fold_keys key columns then sums, and one chunk with the folded sums, cast to
+ * @p out_types, is sent at the end. With @p forward_metadata false the caller has already
+ * received the input's channel metadata and sent the output's.
  */
 rapidsmpf::streaming::Actor chain(
   std::shared_ptr<rapidsmpf::streaming::Context> ctx,
@@ -86,7 +88,9 @@ rapidsmpf::streaming::Actor chain(
   std::vector<std::vector<stage>> branches,
   std::size_t concurrency,
   int fold_keys,
-  std::vector<int> out_types);
+  std::vector<int> out_types,
+  bool forward_metadata = true,
+  bool ordered          = false);
 
 /**
  * @brief Send every chunk of @p ch_in to each of @p chs_out, channel metadata included.
