@@ -267,6 +267,34 @@ _BINOPS = {
 }
 
 
+
+_JOIN_PHASES = __import__("os").environ.get("CUDF_POLARS_JOIN_PHASES")
+_join_phase_stats: dict[str, list[float]] = {}
+
+
+def _join_phase(name: str, t: list[float]) -> None:
+    # Experiment: wall and thread CPU seconds per Join.do_evaluate phase.
+    if _JOIN_PHASES:
+        import time  # noqa: PLC0415
+
+        now, cpu = time.perf_counter(), time.thread_time()
+        rec = _join_phase_stats.setdefault(name, [0.0, 0.0, 0])
+        rec[0] += now - t[0]
+        rec[1] += cpu - t[1]
+        rec[2] += 1
+        t[0], t[1] = now, cpu
+
+
+def _dump_join_phases() -> None:
+    if _JOIN_PHASES and _join_phase_stats:
+        with open(_JOIN_PHASES, "w") as f:
+            for k, (w, c, n) in sorted(_join_phase_stats.items()):
+                f.write(f"{k}\t{n}\t{w:.3f}\t{c:.3f}\n")
+
+
+__import__("atexit").register(_dump_join_phases)
+
+
 class IR(Node["IR"]):
     """Abstract plan node, representing an unevaluated dataframe."""
 
@@ -3576,8 +3604,14 @@ class Join(IR):
         right: DataFrame,
         *,
         context: IRExecutionContext,
+        prebuilt: tuple[plc.join.HashJoin, bool] | None = None,
     ) -> DataFrame:
-        """Evaluate and return a dataframe."""
+        """
+        Evaluate and return a dataframe.
+
+        ``prebuilt`` is a hash table already built on the build side's keys and whether the build
+        side is the left input (an inner or left join probes it instead of building one).
+        """
         how, nulls_equal, zlice, suffix, coalesce, maintain_order = options
         if how == "Cross":
             with context.stream_ordered_after(left, right) as stream:
@@ -3642,6 +3676,9 @@ class Join(IR):
         else:
             # how != "Cross"
             # TODO: Waiting on clarity based on https://github.com/pola-rs/polars/issues/17184
+            import time as _time  # noqa: PLC0415
+
+            _t = [_time.perf_counter(), _time.thread_time()]
             left_on = DataFrame(
                 broadcast(
                     *(e.evaluate(left) for e in left_on_exprs),
@@ -3671,7 +3708,9 @@ class Join(IR):
                     HStack.do_evaluate(right_exprs, True, right, context=context),  # noqa: FBT003
                     right_casts,
                 )
+            _join_phase("1 keys", _t)
             with context.stream_ordered_after(left, right) as stream:
+                _join_phase("2 stream_ordered_after", _t)
                 null_equality = (
                     plc.types.NullEquality.EQUAL
                     if nulls_equal
@@ -3693,7 +3732,17 @@ class Join(IR):
                         left, right = right, left
                         left_on, right_on = right_on, left_on
                         maintain_order = Join.SWAPPED_ORDER[maintain_order]
-                    if predicate_args is None:
+                    if predicate_args is None and prebuilt is not None:
+                        # The hash table of the build side was built once (a
+                        # broadcast join's small side, probed by every chunk).
+                        hash_join, swap = prebuilt
+                        probe = (right_on if swap else left_on).table
+                        probe_join = (
+                            hash_join.left_join if how == "Left" else hash_join.inner_join
+                        )
+                        maps = probe_join(probe, stream=stream)
+                        lg, rg = (maps[1], maps[0]) if swap else maps
+                    elif predicate_args is None:
                         lg, rg = join_fn(
                             left_on.table, right_on.table, null_equality, stream=stream
                         )
@@ -3707,6 +3756,7 @@ class Join(IR):
                             null_equality,
                             stream=stream,
                         )
+                    _join_phase("3 join", _t)
                     if (
                         how in ("Inner", "Left", "Right", "Full")
                         and maintain_order != "none"
@@ -3721,6 +3771,7 @@ class Join(IR):
                             left_primary=maintain_order.startswith("left"),
                             stream=stream,
                         )
+                    _join_phase("4 reorder", _t)
                     if coalesce:
                         if how == "Full":
                             # In this case, keys must be column references,
@@ -3743,6 +3794,7 @@ class Join(IR):
                         left.dtypes,
                         stream=stream,
                     )
+                    _join_phase("5 gather left", _t)
                     right = DataFrame.from_table(
                         plc.copying.gather(
                             right.table, rg, right_policy, stream=stream
@@ -3751,6 +3803,7 @@ class Join(IR):
                         right.dtypes,
                         stream=stream,
                     )
+                    _join_phase("6 gather right", _t)
                     if coalesce and how == "Full":
                         left = left.with_columns(
                             (
@@ -3781,7 +3834,9 @@ class Join(IR):
                             if name in left.column_names_set
                         }
                     )
-                    return left.with_columns(right.columns, stream=stream).slice(zlice)
+                    out = left.with_columns(right.columns, stream=stream).slice(zlice)
+                    _join_phase("7 finish", _t)
+                    return out
 
 
 class HStack(IR):

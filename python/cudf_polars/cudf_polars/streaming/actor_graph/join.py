@@ -116,6 +116,56 @@ if TYPE_CHECKING:
     from cudf_polars.utils.config import StreamingExecutor
 
 
+
+_eval_stats = collections.Counter()
+
+
+def _timed_evaluate(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    # Experiment: wall vs this thread's CPU time per join evaluation (CPU << wall: waiting on the
+    # GIL or on a stream; CPU ~ wall: busy in Python or host code).
+    import time  # noqa: PLC0415
+
+    t0, c0 = time.perf_counter(), time.thread_time()
+    profile = None
+    if os.environ.get("CUDF_POLARS_JOIN_CPROFILE") and _eval_stats["calls"] % 10 == 0:
+        import cProfile  # noqa: PLC0415
+
+        profile = cProfile.Profile()
+        profile.enable()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        if profile is not None:
+            profile.disable()
+            with _profiles_lock:
+                _profiles.append(profile)
+        _eval_stats["calls"] += 1
+        _eval_stats["wall_s"] += time.perf_counter() - t0
+        _eval_stats["cpu_s"] += time.thread_time() - c0
+
+
+_profiles: list = []
+_profiles_lock = __import__("threading").Lock()
+
+
+def _dump_eval_stats() -> None:
+    if (path := os.environ.get("CUDF_POLARS_JOIN_CPROFILE")) and _profiles:
+        import pstats  # noqa: PLC0415
+
+        stats = pstats.Stats(_profiles[0])
+        for profile in _profiles[1:]:
+            stats.add(profile)
+        stats.dump_stats(path)
+    if (path := os.environ.get("CUDF_POLARS_JOIN_STATS")) and _eval_stats:
+        with open(path, "w") as f:
+            for k, v in sorted(_eval_stats.items()):
+                f.write(f"{k}\t{v}\n")
+
+
+import atexit  # noqa: E402
+
+atexit.register(_dump_eval_stats)
+
 def _join_preserves_side_order(
     how: Literal["Inner", "Left", "Right", "Full", "Semi", "Anti", "Cross"],
     maintain_order: Literal["none", "left", "right", "left_right", "right_left"],
@@ -493,7 +543,9 @@ async def _broadcast_join_large_chunk_compute(
         await reserve_memory(context, size=input_bytes, net_memory_delta=0)
     ):
         for sdf in dfs_to_join:
+            _eval_stats["broadcast_" + ir.options[0]] += 1
             result = await ir_context.to_thread(
+                _timed_evaluate,
                 ir.do_evaluate,
                 *ir._non_child_args,
                 *([large_df, sdf] if broadcast_side == "right" else [sdf, large_df]),
@@ -919,25 +971,8 @@ async def _join_chunks(
     )
 
     left, right = ir.children[:2]
-    while True:
-        left_msg, right_msg = await gather_in_task_group(
-            ch_left.recv(context), ch_right.recv(context)
-        )
-        if left_msg is None or right_msg is None:
-            assert left_msg is None, (
-                "Mismatched chunk counts in shuffle join: left has unmatched chunk. "
-                f"Seq num: {left_msg.sequence_number}"
-            )
-            assert right_msg is None, (
-                "Mismatched chunk counts in shuffle join: right has unmatched chunk. "
-                f"Seq num: {right_msg.sequence_number}"
-            )
-            break
-        assert left_msg.sequence_number == right_msg.sequence_number, (
-            "Mismatched chunk sequence numbers in shuffle join. "
-            f"Left: {left_msg.sequence_number}, Right: {right_msg.sequence_number}"
-        )
 
+    async def _join_chunk_pair(left_msg: Any, right_msg: Any) -> TableChunk:
         # Unknown: both chunks are freed but the join output replaces them,
         # and its size depends on selectivity we cannot estimate here.
         (left_chunk, right_chunk), _ = await make_table_chunks_available_or_wait(
@@ -960,8 +995,10 @@ async def _join_chunks(
         with opaque_memory_usage(
             await reserve_memory(context, size=input_bytes, net_memory_delta=0)
         ):
+            _eval_stats["shuffle_" + ir.options[0]] += 1
             df = await ir_context.to_thread(
                 partial(
+                    _timed_evaluate,
                     ir.do_evaluate,
                     *ir._non_child_args,
                     chunk_to_frame(left_chunk, left),
@@ -970,18 +1007,48 @@ async def _join_chunks(
                 )
             )
             del left_chunk, right_chunk
-
-        output_chunk = TableChunk.from_pylibcudf_table(
+        return TableChunk.from_pylibcudf_table(
             df.table, df.stream, exclusive_view=True, br=context.br()
         )
-        await send_chunk(
-            context,
-            ch_out,
-            output_chunk,
-            left_msg.sequence_number,
-            tracer=tracer,
+
+    # Experiment: up to ``concurrency`` partition pairs join at once (they are independent);
+    # results are still sent in sequence order.
+    concurrency = max(1, int(os.environ.get("CUDF_POLARS_JOIN_CONCURRENCY", "1")))
+    pending: collections.deque[tuple[asyncio.Future, int]] = collections.deque()
+
+    async def _send_oldest() -> None:
+        future, seq = pending.popleft()
+        await send_chunk(context, ch_out, await future, seq, tracer=tracer)
+
+    while True:
+        left_msg, right_msg = await gather_in_task_group(
+            ch_left.recv(context), ch_right.recv(context)
         )
-        del df
+        if left_msg is None or right_msg is None:
+            assert left_msg is None, (
+                "Mismatched chunk counts in shuffle join: left has unmatched chunk. "
+                f"Seq num: {left_msg.sequence_number}"
+            )
+            assert right_msg is None, (
+                "Mismatched chunk counts in shuffle join: right has unmatched chunk. "
+                f"Seq num: {right_msg.sequence_number}"
+            )
+            break
+        assert left_msg.sequence_number == right_msg.sequence_number, (
+            "Mismatched chunk sequence numbers in shuffle join. "
+            f"Left: {left_msg.sequence_number}, Right: {right_msg.sequence_number}"
+        )
+
+        pending.append(
+            (
+                asyncio.ensure_future(_join_chunk_pair(left_msg, right_msg)),
+                left_msg.sequence_number,
+            )
+        )
+        if len(pending) >= concurrency:
+            await _send_oldest()
+    while pending:
+        await _send_oldest()
 
     await ch_out.drain(context)
 
