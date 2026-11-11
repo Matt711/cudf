@@ -90,6 +90,7 @@ def configure_scan_io(
                 footer_threads=footer_threads,
                 inflight_bytes=inflight_bytes,
             )
+            _start_sampler(_service)
         return _service
 
 
@@ -542,4 +543,25 @@ def _dump_trace() -> None:
 
 
 _TRACE_PATH = os.environ.get("CUDF_POLARS_IO_TRACE")
+_sampler: list[threading.Thread] = []
+
+
+def _start_sampler(service: Any) -> None:
+    # Every 10 ms: tasks waiting for a block, bytes in flight, bytes queued, free arena bytes.
+    if not _TRACE_PATH or _sampler or not hasattr(service, "snapshot"):
+        return
+
+    def _run() -> None:
+        while True:
+            time.sleep(0.01)
+            if _query["index"] >= 0:
+                w, inflight, queued, free = service.snapshot()
+                _trace.append(
+                    (_query["index"], round(time.perf_counter() - _query["t0"], 4), "iostat",
+                     int(w), int(queued >> 20), (int(inflight >> 20) << 32) | int(free >> 20))
+                )
+
+    t = threading.Thread(target=_run, daemon=True, name="io-sampler")
+    _sampler.append(t)
+    t.start()
 atexit.register(_dump_trace)

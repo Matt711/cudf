@@ -27,6 +27,7 @@ from cudf_polars.streaming.actor_graph.dispatch import (
 from cudf_polars.streaming.actor_graph.hconcat import build_hconcat_partitioning
 from cudf_polars.streaming.actor_graph.partitioning import maybe_remap_partitioning
 from cudf_polars.streaming.actor_graph.tracing import send_chunk
+from cudf_polars.streaming.io import StreamingScan
 from cudf_polars.streaming.actor_graph.utils import (
     ChannelManager,
     _leading_order_keys,
@@ -586,6 +587,7 @@ async def fanout_node_unbounded(
 # channel hop per chunk between them).
 _FUSE_CHUNKWISE = bool(__import__("os").environ.get("CUDF_POLARS_FUSE_CHUNKWISE"))
 _FUSE_JOIN_POST = bool(__import__("os").environ.get("CUDF_POLARS_FUSE_JOIN_POST"))
+_FUSE_SCAN_POST = bool(__import__("os").environ.get("CUDF_POLARS_FUSE_SCAN_POST"))
 
 
 def _fusable(node: IR, rec: SubNetGenerator) -> bool:
@@ -612,6 +614,19 @@ def _default_sub_network(
         while _fusable((fused[0] if fused else ir).children[0], rec):
             fused = ((fused[0] if fused else ir).children[0], *fused)
     source = (fused[0] if fused else ir).children[0] if len(ir.children) == 1 else None
+    if (
+        _FUSE_SCAN_POST
+        and isinstance(source, StreamingScan)
+        and source not in rec.state["fanout_nodes"]
+        and rec.state["quent_operator_map"] is None
+    ):
+        # The scan's producers run the chain on each chunk they decode: no actor of its own.
+        rec.state.setdefault("post_chains", {})[source] = (*fused, ir)  # type: ignore[typeddict-item]
+        nodes, channels = rec(source)
+        nodes, channels = dict(nodes), dict(channels)
+        nodes[ir] = []
+        channels[ir] = channels[source]
+        return nodes, channels
     if (
         _FUSE_JOIN_POST
         and isinstance(source, Join)

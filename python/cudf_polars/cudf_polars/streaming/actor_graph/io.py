@@ -38,8 +38,10 @@ from cudf_polars.streaming.actor_graph.scan_ordering import (
     parquet_metadata_ordering,
 )
 from cudf_polars.streaming.actor_graph.tracing import send_chunk
+from cudf_polars.streaming.actor_graph.partitioning import maybe_remap_partitioning
 from cudf_polars.streaming.actor_graph.utils import (
     ChannelManager,
+    _evaluate_chunk_sync,
     chunk_to_frame,
     empty_table_chunk,
     gather_in_task_group,
@@ -579,6 +581,7 @@ async def read_chunk(
     tracer: ActorTracer | None = None,
     fetched: Any = None,
     after_decode: Any = None,
+    post: tuple[IR, ...] = (),
 ) -> None:
     """
     Read a chunk from disk and send it to the output channel.
@@ -627,22 +630,22 @@ async def read_chunk(
     if fetched is not None:
         remote_io.trace("reserved", -2, seq_num, reservation_bytes)
     with opaque_memory_usage(reservation):
-        if fetched is not None:
-            df = await ir_context.to_thread(
-                remote_fetch.materialize, task, fetched, ir_context
+        br = context.br()
+
+        def _read() -> TableChunk:
+            # Decode, then the chunkwise chain fused into the scan (if any), in one thread call.
+            if fetched is not None:
+                df = remote_fetch.materialize(task, fetched, ir_context)
+            else:
+                df = task.do_evaluate(*task._non_child_args, context=ir_context)
+            out = TableChunk.from_pylibcudf_table(
+                df.table, df.stream, exclusive_view=True, br=br
             )
-        else:
-            df = await ir_context.to_thread(
-                task.do_evaluate,
-                *task._non_child_args,
-                context=ir_context,
-            )
-        chunk = TableChunk.from_pylibcudf_table(
-            df.table,
-            df.stream,
-            exclusive_view=True,
-            br=context.br(),
-        )
+            for node in post:
+                out = _evaluate_chunk_sync(out, node, ir_context, br)
+            return out
+
+        chunk = await ir_context.to_thread(_read)
     if after_decode is not None:
         await after_decode(chunk.data_alloc_size())
 
@@ -663,6 +666,7 @@ async def scan_node(
     infer_ordering: bool,
     num_producers: int,
     estimated_chunk_bytes: int,
+    post: tuple[IR, ...] = (),
 ) -> None:
     """
     Scan node for rapidsmpf.
@@ -723,6 +727,8 @@ async def scan_node(
         if partitioning is None:
             # Remote scans may split their last whole-file tasks (decided before any footer).
             tasks = remote_fetch.split_tail(tasks)
+        for node in post:
+            partitioning = maybe_remap_partitioning(node, partitioning, context=context)
         await send_metadata(
             ch_out,
             context,
@@ -746,6 +752,7 @@ async def scan_node(
                     ir_context,
                     estimated_chunk_bytes,
                     tracer=tracer,
+                    post=post,
                 )
             await ch_out.drain(context)
             return
@@ -825,6 +832,7 @@ async def scan_node(
                         tracer=tracer,
                         fetched=fetched,
                         after_decode=_after_decode,
+                        post=post,
                     )
                     if lineariser is not None and decode_cost > 0:
                         await lineariser.forwarded(producer_id)
@@ -901,6 +909,7 @@ def _(
             estimated_chunk_bytes=(
                 plan.estimated_chunk_bytes or executor.target_partition_size
             ),
+            post=rec.state.get("post_chains", {}).get(ir, ()),  # type: ignore[attr-defined]
         )
     ]
     return nodes, channels

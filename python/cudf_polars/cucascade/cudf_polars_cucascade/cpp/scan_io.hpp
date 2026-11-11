@@ -178,6 +178,12 @@ class scan_io {
   /** @brief Bytes requested from the object store so far (data, not footers). */
   [[nodiscard]] std::size_t fetched_bytes() const noexcept { return _fetched_bytes; }
 
+  /**
+   * @brief A snapshot of the data path: tasks waiting for a block, bytes of reads in flight,
+   * bytes of granted reads not yet issued, and free bytes of the arena.
+   */
+  [[nodiscard]] std::vector<std::size_t> snapshot();
+
  private:
   struct footer_entry {
     std::mutex mutex;

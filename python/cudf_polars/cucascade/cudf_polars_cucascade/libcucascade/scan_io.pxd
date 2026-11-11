@@ -69,6 +69,7 @@ cdef extern from "scan_io.hpp" namespace "cudf_polars_cucascade" nogil:
         ) except +libcucascade_exception_handler
         void release(int64_t id) except +libcucascade_exception_handler
         size_t fetched_bytes()
+        vector[size_t] snapshot() except +
         planned_task plan_task(
             int64_t stream_id,
             const vector[string]& paths,

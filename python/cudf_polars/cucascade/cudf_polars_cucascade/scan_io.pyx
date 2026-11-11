@@ -94,6 +94,10 @@ cdef class ScanIO:
         """Size of the pinned arena in bytes."""
         return self.c_obj.get().arena_bytes()
 
+    def snapshot(self) -> list[int]:
+        """[tasks waiting for a block, bytes in flight, bytes queued to issue, free arena bytes]."""
+        return list(self.c_obj.get().snapshot())
+
     @property
     def fetched_bytes(self) -> int:
         """Data bytes requested from the object store so far."""

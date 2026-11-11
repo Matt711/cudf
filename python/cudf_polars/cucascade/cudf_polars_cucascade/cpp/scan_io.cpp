@@ -522,6 +522,24 @@ std::pair<std::int64_t, std::shared_ptr<scan_io::task>> scan_io::next_grant()
   return {-1, nullptr};
 }
 
+std::vector<std::size_t> scan_io::snapshot()
+{
+  std::lock_guard lock(_mutex);
+  std::size_t waiting = 0;
+  for (auto const& [_, st] : _streams) {
+    waiting += st.queue.size();
+  }
+  std::size_t to_issue = 0;
+  for (auto const& q : _to_issue) {
+    to_issue += q.batch.bytes;
+  }
+  std::size_t free_bytes = 0;
+  for (auto const& [_, size] : _free) {
+    free_bytes += size;
+  }
+  return {waiting, _inflight, to_issue, free_bytes};
+}
+
 void scan_io::scheduler_main()
 {
   while (true) {
