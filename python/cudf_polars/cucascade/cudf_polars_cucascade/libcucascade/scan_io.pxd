@@ -12,6 +12,8 @@ from cuda.bindings.cyruntime cimport cudaStream_t
 from pylibcudf.libcudf.io.parquet cimport parquet_reader_options
 from pylibcudf.libcudf.io.parquet_schema cimport FileMetaData
 from pylibcudf.libcudf.io.types cimport table_with_metadata
+from pylibcudf.libcudf.table.table cimport table
+from pylibcudf.libcudf.table.table_view cimport table_view
 from rmm.librmm.device_buffer cimport device_buffer
 
 from cudf_polars_cucascade.exception_handler cimport libcucascade_exception_handler
@@ -86,3 +88,37 @@ cdef extern from "scan_io.hpp" namespace "cudf_polars_cucascade" nogil:
         table_with_metadata materialize(
             int64_t id, cudaStream_t stream
         ) except +libcucascade_exception_handler
+
+
+cdef extern from "probe_pipeline.hpp" namespace "cudf_polars_cucascade" nogil:
+
+    cdef cppclass expr_node:
+        int op
+        int column_index
+        double value
+        int binop
+        int lhs
+        int rhs
+
+    cdef cppclass stage:
+        int op
+        int build
+        vector[int] probe_keys
+        vector[int] keep_probe
+        vector[int] keep_build
+        vector[vector[expr_node]] exprs
+        vector[int] columns
+        vector[int] keys
+        vector[int] sums
+
+    cdef cppclass probe_pipeline:
+        probe_pipeline(
+            scan_io& io,
+            vector[vector[stage]] branches,
+            vector[table_view] builds,
+            vector[vector[int]] build_keys,
+            int threads,
+        ) except +libcucascade_exception_handler
+        void submit(int64_t task_id) except +libcucascade_exception_handler
+        vector[unique_ptr[table]] finish() except +libcucascade_exception_handler
+        vector[double] stats() except +libcucascade_exception_handler

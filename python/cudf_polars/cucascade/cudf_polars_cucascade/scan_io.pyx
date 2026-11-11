@@ -19,12 +19,19 @@ from rmm.pylibrmm.device_buffer cimport DeviceBuffer
 from rmm.pylibrmm.stream cimport Stream
 
 from cudf_polars_cucascade.libcucascade.scan_io cimport (
+    expr_node,
     planned_task,
+    probe_pipeline as cpp_probe_pipeline,
     scan_io as cpp_scan_io,
     scan_io_config as cpp_scan_io_config,
+    stage,
 )
+from pylibcudf.libcudf.table.table cimport table
+from pylibcudf.libcudf.table.table_view cimport table_view
+from pylibcudf.table cimport Table
+from rmm.pylibrmm.memory_resource cimport DeviceMemoryResource
 
-__all__ = ["ScanIO"]
+__all__ = ["ProbePipeline", "ScanIO"]
 
 
 cdef class ScanIO:
@@ -246,3 +253,97 @@ cdef class ScanIO:
         return TableWithMetadata.from_libcudf(
             result, stream, rmm.mr.get_current_device_resource()
         )
+
+
+_EXPR_OPS = {"column": 0, "literal": 1, "binary": 2, "year": 3}
+_STAGE_OPS = {"join": 0, "compute": 1, "select": 2, "groupby": 3}
+
+
+cdef vector[expr_node] _expr(list nodes):
+    cdef vector[expr_node] out
+    cdef expr_node n
+    for d in nodes:
+        n.op = _EXPR_OPS[d["op"]]
+        n.column_index = d.get("column", 0)
+        n.value = d.get("value", 0.0)
+        n.binop = int(d.get("binop", 0))
+        n.lhs = d.get("lhs", 0)
+        n.rhs = d.get("rhs", 0)
+        out.push_back(n)
+    return out
+
+
+cdef stage _stage(dict d):
+    cdef stage s
+    s.op = _STAGE_OPS[d["op"]]
+    s.build = d.get("build", 0)
+    s.probe_keys = d.get("probe_keys", [])
+    s.keep_probe = d.get("keep_probe", [])
+    s.keep_build = d.get("keep_build", [])
+    for e in d.get("exprs", []):
+        s.exprs.push_back(_expr(e))
+    s.columns = d.get("columns", [])
+    s.keys = d.get("keys", [])
+    s.sums = d.get("sums", [])
+    return s
+
+
+cdef class ProbePipeline:
+    """
+    Experiment: probe chains run natively over the decoded tasks of a scan.
+
+    Worker threads decode each submitted task (planned on ``io``) and run every branch's stages
+    on it: ``join`` (inner join against a build table: ``build``, ``probe_keys``, then the kept
+    ``keep_probe`` and ``keep_build`` columns), ``compute`` (``exprs``: flattened expressions of
+    ``column``, ``literal``, ``binary`` and ``year`` nodes, appended as columns), ``select``
+    (``columns``) and a final ``groupby`` (``keys``, ``sums``). :meth:`finish` returns each
+    branch's aggregate. The build tables must stay alive (this object keeps them).
+    """
+
+    cdef unique_ptr[cpp_probe_pipeline] c_obj
+    cdef list _builds
+
+    def __cinit__(self, ScanIO io, list branches, list builds, list build_keys, int threads):
+        cdef vector[vector[stage]] c_branches
+        cdef vector[stage] c_stages
+        cdef vector[table_view] c_builds
+        cdef vector[vector[int]] c_keys = build_keys
+        for stages in branches:
+            c_stages.clear()
+            for d in stages:
+                c_stages.push_back(_stage(d))
+            c_branches.push_back(c_stages)
+        self._builds = list(builds)
+        for t in self._builds:
+            c_builds.push_back((<Table?>t).view())
+        with nogil:
+            self.c_obj.reset(
+                new cpp_probe_pipeline(
+                    io.c_obj.get()[0], c_branches, c_builds, c_keys, threads
+                )
+            )
+
+    def submit(self, int64_t task_id) -> None:
+        """Queue a planned task; the pipeline decodes and releases it."""
+        with nogil:
+            self.c_obj.get().submit(task_id)
+
+    def finish(self) -> list:
+        """Wait for every task; returns each branch's aggregate (keys, then sums)."""
+        cdef vector[unique_ptr[table]] result
+        with nogil:
+            result = move(self.c_obj.get().finish())
+        import rmm.mr
+
+        mr = rmm.mr.get_current_device_resource()
+        stream = Stream()  # the results are complete: finish() synchronized
+        return [Table.from_libcudf(move(result[i]), stream, mr) for i in range(result.size())]
+
+    def stats(self) -> dict:
+        """Counters of the work so far."""
+        cdef vector[double] v = self.c_obj.get().stats()
+        names = (
+            "tasks", "decode_s", "join_s", "compute_s", "groupby_s", "fold_s", "wall_s",
+            "joins", "rows_in", "rows_out",
+        )
+        return {name: v[i] for i, name in enumerate(names)}

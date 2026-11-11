@@ -211,3 +211,14 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
   backlog -1.0 to -2.1 s, post -0.8 to -1.0 s. Adopted into the best config.
 - For a C++ executor: the gain would come from stream-ordered chains with fewer synchronizes and deliberate decode vs compute
   GPU scheduling, not from removing the interpreter.
+
+## 11 Nov (evening): native executor, Q7 vertical slice
+- ProbePipeline (cpp/probe_pipeline.{hpp,cpp}, Cython in scan_io.pyx; harness notes/q7_native.py; site cudf-ext-io2f-site):
+  worker threads take planned ScanIO tasks, materialize natively, run each branch's stages on the worker's stream (hash_join
+  probes against prebuilt build tables, a small expression contract: column/literal/binary/year, select, partial groupby),
+  fold partial aggregates; only final aggregates return to Python. No per-chunk Python.
+- Q7 lineitem probe (both union branches) cold from S3, build tables prebuilt untimed: 67.4 GB at 11.1-11.7 GB/s, tail after
+  the last byte 0.05-0.26 s with 2/4/8 threads, VALID vs expected q07. 360 join probes over 3.6 B rows: 0.7-1.3 s summed
+  (~2-3.5 ms each) vs 8-25 ms per call in the engine. Engine Q7 tail after its last lineitem byte: ~1.8-2.7 s.
+- Not yet measured: build sides fetched in the same query (engine Q7 also reads ~6 GB of orders/customer), memory admission,
+  engine integration (lowering a scan -> chunkwise -> broadcast joins -> partial groupby chain to a native node).

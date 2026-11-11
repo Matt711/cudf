@@ -9,6 +9,7 @@
 # opens it. cuCascade's libraries are linked statically, so the module carries what it needs.
 add_library(
   cudf_polars_cucascade_cpp STATIC cpp/cucascade_datasource.cpp cpp/scan_cache.cpp cpp/scan_io.cpp
+  cpp/probe_pipeline.cpp
 )
 target_include_directories(
   cudf_polars_cucascade_cpp PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/cpp"
