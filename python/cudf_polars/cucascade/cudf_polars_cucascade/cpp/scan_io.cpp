@@ -238,6 +238,30 @@ std::vector<std::uint8_t> scan_io::footer_file(std::string const& path)
   return file;
 }
 
+std::vector<std::size_t> scan_io::projected_bytes(std::vector<std::string> const& paths,
+                                                  std::vector<std::string> const& columns)
+{
+  std::vector<std::size_t> result;
+  result.reserve(2 * paths.size());
+  for (auto const& path : paths) {
+    auto entry       = wait_footer(path);
+    std::size_t sum  = 0;
+    for (auto const& group : entry->metadata->row_groups) {
+      for (auto const& chunk : group.columns) {
+        auto const& name = chunk.meta_data.path_in_schema;
+        if (columns.empty() ||
+            (!name.empty() &&
+             std::find(columns.begin(), columns.end(), name.front()) != columns.end())) {
+          sum += static_cast<std::size_t>(chunk.meta_data.total_compressed_size);
+        }
+      }
+    }
+    result.push_back(sum);
+    result.push_back(entry->metadata->row_groups.size());
+  }
+  return result;
+}
+
 void scan_io::clear_footers()
 {
   std::lock_guard lock(_footer_mutex);

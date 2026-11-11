@@ -8,6 +8,7 @@ import dataclasses
 import functools
 import itertools
 import math
+import os
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -87,12 +88,24 @@ def _(
     return ir, {ir: PartitionInfo(count=count)}
 
 
+def scan_partition_size(executor: StreamingExecutor) -> int:
+    """
+    Target bytes of a scan task.
+
+    Experiment: ``CUDF_POLARS_SCAN_PARTITION_SIZE`` sets it apart from the
+    ``target_partition_size`` the operators partition by.
+    """
+    if size := os.environ.get("CUDF_POLARS_SCAN_PARTITION_SIZE"):
+        return int(size)
+    return executor.target_partition_size
+
+
 def scan_partition_plan(
     ir: Scan, stats: StatsCollector, config_options: ConfigOptions[StreamingExecutor]
 ) -> IOPartitionPlan:
     """Extract the partitioning plan of a Scan operation."""
     if ir.typ == "parquet":
-        blocksize: int = config_options.executor.target_partition_size
+        blocksize: int = scan_partition_size(config_options.executor)
         whole_files = ir.lake_options is not None
         if source := stats.scan_stats.get(ir):
             column_sizes = [

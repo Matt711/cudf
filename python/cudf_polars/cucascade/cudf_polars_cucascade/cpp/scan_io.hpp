@@ -103,6 +103,14 @@ class scan_io {
    */
   std::vector<std::uint8_t> footer_file(std::string const& path);
 
+  /**
+   * @brief Per path, from its footer (waiting for it): the bytes of the column chunks of
+   * @p columns (top-level names; every column when empty), then its row-group count, flattened
+   * as `{bytes_0, row_groups_0, bytes_1, ...}`.
+   */
+  std::vector<std::size_t> projected_bytes(std::vector<std::string> const& paths,
+                                           std::vector<std::string> const& columns);
+
   /** @brief Forget every footer and open object (so the next query fetches them again). */
   void clear_footers();
 

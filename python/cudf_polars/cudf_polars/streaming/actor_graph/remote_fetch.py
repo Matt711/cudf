@@ -90,6 +90,78 @@ def split_tail(tasks: Sequence[ScanTask]) -> list[ScanTask]:
     return result[:start] + pieces
 
 
+async def resize(tasks: Sequence[ScanTask]) -> list[ScanTask]:
+    """
+    Regroup a remote scan's whole-file tasks by the bytes their footers say they read.
+
+    Planning gives a remote scan one task per file, as it has no sizes then. Once the scan's
+    footers are in (the service fetches them in parallel at scan start), consecutive files are
+    fused into one task until it reads about ``CUDF_POLARS_SCAN_FUSE_BYTES`` (off when unset),
+    and a file reading more than ``CUDF_POLARS_SCAN_SPLIT_BYTES`` (off when unset) is split into
+    row-group pieces of about that size. Both are bytes of the projected column chunks.
+    """
+    fuse = int(os.environ.get("CUDF_POLARS_SCAN_FUSE_BYTES", "0"))
+    split = int(os.environ.get("CUDF_POLARS_SCAN_SPLIT_BYTES", "0"))
+    if (fuse <= 0 and split <= 0) or not enabled(tasks) or len(tasks) < 2:
+        return list(tasks)
+    if not all(
+        isinstance(t, ParquetScanTask)
+        and len(t.paths) == 1
+        and t.total_splits == 1
+        and t.hive_parts is None
+        and t.lake_options is None
+        for t in tasks
+    ):
+        return list(tasks)
+    first = tasks[0]
+    assert isinstance(first, ParquetScanTask)
+    columns = list(first.base_scan.with_columns or ())
+    service = remote_io.scan_io()
+    paths = [t.paths[0] for t in tasks]
+    service.request_footers(paths)
+    t0 = time.perf_counter()
+    sizes = await asyncio.to_thread(service.projected_bytes, paths, columns)
+    _count("resize_wait_s", time.perf_counter() - t0)
+
+    def _task(paths: list[str], index: int = 0, splits: int = 1) -> ParquetScanTask:
+        return ParquetScanTask(
+            first.base_scan,
+            paths,
+            index,
+            splits,
+            first.parquet_options,
+            None,
+            None,
+        )
+
+    result: list[ScanTask] = []
+    group: list[str] = []
+    group_bytes = 0
+    for task, (nbytes, row_groups) in zip(tasks, sizes, strict=True):
+        if split > 0 and nbytes > 1.5 * split and row_groups > 1:
+            if group:
+                result.append(_task(group))
+                group, group_bytes = [], 0
+            n = min(row_groups, round(nbytes / split))
+            result.extend(_task(list(task.paths), i, n) for i in range(n))
+            continue
+        if fuse > 0 and group and group_bytes + nbytes > fuse:
+            # Close the group when adding this file overshoots more than leaving it short.
+            if group_bytes + nbytes - fuse > fuse - group_bytes:
+                result.append(_task(group))
+                group, group_bytes = [], 0
+        group.append(task.paths[0])
+        group_bytes += nbytes
+        if fuse <= 0 or group_bytes >= fuse:
+            result.append(_task(group))
+            group, group_bytes = [], 0
+    if group:
+        result.append(_task(group))
+    _count("resized_scans")
+    _count("resized_tasks", len(result) - len(tasks))
+    return result
+
+
 _stats: dict[str, Any] = {}
 _stats_lock = threading.Lock()
 

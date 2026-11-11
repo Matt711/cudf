@@ -123,6 +123,18 @@ cdef class ScanIO:
             result = move(self.c_obj.get().footer(c_path))
         return result.first, FileMetaData.from_libcudf(move(result.second))
 
+    def projected_bytes(self, paths, columns) -> list[tuple[int, int]]:
+        """
+        Per path, ``(bytes of the column chunks of columns, row-group count)`` from its footer
+        (waiting for it). An empty ``columns`` counts every column.
+        """
+        cdef vector[string] c_paths = [p.encode() for p in paths]
+        cdef vector[string] c_columns = [c.encode() for c in columns]
+        cdef vector[size_t] result
+        with nogil:
+            result = self.c_obj.get().projected_bytes(c_paths, c_columns)
+        return [(result[2 * i], result[2 * i + 1]) for i in range(len(paths))]
+
     def footer_file(self, str path) -> bytes:
         """
         A minimal parquet file holding only the footer of ``path``.

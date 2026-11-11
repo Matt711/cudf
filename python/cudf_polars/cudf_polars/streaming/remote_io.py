@@ -494,6 +494,10 @@ def begin_query() -> None:
         _query["t0"] = time.perf_counter()
         mark("begin_query")
         trace("query", -1, -1, int((_query["t0"] - _entry[0]) * 1e6) if _entry else 0)
+        # Cumulative data bytes fetched and taken from shared chunks, as of this query's start.
+        trace("fetched_total", -1, -1, int(_service.fetched_bytes))
+        if hasattr(_service, "shared_bytes"):
+            trace("shared_total", -1, -1, int(_service.shared_bytes))
 
 
 _trace: list[tuple] = []

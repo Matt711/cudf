@@ -54,6 +54,7 @@ from cudf_polars.streaming.io import (
     StreamingSink,
     _prepare_sink_directory,
     _sink_to_file,
+    scan_partition_size,
 )
 from cudf_polars.streaming.rank_aware_source import RankAwareSource
 from cudf_polars.streaming.utils import _fallback_inform
@@ -727,6 +728,7 @@ async def scan_node(
         if partitioning is None:
             # Remote scans may split their last whole-file tasks (decided before any footer).
             tasks = remote_fetch.split_tail(tasks)
+            tasks = await remote_fetch.resize(tasks)
         for node in post:
             partitioning = maybe_remap_partitioning(node, partitioning, context=context)
         await send_metadata(
@@ -907,7 +909,7 @@ def _(
             ),
             num_producers=num_producers,
             estimated_chunk_bytes=(
-                plan.estimated_chunk_bytes or executor.target_partition_size
+                plan.estimated_chunk_bytes or scan_partition_size(executor)
             ),
             post=rec.state.get("post_chains", {}).get(ir, ()),  # type: ignore[attr-defined]
         )
