@@ -228,3 +228,9 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
   CUDF_POLARS_NATIVE_PREFETCH_MB), build tables viewing freed chunks, scan filter freed during decode, frees on destroyed streams.
 - Subset Q3/5/7/9/10 with 20 GB read-ahead: 36.2 vs 40.7 s cold. Full pairs: 125.6 vs 128.4, 127.9 vs 136.6 (all valid);
   Q7 -1.6/-1.8, Q9 -4.7 in the second pair. Not rapidsmpf memory-aware yet (no reservations/spill in the native region).
+- With Q8 (when/then, string compares; 660389b54e): full pairs 118.3 vs 123.5 and 129.1 vs 131.3 (all valid). The six native
+  queries (Q3/5/7/8/9/10) gained 5.3 and 5.4 s in the two pairs; the other 16 queries moved +0.1 and +3.2 s (noise).
+  118.3 s is the best cold run so far.
+- Paused for design here (Matt, 11 Nov). Uncommitted, built only into cudf-ext-io2g-site: C++ streamed-output mode for the
+  probe pipeline (bounded output queue, close()/next_output(), process-wide worker stream pool) for a "native probe source"
+  that would emit one chunk per task into the regular engine; the Python matcher/actor for it is not written.
