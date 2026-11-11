@@ -69,6 +69,7 @@ async def default_node_single(
     ch_in: Channel[TableChunk],
     *,
     partitioning_callback: PartitioningCallback | None = None,
+    fused: tuple[IR, ...] = (),
 ) -> None:
     """
     Single-channel default node for rapidsmpf.
@@ -103,11 +104,14 @@ async def default_node_single(
         ir_context = actor_scope.require_ir_context()
         # Recv metadata and prepare output metadata
         metadata_in = await recv_metadata(ch_in, context)
-        partitioning = (
-            partitioning_callback((metadata_in,), context)
-            if partitioning_callback is not None
-            else maybe_remap_partitioning(ir, metadata_in.partitioning, context=context)
-        )
+        if partitioning_callback is not None:
+            partitioning = partitioning_callback((metadata_in,), context)
+        else:
+            partitioning = metadata_in.partitioning
+            for node in (*fused, ir):
+                partitioning = maybe_remap_partitioning(
+                    node, partitioning, context=context
+                )
         metadata_out = ChannelMetadata(
             local_count=metadata_in.local_count,
             partitioning=partitioning,
@@ -124,6 +128,7 @@ async def default_node_single(
             input_metadata=metadata_in,
             handle_empty_input=True,
             tracer=tracer,
+            fused=fused,
         )
 
 
@@ -347,6 +352,12 @@ async def fanout_node_bounded(
         await gather_in_task_group(*(ch.drain(context) for ch in chs_out))
 
 
+# Experiment: copy fanned-out messages on a worker thread, not the event loop.
+_FANOUT_COPY_THREAD = bool(
+    __import__("os").environ.get("CUDF_POLARS_FANOUT_COPY_THREAD")
+)
+
+
 @define_actor()
 async def fanout_node_unbounded(
     context: Context,
@@ -534,7 +545,14 @@ async def fanout_node_unbounded(
                             for idx, sm in enumerate(output_buffers):
                                 if idx < num_outputs - 1:
                                     # Copy to target memory and insert into spillable buffer
-                                    mid = sm.insert(msg.copy(memory_reservation))
+                                    if _FANOUT_COPY_THREAD:
+                                        mid = sm.insert(
+                                            await asyncio.to_thread(
+                                                msg.copy, memory_reservation
+                                            )
+                                        )
+                                    else:
+                                        mid = sm.insert(msg.copy(memory_reservation))
                                 else:
                                     # Optimization: reuse the original message for last output
                                     # (no copy needed)
@@ -564,15 +582,41 @@ async def fanout_node_unbounded(
             context.br().spill_manager.remove_spill_function(spill_func_id)
 
 
+# Experiment: run a chain of single-input chunkwise nodes in one actor (one thread hop and no
+# channel hop per chunk between them).
+_FUSE_CHUNKWISE = bool(__import__("os").environ.get("CUDF_POLARS_FUSE_CHUNKWISE"))
+
+
+def _fusable(node: IR, rec: SubNetGenerator) -> bool:
+    return (
+        len(node.children) == 1
+        and generate_ir_sub_network.dispatch(type(node)) is _default_sub_network
+        and node not in rec.state["fanout_nodes"]
+    )
+
+
 @generate_ir_sub_network.register(IR)
-def _(
+def _default_sub_network(
     ir: IR, rec: SubNetGenerator
 ) -> tuple[dict[IR, list[Any]], dict[IR, ChannelManager]]:
     # Default generate_ir_sub_network logic.
     # Use simple pointwise node.
 
-    # Process children
-    nodes, channels = process_children(ir, rec)
+    fused: tuple[IR, ...] = ()
+    if (
+        _FUSE_CHUNKWISE
+        and len(ir.children) == 1
+        and rec.state["quent_operator_map"] is None
+    ):
+        while _fusable((fused[0] if fused else ir).children[0], rec):
+            fused = ((fused[0] if fused else ir).children[0], *fused)
+    if fused:
+        # Process the input of the first fused node instead of the children
+        nodes, channels = rec(fused[0].children[0])
+        nodes, channels = dict(nodes), dict(channels)
+    else:
+        # Process children
+        nodes, channels = process_children(ir, rec)
 
     # Create output ChannelManager
     channels[ir] = ChannelManager(rec.state["context"])
@@ -580,13 +624,15 @@ def _(
 
     if len(ir.children) == 1:
         # Single-channel default node
+        source = fused[0].children[0] if fused else ir.children[0]
         nodes[ir] = [
             default_node_single(
                 rec.state["context"],
                 ir,
                 ir_context,
                 channels[ir].reserve_input_slot(),
-                channels[ir.children[0]].reserve_output_slot(),
+                channels[source].reserve_output_slot(),
+                fused=fused,
             )
         ]
     else:

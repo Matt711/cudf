@@ -10,6 +10,7 @@ import itertools
 import math
 import operator
 import struct
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -36,6 +37,7 @@ from rapidsmpf.streaming.coll.allgather import AllGather
 from rapidsmpf.streaming.core.message import Message
 
 from cudf_polars.containers import DataFrame
+from cudf_polars.streaming import remote_io
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
 from cudf_polars.streaming.actor_graph.partitioning import NormalizedPartitioning
 from cudf_polars.streaming.actor_graph.tracing import (
@@ -474,6 +476,9 @@ def _evaluate_chunk_sync(
     )
 
 
+_INLINE_CHEAP = bool(__import__("os").environ.get("CUDF_POLARS_INLINE_CHEAP"))
+
+
 async def evaluate_chunk(
     context: Context,
     chunk: TableChunk,
@@ -524,14 +529,31 @@ async def evaluate_chunk(
         )
     with opaque_memory_usage(reservation):
         for single_ir in irs:
-            chunk = await ir_context.to_thread(
-                _evaluate_chunk_sync,
-                chunk,
-                single_ir,
-                ir_context,
-                context.br(),
-                ordering_metadata=ordering_metadata,
-            )
+            if _INLINE_CHEAP and type(single_ir).__name__ in ("Projection", "Select"):
+                # Experiment: cheap column selections run inline, without a thread hop.
+                chunk = _evaluate_chunk_sync(
+                    chunk,
+                    single_ir,
+                    ir_context,
+                    context.br(),
+                    ordering_metadata=ordering_metadata,
+                )
+            else:
+                _t0 = time.perf_counter()
+                chunk = await ir_context.to_thread(
+                    _evaluate_chunk_sync,
+                    chunk,
+                    single_ir,
+                    ir_context,
+                    context.br(),
+                    ordering_metadata=ordering_metadata,
+                )
+                remote_io.trace(
+                    f"op:{type(single_ir).__name__}",
+                    id(single_ir) & 0xFFFF,
+                    0,
+                    int((time.perf_counter() - _t0) * 1e6),
+                )
             ordering_metadata = None
         return chunk
 
@@ -674,6 +696,7 @@ async def chunkwise_evaluate(
     input_metadata: ChannelMetadata | None = None,
     handle_empty_input: bool = False,
     tracer: ActorTracer | None = None,
+    fused: tuple[IR, ...] = (),
 ) -> None:
     """
     Apply IR evaluation chunk-by-chunk.
@@ -731,6 +754,7 @@ async def chunkwise_evaluate(
         result = await evaluate_chunk(
             context,
             TableChunk.from_message(msg, br=context.br()),
+            *fused,
             ir,
             ir_context=chunk_ir_context,
             ordering_metadata=input_ordering_metadata,
@@ -739,10 +763,15 @@ async def chunkwise_evaluate(
         await send_chunk(context, ch_out, result, seq_num, tracer=tracer)
 
     if handle_empty_input and not received_any:
-        chunk = empty_table_chunk(ir.children[0], context, ir_context.get_cuda_stream())
+        chunk = empty_table_chunk(
+            (fused[0] if fused else ir).children[0],
+            context,
+            ir_context.get_cuda_stream(),
+        )
         result = await evaluate_chunk(
             context,
             chunk,
+            *fused,
             ir,
             ir_context=ir_context,
             ordering_metadata=input_ordering_metadata,
