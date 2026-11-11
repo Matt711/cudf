@@ -717,6 +717,9 @@ async def scan_node(
         )
         if partitioning is not None and tracer is not None:
             tracer.decision = "parquet_ordering"
+        if partitioning is None:
+            # Remote scans may split their last whole-file tasks (decided before any footer).
+            tasks = remote_fetch.split_tail(tasks)
         await send_metadata(
             ch_out,
             context,

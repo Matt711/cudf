@@ -655,6 +655,7 @@ class SPMDEngine(StreamingEngine):
                 reactors=int(os.environ.get("CUDF_POLARS_SCAN_IO_REACTORS", "8")),
                 connections=int(os.environ.get("CUDF_POLARS_SCAN_IO_CONNECTIONS", "32")),
                 footer_threads=int(os.environ.get("CUDF_POLARS_SCAN_IO_FOOTER_THREADS", "32")),
+                inflight_bytes=int(os.environ.get("CUDF_POLARS_SCAN_IO_INFLIGHT_MB", "0")) << 20,
                 endpoint=os.environ.get("CUDF_POLARS_SCAN_IO_ENDPOINT") or None,
             )
             if warm := os.environ.get("CUDF_POLARS_SCAN_IO_WARMUP_URL"):

@@ -48,6 +48,9 @@ cdef class ScanIO:
         A request slower than 64 KiB/s for this long is retried.
     footer_threads : int, default 32
         Footer requests in flight.
+    inflight_bytes : int, default 0
+        Bytes of reads on the network at once (0: no limit). Reads are issued in task order,
+        so a limit near bandwidth x latency makes tasks land roughly in order.
     """
 
     cdef unique_ptr[cpp_scan_io] c_obj
@@ -65,6 +68,7 @@ cdef class ScanIO:
         size_t connections=32,
         size_t stall_seconds=5,
         size_t footer_threads=32,
+        size_t inflight_bytes=0,
     ):
         cdef cpp_scan_io_config cfg
         cfg.endpoint = endpoint.encode()
@@ -77,6 +81,7 @@ cdef class ScanIO:
         cfg.connections = connections
         cfg.stall_seconds = stall_seconds
         cfg.footer_threads = footer_threads
+        cfg.inflight_bytes = inflight_bytes
         with nogil:
             self.c_obj.reset(new cpp_scan_io(cfg))
 

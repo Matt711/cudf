@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.streaming.io import ScanTask
 
-__all__ = ["RemoteFetchAhead", "enabled", "materialize"]
+__all__ = ["RemoteFetchAhead", "enabled", "materialize", "split_tail"]
 
 
 def enabled(tasks: Sequence[ScanTask]) -> bool:
@@ -45,6 +45,49 @@ def enabled(tasks: Sequence[ScanTask]) -> bool:
     return bool(tasks) and all(
         isinstance(t, ParquetScanTask) and remote_io.eligible(t) for t in tasks
     )
+
+
+def split_tail(tasks: Sequence[ScanTask]) -> list[ScanTask]:
+    """
+    Split a remote scan's last whole-file tasks into row-group pieces.
+
+    The work left after a scan's last byte lands is its last chunks' decode and their way through
+    the query, so smaller last chunks shorten it; earlier chunks stay whole (each chunk costs a
+    fixed amount downstream). ``CUDF_POLARS_SCAN_TAIL_SPLIT=KxN`` splits the last K single-file
+    tasks into N pieces each (off when unset).
+    """
+    spec = os.environ.get("CUDF_POLARS_SCAN_TAIL_SPLIT", "")
+    if not spec or not enabled(tasks):
+        return list(tasks)
+    k, n = (int(x) for x in spec.lower().split("x"))
+    result: list[ScanTask] = list(tasks)
+    if len(result) < 2 * max(k, 8):
+        # Small scans (a few files, few row groups) are left whole.
+        return result
+    start = max(0, len(result) - k)
+    pieces: list[ScanTask] = []
+    for task in result[start:]:
+        if (
+            n > 1
+            and isinstance(task, ParquetScanTask)
+            and len(task.paths) == 1
+            and task.total_splits == 1
+        ):
+            pieces.extend(
+                ParquetScanTask(
+                    task.base_scan,
+                    list(task.paths),
+                    i,
+                    n,
+                    task.parquet_options,
+                    task.hive_parts,
+                    task.lake_options,
+                )
+                for i in range(n)
+            )
+        else:
+            pieces.append(task)
+    return result[:start] + pieces
 
 
 _stats: dict[str, Any] = {}
@@ -194,6 +237,7 @@ class RemoteFetchAhead:
         # feeder then plans each task as soon as its footers are in.
         self._service.request_footers([p for t in self._tasks for p in t.paths])
         self._stream = self._service.open_stream()
+        remote_io.trace("scan_start", self._stream, -1, len(self._tasks))
         self._feeder = asyncio.ensure_future(self._feed())
 
     async def close(self) -> None:
@@ -230,6 +274,7 @@ class RemoteFetchAhead:
                 )
                 next_plan += 1
             plan = await plans.pop(i)
+            remote_io.trace("planned", self._stream, i, plan.nbytes)
             task_id = self._service.submit(
                 self._stream,
                 plan.paths,
@@ -245,6 +290,9 @@ class RemoteFetchAhead:
                 _count("staged_bytes", plan.nbytes)
                 staged = Staged(plan, task_id)
                 self._read[i] = self._watch(task_id)
+                self._read[i].add_done_callback(
+                    lambda _, i=i, n=plan.nbytes: remote_io.trace("landed", self._stream, i, n)
+                )
             self._staged[i] = staged
             self._launched[i].set()
 
@@ -266,6 +314,7 @@ class RemoteFetchAhead:
         if read is not None:
             await asyncio.wait([read])  # a read error surfaces again from the copy to device
         _count("producer_wait_s", time.perf_counter() - t0)
+        remote_io.trace("taken", self._stream, i, 0)
         async with self._cond:
             self._taken += 1
             self._cond.notify_all()

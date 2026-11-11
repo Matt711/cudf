@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import collections
+import os
+
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, assert_never
@@ -446,6 +450,34 @@ async def _broadcast_join_large_chunk(
     tracer: ActorTracer | None,
 ) -> int:
     """Join one large-side chunk with the small DataFrame(s) and send the result."""
+    output_chunk = await _broadcast_join_large_chunk_compute(
+        context,
+        ir,
+        ir_context,
+        small_dfs,
+        small_child,
+        large_chunk,
+        large_child,
+        small_size,
+        broadcast_side,
+    )
+    output_rows = output_chunk.shape[0]
+    await send_chunk(context, ch_out, output_chunk, seq_num, tracer=tracer)
+    return output_rows
+
+
+async def _broadcast_join_large_chunk_compute(
+    context: Context,
+    ir: Join,
+    ir_context: IRExecutionContext,
+    small_dfs: list[DataFrame],
+    small_child: IR,
+    large_chunk: TableChunk,
+    large_child: IR,
+    small_size: int,
+    broadcast_side: Literal["left", "right"],
+) -> TableChunk:
+    """Join one large-side chunk with the small DataFrame(s); returns the output chunk."""
     large_df = chunk_to_frame(large_chunk, large_child)
     large_chunk_size = large_chunk.data_alloc_size()
 
@@ -475,10 +507,8 @@ async def _broadcast_join_large_chunk(
     output_chunk = TableChunk.from_pylibcudf_table(
         df.table, df.stream, exclusive_view=True, br=context.br()
     )
-    output_rows = output_chunk.shape[0]
-    await send_chunk(context, ch_out, output_chunk, seq_num, tracer=tracer)
     del df, large_df
-    return output_rows
+    return output_chunk
 
 
 async def broadcast_join(
@@ -558,6 +588,18 @@ async def broadcast_join(
 
     input_rows = 0
     output_rows = 0
+    # Experiment: up to ``concurrency`` large-side chunks join at once (they are independent);
+    # results are still sent in the order the chunks arrived.
+    concurrency = max(1, int(os.environ.get("CUDF_POLARS_JOIN_CONCURRENCY", "1")))
+    pending: collections.deque[tuple[asyncio.Future, int]] = collections.deque()
+
+    async def _send_oldest() -> None:
+        nonlocal output_rows
+        future, seq = pending.popleft()
+        output_chunk = await future
+        output_rows += output_chunk.shape[0]
+        await send_chunk(context, ch_out, output_chunk, seq, tracer=tracer)
+
     while (msg := await large_ch.recv(context)) is not None:
         # Unknown: the large chunk is freed but the join output replaces
         # it, and its size depends on selectivity we cannot estimate here.
@@ -568,20 +610,28 @@ async def broadcast_join(
             net_memory_delta=missing_net_memory_delta,
         )
         input_rows += large_chunk.shape[0]
-        output_rows += await _broadcast_join_large_chunk(
-            context,
-            ir,
-            ir_context,
-            ch_out,
-            small_dfs,
-            small_child,
-            large_chunk,
-            large_child,
-            msg.sequence_number,
-            small_size,
-            broadcast_side,
-            tracer=tracer,
+        pending.append(
+            (
+                asyncio.ensure_future(
+                    _broadcast_join_large_chunk_compute(
+                        context,
+                        ir,
+                        ir_context,
+                        small_dfs,
+                        small_child,
+                        large_chunk,
+                        large_child,
+                        small_size,
+                        broadcast_side,
+                    )
+                ),
+                msg.sequence_number,
+            )
         )
+        if len(pending) >= concurrency:
+            await _send_oldest()
+    while pending:
+        await _send_oldest()
 
     if prefilter_statistics is not None:
         prefilter_statistics.input_rows = input_rows

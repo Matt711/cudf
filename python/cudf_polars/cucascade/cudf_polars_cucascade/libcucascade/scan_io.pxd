@@ -29,6 +29,7 @@ cdef extern from "scan_io.hpp" namespace "cudf_polars_cucascade" nogil:
         size_t stall_seconds
         size_t arena_bytes
         size_t footer_threads
+        size_t inflight_bytes
 
     cdef cppclass scan_io:
         scan_io(const scan_io_config& cfg) except +libcucascade_exception_handler

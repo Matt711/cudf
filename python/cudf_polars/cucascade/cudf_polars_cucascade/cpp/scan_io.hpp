@@ -45,6 +45,11 @@ struct scan_io_config {
   std::size_t stall_seconds{5};   ///< a GET slower than 64 KiB/s for this long is retried
   std::size_t arena_bytes{0};     ///< pinned staging arena, pinned once at construction
   std::size_t footer_threads{32};  ///< concurrent footer requests
+  /// Bytes of reads in flight on the network at once (0: no limit). Reads are issued in the order
+  /// the tasks got their blocks, so with a limit of about bandwidth x latency the tasks complete
+  /// roughly in order and decodes start as soon as the first one lands, instead of every task in
+  /// flight sharing the bandwidth and finishing together.
+  std::size_t inflight_bytes{0};
 };
 
 /**
@@ -171,11 +176,25 @@ class scan_io {
   std::shared_ptr<footer_entry> footer_entry_for(std::string const& path, bool request);
   void load_footer(std::string const& path, footer_entry& entry);
 
+  struct read_batch {
+    std::size_t file;
+    std::vector<cucascade::io::slice> slices;
+    std::size_t bytes;
+  };
+  struct queued_batch {
+    std::int64_t id;
+    std::shared_ptr<task> t;
+    read_batch batch;
+  };
+  /// Bytes per vectored read call (the engine spreads one call over at most two reactors).
+  static constexpr std::size_t batch_bytes = 64UL << 20;
+  [[nodiscard]] std::vector<read_batch> plan_reads(task const& t) const;
+
   void scheduler_main();
   [[nodiscard]] std::pair<std::int64_t, std::shared_ptr<task>> next_grant();  // mutex_ held
   [[nodiscard]] bool try_allocate(task& t);                                    // mutex_ held
-  void issue_reads(std::int64_t id, std::shared_ptr<task> const& t);           // no lock
-  void finish_read(std::int64_t id, std::shared_ptr<task> const& t, std::exception_ptr error);
+  void issue(queued_batch q);  // no lock
+  void finish_read(std::shared_ptr<task> const& t, std::size_t bytes, std::exception_ptr error);
   std::shared_ptr<task> find(std::int64_t id);
 
   std::unique_ptr<cucascade::memory::memory_reservation_manager> _memory;
@@ -204,6 +223,9 @@ class scan_io {
   std::int64_t _next_id{0};
   bool _stop{false};
   std::size_t _fetched_bytes{0};
+  std::size_t _inflight_limit{0};
+  std::size_t _inflight{0};             // bytes of issued, unfinished reads
+  std::deque<queued_batch> _to_issue;  // read batches of granted tasks, in grant order
   std::thread _scheduler;
 };
 

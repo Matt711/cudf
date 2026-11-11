@@ -14,10 +14,12 @@ reader. Nothing here touches KvikIO or a ``SourceInfo`` of a remote path.
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import functools
 import os
 import threading
+import time
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import pylibcudf as plc
@@ -61,6 +63,7 @@ def configure_scan_io(
     reactors: int = 8,
     connections: int = 32,
     footer_threads: int = 32,
+    inflight_bytes: int = 0,
     endpoint: str | None = None,
 ) -> Any:
     """Create the process-wide service (once), with credentials from the environment."""
@@ -82,6 +85,7 @@ def configure_scan_io(
                 reactors=reactors,
                 connections=connections,
                 footer_threads=footer_threads,
+                inflight_bytes=inflight_bytes,
             )
         return _service
 
@@ -352,6 +356,9 @@ def materialize(
     )
 
 
+_query = {"index": -1, "t0": 0.0}
+
+
 def begin_query() -> None:
     """
     Start of a query: forget the previous query's footers.
@@ -361,3 +368,29 @@ def begin_query() -> None:
     if _service is not None:
         _service.clear_footers()
         _physical_types.cache_clear()
+        _query["index"] += 1
+        _query["t0"] = time.perf_counter()
+        trace("query", -1, -1, 0)
+
+
+_trace: list[tuple] = []
+
+
+def trace(event: str, scan: int, task: int, nbytes: int) -> None:
+    """Record an I/O event (seconds since the query started) when CUDF_POLARS_IO_TRACE is set."""
+    if _TRACE_PATH:
+        _trace.append(
+            (_query["index"], round(time.perf_counter() - _query["t0"], 4), event, scan, task, nbytes)
+        )
+
+
+def _dump_trace() -> None:
+    if _TRACE_PATH and _trace:
+        with open(_TRACE_PATH, "w") as f:
+            f.write("query\tt\tevent\tscan\ttask\tbytes\n")
+            for row in _trace:
+                f.write("\t".join(map(str, row)) + "\n")
+
+
+_TRACE_PATH = os.environ.get("CUDF_POLARS_IO_TRACE")
+atexit.register(_dump_trace)
