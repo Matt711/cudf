@@ -72,11 +72,10 @@ std::unique_ptr<cudf::column> evaluate(std::vector<expr_node> const& nodes,
                                        ::cuda::stream_ref stream)
 {
   CUDF_EXPECTS(!nodes.empty(), "probe_pipeline: empty expression");
-  // Each node's value: a column (owned or a view into `t`) or a literal.
+  // Each node's value: a column (owned or a view into `t`) or a scalar.
   std::vector<std::unique_ptr<cudf::column>> owned(nodes.size());
   std::vector<cudf::column_view> views(nodes.size());
-  std::vector<std::unique_ptr<cudf::numeric_scalar<double>>> scalars(nodes.size());
-  auto const f64 = cudf::data_type{cudf::type_id::FLOAT64};
+  std::vector<std::unique_ptr<cudf::scalar>> scalars(nodes.size());
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     auto const& n = nodes[i];
     switch (n.op) {
@@ -85,32 +84,40 @@ std::unique_ptr<cudf::column> evaluate(std::vector<expr_node> const& nodes,
       case expr_node::literal:
         scalars[i] = std::make_unique<cudf::numeric_scalar<double>>(n.value, true, stream);
         break;
+      case expr_node::str_literal:
+        scalars[i] = std::make_unique<cudf::string_scalar>(n.text, true, stream);
+        break;
       case expr_node::year:
         owned[i] = cudf::datetime::extract_datetime_component(
           views[n.lhs], cudf::datetime::datetime_component::YEAR, stream);
-        views[i] = owned[i]->view();
         break;
       case expr_node::cast:
-        owned[i] = cudf::cast(views[n.lhs],
-                              cudf::data_type{static_cast<cudf::type_id>(n.binop)},
-                              stream);
-        views[i] = owned[i]->view();
+        owned[i] = cudf::cast(
+          views[n.lhs], cudf::data_type{static_cast<cudf::type_id>(n.binop)}, stream);
         break;
       case expr_node::binary: {
-        auto const l_lit = scalars[n.lhs] != nullptr;
-        auto const r_lit = scalars[n.rhs] != nullptr;
-        CUDF_EXPECTS(!(l_lit && r_lit), "probe_pipeline: binary of two literals");
-        if (l_lit) {
-          owned[i] = cudf::binary_operation(*scalars[n.lhs], views[n.rhs], static_cast<cudf::binary_operator>(n.binop), f64, stream);
-        } else if (r_lit) {
-          owned[i] = cudf::binary_operation(views[n.lhs], *scalars[n.rhs], static_cast<cudf::binary_operator>(n.binop), f64, stream);
-        } else {
-          owned[i] = cudf::binary_operation(views[n.lhs], views[n.rhs], static_cast<cudf::binary_operator>(n.binop), f64, stream);
-        }
-        views[i] = owned[i]->view();
+        auto const op  = static_cast<cudf::binary_operator>(n.binop);
+        auto const out = cudf::data_type{static_cast<cudf::type_id>(n.dtype)};
+        auto const* l  = scalars[n.lhs].get();
+        auto const* r  = scalars[n.rhs].get();
+        CUDF_EXPECTS(!(l && r), "probe_pipeline: binary of two literals");
+        owned[i] = l   ? cudf::binary_operation(*l, views[n.rhs], op, out, stream)
+                   : r ? cudf::binary_operation(views[n.lhs], *r, op, out, stream)
+                       : cudf::binary_operation(views[n.lhs], views[n.rhs], op, out, stream);
+        break;
+      }
+      case expr_node::ternary: {
+        auto const* a = scalars[n.rhs].get();
+        auto const* b = scalars[n.third].get();
+        auto const& mask = views[n.lhs];
+        owned[i] = a && b ? cudf::copy_if_else(*a, *b, mask, stream)
+                   : a    ? cudf::copy_if_else(*a, views[n.third], mask, stream)
+                   : b    ? cudf::copy_if_else(views[n.rhs], *b, mask, stream)
+                          : cudf::copy_if_else(views[n.rhs], views[n.third], mask, stream);
         break;
       }
     }
+    if (owned[i]) { views[i] = owned[i]->view(); }
   }
   CUDF_EXPECTS(owned.back() != nullptr, "probe_pipeline: an expression must compute a column");
   return std::move(owned.back());

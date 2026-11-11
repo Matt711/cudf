@@ -96,9 +96,12 @@ cdef extern from "probe_pipeline.hpp" namespace "cudf_polars_cucascade" nogil:
         int op
         int column_index
         double value
+        string text
         int binop
+        int dtype
         int lhs
         int rhs
+        int third
 
     cdef cppclass stage:
         int op

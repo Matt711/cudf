@@ -34,13 +34,24 @@ namespace cudf_polars_cucascade {
  * the last node is the result.
  */
 struct expr_node {
-  enum kind : int { column = 0, literal = 1, binary = 2, year = 3, cast = 4 };
+  enum kind : int {
+    column      = 0,
+    literal     = 1,
+    binary      = 2,
+    year        = 3,
+    cast        = 4,
+    str_literal = 5,
+    ternary     = 6,
+  };
   int op{column};
   int column_index{0};  ///< column: index into the current table
   double value{0.0};    ///< literal: a float64 scalar
+  std::string text;     ///< str_literal
   int binop{0};         ///< binary: a cudf::binary_operator; cast: a cudf::type_id
-  int lhs{0};           ///< binary, year, cast: operand node
-  int rhs{0};           ///< binary: operand node
+  int dtype{10};        ///< binary: the result's cudf::type_id (FLOAT64 by default)
+  int lhs{0};           ///< binary, year, cast: operand node; ternary: the condition
+  int rhs{0};           ///< binary: operand node; ternary: the value where true
+  int third{0};         ///< ternary: the value where false
 };
 
 /** @brief One step of a probe chain, applied to each decoded chunk in order. */

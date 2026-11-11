@@ -67,6 +67,19 @@ _BINOPS = {
     plc.binaryop.BinaryOperator.TRUE_DIV,
 }
 _F64 = plc.TypeId.FLOAT64
+_BOOL = plc.TypeId.BOOL8
+_PREDICATES = {
+    plc.binaryop.BinaryOperator.EQUAL,
+    plc.binaryop.BinaryOperator.NOT_EQUAL,
+    plc.binaryop.BinaryOperator.LESS,
+    plc.binaryop.BinaryOperator.LESS_EQUAL,
+    plc.binaryop.BinaryOperator.GREATER,
+    plc.binaryop.BinaryOperator.GREATER_EQUAL,
+    plc.binaryop.BinaryOperator.LOGICAL_AND,
+    plc.binaryop.BinaryOperator.LOGICAL_OR,
+    plc.binaryop.BinaryOperator.NULL_LOGICAL_AND,
+    plc.binaryop.BinaryOperator.NULL_LOGICAL_OR,
+}
 _NUMERIC = {
     plc.TypeId.INT16,
     plc.TypeId.INT32,
@@ -96,15 +109,27 @@ def _expr(e: E.Expr, names: list[str], nodes: list[dict]) -> int:
     if isinstance(e, E.Col):
         nodes.append({"op": "column", "column": names.index(e.name)})
     elif isinstance(e, E.Literal):
-        if e.dtype.plc_type.id() not in (_F64, plc.TypeId.INT32, plc.TypeId.INT64):
+        tid = e.dtype.plc_type.id()
+        if tid == plc.TypeId.STRING:
+            nodes.append({"op": "str_literal", "text": e.value})
+        elif tid in (_F64, plc.TypeId.INT32, plc.TypeId.INT64):
+            nodes.append({"op": "literal", "value": float(e.value)})
+        else:
             raise _NoMatch(f"literal of {e.dtype}")
-        nodes.append({"op": "literal", "value": float(e.value)})
-    elif isinstance(e, E.BinOp) and e.op in _BINOPS:
-        if e.dtype.plc_type.id() != _F64:
+    elif isinstance(e, E.BinOp) and (e.op in _BINOPS or e.op in _PREDICATES):
+        out = e.dtype.plc_type.id()
+        if out != (_F64 if e.op in _BINOPS else _BOOL):
             raise _NoMatch(f"binary op of {e.dtype}")
         lhs = _expr(e.children[0], names, nodes)
         rhs = _expr(e.children[1], names, nodes)
-        nodes.append({"op": "binary", "binop": int(e.op), "lhs": lhs, "rhs": rhs})
+        nodes.append(
+            {"op": "binary", "binop": int(e.op), "dtype": int(out), "lhs": lhs, "rhs": rhs}
+        )
+    elif isinstance(e, E.Ternary):
+        if e.dtype.plc_type.id() != _F64:
+            raise _NoMatch(f"ternary of {e.dtype}")
+        cond, then, otherwise = (_expr(c, names, nodes) for c in e.children)
+        nodes.append({"op": "ternary", "lhs": cond, "rhs": then, "third": otherwise})
     elif (
         isinstance(e, E.TemporalFunction)
         and e.name == E.TemporalFunction.Name.Year

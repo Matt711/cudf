@@ -255,7 +255,15 @@ cdef class ScanIO:
         )
 
 
-_EXPR_OPS = {"column": 0, "literal": 1, "binary": 2, "year": 3, "cast": 4}
+_EXPR_OPS = {
+    "column": 0,
+    "literal": 1,
+    "binary": 2,
+    "year": 3,
+    "cast": 4,
+    "str_literal": 5,
+    "ternary": 6,
+}
 _STAGE_OPS = {"join": 0, "compute": 1, "select": 2, "groupby": 3}
 
 
@@ -266,9 +274,12 @@ cdef vector[expr_node] _expr(list nodes):
         n.op = _EXPR_OPS[d["op"]]
         n.column_index = d.get("column", 0)
         n.value = d.get("value", 0.0)
+        n.text = d.get("text", "").encode()
         n.binop = int(d.get("binop", 0))
+        n.dtype = int(d.get("dtype", 10))
         n.lhs = d.get("lhs", 0)
         n.rhs = d.get("rhs", 0)
+        n.third = d.get("third", 0)
         out.push_back(n)
     return out
 
