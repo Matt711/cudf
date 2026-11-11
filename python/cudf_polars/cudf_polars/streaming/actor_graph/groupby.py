@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
+import collections
+import os
 from typing import TYPE_CHECKING, Any
 
 import pylibcudf as plc
@@ -187,6 +190,9 @@ class DecomposedGroupBy:
         )
 
 
+_GROUPBY_CONCURRENCY = max(1, int(os.environ.get("CUDF_POLARS_GROUPBY_CONCURRENCY", "1")))
+
+
 async def _local_aggregation(
     context: Context,
     decomposed: DecomposedGroupBy,
@@ -228,20 +234,33 @@ async def _local_aggregation(
     chunks_received = 0
     input_drained = False
     evaluated_chunks: list[TableChunk] = []
-    while True:
-        msg = await ch_in.recv(context)
-        if msg is None:
-            input_drained = True
-            break
+    # Experiment: up to _GROUPBY_CONCURRENCY piecewise aggregations in flight, consumed in the
+    # order the chunks arrived.
+    pending: collections.deque[asyncio.Task] = collections.deque()
 
-        chunks_received += 1
+    async def _piecewise(msg: Any) -> TableChunk:
         chunk = await evaluate_chunk(
             context,
             TableChunk.from_message(msg, br=context.br()),
             decomposed.piecewise_ir,
             ir_context=ir_context,
         )
-        chunk = _enforce_schema(chunk, decomposed.piecewise_ir.schema, context.br())
+        return _enforce_schema(chunk, decomposed.piecewise_ir.schema, context.br())
+
+    while True:
+        if not input_drained and len(pending) < _GROUPBY_CONCURRENCY:
+            msg = await ch_in.recv(context)
+            if msg is None:
+                input_drained = True
+            else:
+                chunks_received += 1
+                pending.append(asyncio.ensure_future(_piecewise(msg)))
+                del msg
+                if len(pending) < _GROUPBY_CONCURRENCY:
+                    continue
+        if not pending:
+            break
+        chunk = await pending.popleft()
 
         total_size += chunk.data_alloc_size()
         evaluated_chunks.append(chunk)
@@ -256,6 +275,10 @@ async def _local_aggregation(
             ]
             total_size = evaluated_chunks[0].data_alloc_size()
         if total_size > target_partition_size and allow_early_exit:
+            # Chunks already received are part of this aggregation.
+            for task in pending:
+                evaluated_chunks.append(await task)
+            pending.clear()
             break
 
     aggregated: TableChunk
