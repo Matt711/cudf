@@ -1008,7 +1008,7 @@ def _evaluate_on_rank(
 
     # Remote parquet footers are fetched by the scans themselves, in parallel and without a stage
     # before the actor network; cold reads fetch them again for every query.
-    remote_io.begin_query()
+    remote_io.begin_query(ir)
 
     with ReserveOpIDs(ir, config_options) as collective_id_map:
         return execute_ir_on_rank(

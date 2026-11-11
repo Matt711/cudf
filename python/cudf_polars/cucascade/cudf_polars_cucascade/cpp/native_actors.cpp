@@ -99,6 +99,17 @@ void stream_wait(::cuda::stream_ref waiter, ::cuda::stream_ref waited)
   return stream;
 }
 
+// A scan's fetch priority (CUDF_POLARS_SCAN_PRIORITY=1): its task count, so smaller scans go
+// first; 0 for every scan otherwise.
+std::int64_t scan_priority(std::size_t num_tasks)
+{
+  static bool const enabled = [] {
+    auto const* v = std::getenv("CUDF_POLARS_SCAN_PRIORITY");
+    return v != nullptr && std::string{v} == "1";
+  }();
+  return enabled ? static_cast<std::int64_t>(num_tasks) : 0;
+}
+
 // How long a producer waiting on the scan service sleeps between checks (after yielding its
 // executor thread), so waiting costs neither a thread nor a spinning core.
 constexpr auto poll_interval = std::chrono::microseconds(100);
@@ -364,7 +375,7 @@ rs::Actor scan_source(std::shared_ptr<rs::Context> ctx,
   }
   auto st = std::make_shared<scan_state>();
   st->plans.resize(tasks.size());
-  auto const stream_id = io->open_stream();
+  auto const stream_id = io->open_stream(scan_priority(tasks.size()));
   std::thread planner(plan_tasks,
                       io,
                       stream_id,

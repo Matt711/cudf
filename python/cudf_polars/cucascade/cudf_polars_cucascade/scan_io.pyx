@@ -177,9 +177,14 @@ cdef class ScanIO:
         with nogil:
             self.c_obj.get().clear_footers()
 
-    def open_stream(self) -> int:
-        """Open a stream: one scan's tasks, given blocks in their own submission order."""
-        return self.c_obj.get().open_stream()
+    def open_stream(self, int64_t priority=0) -> int:
+        """Open a stream for a scan's tasks; lower ``priority`` is fetched first."""
+        return self.c_obj.get().open_stream(priority)
+
+    def set_expected_streams(self, size_t count) -> None:
+        """How many streams the current query will open (for each one's share of the arena)."""
+        with nogil:
+            self.c_obj.get().set_expected_streams(count)
 
     def close_stream(self, int64_t stream) -> None:
         """Close a stream whose tasks have all been released."""

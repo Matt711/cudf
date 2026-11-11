@@ -118,8 +118,21 @@ class scan_io {
 
   [[nodiscard]] std::size_t arena_bytes() const noexcept { return _arena_bytes; }
 
-  /** @brief Open a stream: a scan's tasks, given blocks in their own submission order. */
-  std::int64_t open_stream();
+  /**
+   * @brief Open a stream: a scan's tasks, given blocks in their own submission order.
+   *
+   * Streams of lower @p priority are given blocks, and have their reads issued, first: small
+   * scans (usually the build sides of joins) then finish early instead of sharing the bandwidth
+   * with the large scan probing them.
+   */
+  std::int64_t open_stream(std::int64_t priority = 0);
+
+  /**
+   * @brief How many streams the current query will open: until they are opened, each stream's
+   * share of the arena counts them, so a stream opened first cannot take the room of those opened
+   * just after it.
+   */
+  void set_expected_streams(std::size_t count);
 
   /** @brief Close a stream whose tasks have all been released. */
   void close_stream(std::int64_t stream);
@@ -231,6 +244,7 @@ class scan_io {
   struct stream_state {
     std::deque<std::int64_t> queue;  // submitted, not yet given a block, in order
     std::size_t held{0};             // arena bytes of its granted, unreleased tasks
+    std::int64_t priority{0};        // lower first
   };
 
   void footer_main();
@@ -279,6 +293,7 @@ class scan_io {
   std::unordered_map<std::int64_t, stream_state> _streams;
   std::int64_t _next_stream{1};
   std::int64_t _rr{0};
+  std::size_t _pending_streams{0};  // expected streams of the query not yet opened
   std::size_t _largest_task{0};
   std::unordered_map<std::int64_t, std::shared_ptr<task>> _tasks;
   std::vector<std::pair<std::size_t, std::size_t>> _free;  // sorted (offset, size)

@@ -530,13 +530,54 @@ def decode_stream(ir_context: Any) -> Any:
     return _decode_streams[0]() if _decode_streams else ir_context.get_cuda_stream()
 
 
-def begin_query() -> None:
+def scan_priority(num_tasks: int) -> int:
+    """
+    A scan's fetch priority in the service: lower is fetched first.
+
+    With ``CUDF_POLARS_SCAN_PRIORITY=1`` it is the scan's task count, so small scans (usually
+    the build sides of joins) finish early instead of sharing the bandwidth with the large scan
+    probing them; otherwise every scan shares equally.
+    """
+    return num_tasks if _scan_priority_enabled() else 0
+
+
+def _scan_priority_enabled() -> bool:
+    return os.environ.get("CUDF_POLARS_SCAN_PRIORITY") == "1"
+
+
+def _remote_scan_count(ir: Any) -> int:
+    # The scans of a lowered plan read through the service, each opening one stream: a native
+    # region's scan (a field of the region, not a child), and the others of more than one task (a
+    # single task is read directly).
+    from cudf_polars.dsl.traversal import traversal
+    from cudf_polars.streaming.io import ParquetScanTask, StreamingScan
+    from cudf_polars.streaming.native import NativeRegion
+
+    count = 0
+    for node in traversal([ir]):
+        native = isinstance(node, NativeRegion)
+        scan = node.scan if native else node
+        if (
+            isinstance(scan, StreamingScan)
+            and (len(scan.tasks) > 1 or (native and scan.tasks))
+            and all(isinstance(t, ParquetScanTask) and eligible(t) for t in scan.tasks)
+        ):
+            count += 1
+    return count
+
+
+def begin_query(ir: Any = None) -> None:
     """
     Start of a query: forget the previous query's footers.
 
-    Cold reads fetch every byte of a query from the object store, footers included.
+    Cold reads fetch every byte of a query from the object store, footers included. With the
+    query's lowered plan, the service is told how many scans it will read, so the first ones
+    cannot take the others' share of the arena.
     """
     if _service is not None:
+        if ir is not None and _scan_priority_enabled():
+            expected = _remote_scan_count(ir)
+            _service.set_expected_streams(expected)
         _service.clear_footers()
         _physical_types.cache_clear()
         _query["index"] += 1
@@ -544,6 +585,8 @@ def begin_query() -> None:
         _channels.clear()
         mark("begin_query")
         trace("query", -1, -1, int((_query["t0"] - _entry[0]) * 1e6) if _entry else 0)
+        if ir is not None and _scan_priority_enabled():
+            trace("expected_streams", -1, -1, expected)
         # Cumulative data bytes fetched and taken from shared chunks, as of this query's start.
         trace("fetched_total", -1, -1, int(_service.fetched_bytes))
         if hasattr(_service, "shared_bytes"):

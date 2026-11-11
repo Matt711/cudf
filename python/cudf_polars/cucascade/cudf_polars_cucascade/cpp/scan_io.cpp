@@ -271,12 +271,21 @@ void scan_io::clear_footers()
 
 // ---------------------------------------------------------------- data
 
-std::int64_t scan_io::open_stream()
+std::int64_t scan_io::open_stream(std::int64_t priority)
 {
   std::lock_guard lock(_mutex);
   auto const id = _next_stream++;
-  _streams.emplace(id, stream_state{});
+  if (_pending_streams > 0) { --_pending_streams; }
+  stream_state s;
+  s.priority = priority;
+  _streams.emplace(id, std::move(s));
   return id;
+}
+
+void scan_io::set_expected_streams(std::size_t count)
+{
+  std::lock_guard lock(_mutex);
+  _pending_streams = count;
 }
 
 void scan_io::close_stream(std::int64_t stream)
@@ -516,16 +525,24 @@ std::pair<std::int64_t, std::shared_ptr<scan_io::task>> scan_io::next_grant()
   for (auto const& [id, s] : _streams) {
     if (s.held == 0) { ++holding_none; }
   }
-  auto const share = _arena_bytes / _streams.size();
-  std::vector<std::int64_t> order;
-  order.reserve(_streams.size());
+  auto const share = _arena_bytes / (_streams.size() + _pending_streams);
+  std::vector<std::int64_t> ids;
+  ids.reserve(_streams.size());
   for (auto const& [id, s] : _streams) {
-    order.push_back(id);
+    ids.push_back(id);
   }
-  std::sort(order.begin(), order.end());
-  auto const start = std::upper_bound(order.begin(), order.end(), _rr) - order.begin();
-  for (std::size_t k = 0; k < order.size(); ++k) {
-    auto const sid = order[(start + k) % order.size()];
+  std::sort(ids.begin(), ids.end());
+  // Round robin from the stream after the last one served, then by priority (stable).
+  auto const start = std::upper_bound(ids.begin(), ids.end(), _rr) - ids.begin();
+  std::vector<std::int64_t> order;
+  order.reserve(ids.size());
+  for (std::size_t k = 0; k < ids.size(); ++k) {
+    order.push_back(ids[(start + k) % ids.size()]);
+  }
+  std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) {
+    return _streams.at(a).priority < _streams.at(b).priority;
+  });
+  for (auto const sid : order) {
     auto& s        = _streams.at(sid);
     if (s.queue.empty()) { continue; }
     auto const id   = s.queue.front();
@@ -591,9 +608,18 @@ void scan_io::scheduler_main()
         // Issue in that order while the bytes in flight stay under the limit.
         while (!_to_issue.empty() &&
                (_inflight_limit == 0 || _inflight == 0 || _inflight < _inflight_limit)) {
-          _inflight += _to_issue.front().batch.bytes;
-          issue_now.push_back(std::move(_to_issue.front()));
-          _to_issue.pop_front();
+          // The oldest batch of the stream of lowest priority.
+          auto priority_of = [&](queued_batch const& q) {
+            auto it = _streams.find(q.t->stream);
+            return it == _streams.end() ? std::int64_t{0} : it->second.priority;
+          };
+          auto best = _to_issue.begin();
+          for (auto it = _to_issue.begin(); it != _to_issue.end(); ++it) {
+            if (priority_of(*it) < priority_of(*best)) { best = it; }
+          }
+          _inflight += best->batch.bytes;
+          issue_now.push_back(std::move(*best));
+          _to_issue.erase(best);
         }
         return !issue_now.empty() || finished_empty;
       });

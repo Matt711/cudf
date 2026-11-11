@@ -400,7 +400,12 @@ class RemoteFetchAhead:
         # Every footer of the scan is requested at once (the service runs them in parallel); the
         # feeder then plans each task as soon as its footers are in.
         self._service.request_footers([p for t in self._tasks for p in t.paths])
-        self._stream = self._service.open_stream()
+        priority = remote_io.scan_priority(len(self._tasks))
+        self._stream = (
+            self._service.open_stream(priority)
+            if priority
+            else self._service.open_stream()
+        )
         remote_io.trace("scan_start", self._stream, -1, len(self._tasks))
         _start_lag_monitor()
         self._feeder = asyncio.ensure_future(self._feed())

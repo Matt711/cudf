@@ -83,7 +83,7 @@ class _Planner:
         service = remote_io.scan_io()
         tasks = self._region.scan.tasks
         service.request_footers([p for t in tasks for p in t.paths])
-        self.stream_id = service.open_stream()
+        self.stream_id = service.open_stream(remote_io.scan_priority(len(tasks)))
         stream = self._ir_context.get_cuda_stream()
         options, residual = remote_io.scan_options(tasks[0], stream)
         self.options = options
