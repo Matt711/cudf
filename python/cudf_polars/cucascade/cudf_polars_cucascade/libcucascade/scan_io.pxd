@@ -3,7 +3,7 @@
 
 from libc.stdint cimport int32_t, int64_t, uint8_t
 from libcpp cimport bool
-from libcpp.memory cimport unique_ptr
+from libcpp.memory cimport shared_ptr, unique_ptr
 from libcpp.string cimport string
 from libcpp.utility cimport pair
 from libcpp.vector cimport vector
@@ -18,6 +18,10 @@ from pylibcudf.libcudf.table.table_view cimport table_view
 from rmm.librmm.device_buffer cimport device_buffer
 
 from cudf_polars_cucascade.exception_handler cimport libcucascade_exception_handler
+from rapidsmpf._detail.exception_handling cimport ex_handler
+from rapidsmpf.streaming.core.actor cimport cpp_Actor
+from rapidsmpf.streaming.core.channel cimport cpp_Channel
+from rapidsmpf.streaming.core.context cimport cpp_Context
 
 
 cdef extern from "scan_io.hpp" namespace "cudf_polars_cucascade" nogil:
@@ -133,3 +137,44 @@ cdef extern from "probe_pipeline.hpp" namespace "cudf_polars_cucascade" nogil:
         void close() except +libcucascade_exception_handler
         pair[int64_t, unique_ptr[table]] next_output() except +libcucascade_exception_handler
         vector[double] stats() except +libcucascade_exception_handler
+
+
+cdef extern from "native_actors.hpp" namespace "cudf_polars_cucascade::actor" nogil:
+
+    cdef cppclass scan_task:
+        vector[string] paths
+        int split_index
+        int total_splits
+
+    cpp_Actor cpp_scan_source "cudf_polars_cucascade::actor::scan_source"(
+        shared_ptr[cpp_Context] ctx,
+        shared_ptr[cpp_Channel] ch_out,
+        scan_io* io,
+        vector[scan_task] tasks,
+        const parquet_reader_options* options,
+        bool prune_with_stats,
+        size_t merge_gap,
+        size_t num_producers,
+        vector[string] columns,
+        vector[int] column_types,
+        size_t max_ahead_bytes,
+    ) except +ex_handler
+
+    cpp_Actor cpp_broadcast "cudf_polars_cucascade::actor::broadcast"(
+        shared_ptr[cpp_Context] ctx,
+        shared_ptr[cpp_Channel] ch_in,
+        vector[shared_ptr[cpp_Channel]] chs_out,
+    ) except +ex_handler
+
+    cpp_Actor cpp_chain "cudf_polars_cucascade::actor::chain"(
+        shared_ptr[cpp_Context] ctx,
+        vector[shared_ptr[cpp_Channel]] ch_builds,
+        vector[vector[int]] build_keys,
+        vector[vector[int]] build_types,
+        shared_ptr[cpp_Channel] ch_in,
+        shared_ptr[cpp_Channel] ch_out,
+        vector[vector[stage]] branches,
+        size_t concurrency,
+        int fold_keys,
+        vector[int] out_types,
+    ) except +ex_handler

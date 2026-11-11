@@ -47,27 +47,6 @@ enum counter : std::size_t {
   n_counters
 };
 
-cudf::table_view select(cudf::table_view t, std::vector<int> const& columns)
-{
-  std::vector<cudf::column_view> cols;
-  cols.reserve(columns.size());
-  std::string sizes;
-  for (auto c : columns) {
-    CUDF_EXPECTS(c >= 0 && c < t.num_columns(),
-                 "probe_pipeline: column " + std::to_string(c) + " of a table with " +
-                   std::to_string(t.num_columns()) + " columns");
-    cols.push_back(t.column(c));
-    sizes += std::to_string(c) + ":" + std::to_string(cols.back().size()) + " ";
-  }
-  for (auto const& col : cols) {
-    CUDF_EXPECTS(col.size() == cols.front().size(),
-                 "probe_pipeline: select of mismatched columns " + sizes + "of a table with " +
-                   std::to_string(t.num_rows()) + " rows");
-  }
-  return cudf::table_view(cols);
-}
-
-
 // Worker streams come from a process-wide pool that is never destroyed: tables built on them
 // (streamed outputs, results) are freed on them after the pipeline is gone.
 cudaStream_t pooled_stream(std::size_t i)
@@ -85,62 +64,6 @@ cudaStream_t pooled_stream(std::size_t i)
 
 }  // namespace
 
-std::unique_ptr<cudf::column> evaluate_expression(std::vector<expr_node> const& nodes,
-                                                  cudf::table_view t,
-                                                  ::cuda::stream_ref stream)
-{
-  CUDF_EXPECTS(!nodes.empty(), "probe_pipeline: empty expression");
-  // Each node's value: a column (owned or a view into `t`) or a scalar.
-  std::vector<std::unique_ptr<cudf::column>> owned(nodes.size());
-  std::vector<cudf::column_view> views(nodes.size());
-  std::vector<std::unique_ptr<cudf::scalar>> scalars(nodes.size());
-  for (std::size_t i = 0; i < nodes.size(); ++i) {
-    auto const& n = nodes[i];
-    switch (n.op) {
-      default: CUDF_FAIL("probe_pipeline: unknown expression node");
-      case expr_node::column: views[i] = t.column(n.column_index); break;
-      case expr_node::literal:
-        scalars[i] = std::make_unique<cudf::numeric_scalar<double>>(n.value, true, stream);
-        break;
-      case expr_node::str_literal:
-        scalars[i] = std::make_unique<cudf::string_scalar>(n.text, true, stream);
-        break;
-      case expr_node::year:
-        owned[i] = cudf::datetime::extract_datetime_component(
-          views[n.lhs], cudf::datetime::datetime_component::YEAR, stream);
-        break;
-      case expr_node::cast:
-        owned[i] = cudf::cast(
-          views[n.lhs], cudf::data_type{static_cast<cudf::type_id>(n.binop)}, stream);
-        break;
-      case expr_node::binary: {
-        auto const op  = static_cast<cudf::binary_operator>(n.binop);
-        auto const out = cudf::data_type{static_cast<cudf::type_id>(n.dtype)};
-        auto const* l  = scalars[n.lhs].get();
-        auto const* r  = scalars[n.rhs].get();
-        CUDF_EXPECTS(!(l && r), "probe_pipeline: binary of two literals");
-        owned[i] = l   ? cudf::binary_operation(*l, views[n.rhs], op, out, stream)
-                   : r ? cudf::binary_operation(views[n.lhs], *r, op, out, stream)
-                       : cudf::binary_operation(views[n.lhs], views[n.rhs], op, out, stream);
-        break;
-      }
-      case expr_node::ternary: {
-        auto const* a = scalars[n.rhs].get();
-        auto const* b = scalars[n.third].get();
-        auto const& mask = views[n.lhs];
-        owned[i] = a && b ? cudf::copy_if_else(*a, *b, mask, stream)
-                   : a    ? cudf::copy_if_else(*a, views[n.third], mask, stream)
-                   : b    ? cudf::copy_if_else(views[n.rhs], *b, mask, stream)
-                          : cudf::copy_if_else(views[n.rhs], views[n.third], mask, stream);
-        break;
-      }
-    }
-    if (owned[i]) { views[i] = owned[i]->view(); }
-  }
-  CUDF_EXPECTS(owned.back() != nullptr, "probe_pipeline: an expression must compute a column");
-  return std::move(owned.back());
-}
-
 probe_pipeline::probe_pipeline(scan_io& io,
                                std::vector<std::vector<stage>> branches,
                                std::vector<cudf::table_view> builds,
@@ -149,13 +72,13 @@ probe_pipeline::probe_pipeline(scan_io& io,
                                std::vector<std::string> input_columns)
   : _io{io},
     _branches(std::move(branches)),
-    _builds(std::move(builds)),
+
     _input_columns(std::move(input_columns)),
     _fold_mutex(_branches.size()),
     _partials(_branches.size()),
     _stats(n_counters, 0.0)
 {
-  CUDF_EXPECTS(_builds.size() == build_keys.size(), "probe_pipeline: one key list per build");
+  CUDF_EXPECTS(builds.size() == build_keys.size(), "probe_pipeline: one key list per build");
   _streamed = _branches.size() == 1 && !_branches[0].empty() &&
               _branches[0].back().op != stage::groupby;
   if (!_streamed) {
@@ -169,10 +92,9 @@ probe_pipeline::probe_pipeline(scan_io& io,
   }
   _out_cap  = 2 * _streams.size();
   _running  = threads;
-  for (std::size_t i = 0; i < _builds.size(); ++i) {
-    _joins.push_back(std::make_unique<cudf::hash_join>(select(_builds[i], build_keys[i]),
-                                                       cudf::null_equality::UNEQUAL,
-                                                       ::cuda::stream_ref{_streams[0]}));
+  for (std::size_t i = 0; i < builds.size(); ++i) {
+    _builds.push_back(
+      make_build_table(builds[i], build_keys[i], ::cuda::stream_ref{_streams[0]}));
   }
   CUDF_CUDA_TRY(cudaStreamSynchronize(_streams[0]));
   for (int i = 0; i < threads; ++i) {
@@ -288,10 +210,12 @@ void probe_pipeline::run_task(std::int64_t id, std::int64_t seq, ::cuda::stream_
       CUDF_EXPECTS(it != info.end(), "probe_pipeline: decoded table has no column " + name);
       order.push_back(static_cast<int>(it - info.begin()));
     }
-    input = select(input, order);
+    input = select_columns(input, order);
   }
   if (_streamed) {
-    auto out = run_branch(_branches[0], input, stream);
+    stage_counters counters;
+    auto out = run_stages(_branches[0], input, _builds, stream, &counters);
+    add_counters(counters);
     stream.sync();  // complete before another thread hands it on
     std::unique_lock lock(_mutex);
     _out_cv.wait(lock, [&] { return _out.size() < _out_cap || _cancel; });
@@ -300,7 +224,9 @@ void probe_pipeline::run_task(std::int64_t id, std::int64_t seq, ::cuda::stream_
     _out_cv.notify_all();
   } else {
     for (std::size_t b = 0; b < _branches.size(); ++b) {
-      auto partial = run_branch(_branches[b], input, stream);
+      stage_counters counters;
+      auto partial = run_stages(_branches[b], input, _builds, stream, &counters);
+      add_counters(counters);
       fold(b, std::move(partial), stream);
     }
   }
@@ -308,122 +234,15 @@ void probe_pipeline::run_task(std::int64_t id, std::int64_t seq, ::cuda::stream_
   _t_last = std::max(_t_last, now());
 }
 
-std::unique_ptr<cudf::table> probe_pipeline::run_branch(std::vector<stage> const& stages,
-                                                        cudf::table_view input,
-                                                        ::cuda::stream_ref stream)
+void probe_pipeline::add_counters(stage_counters const& c)
 {
-  std::unique_ptr<cudf::table> current;  // owns the current view's data after the first stage
-  auto view  = input;
-  bool owned = false;  // whether `view` is all of `current`
-  for (auto const& s : stages) {
-    auto const t0 = now();
-    std::size_t c = 0;
-    switch (s.op) {
-      default: CUDF_FAIL("probe_pipeline: unknown stage");
-      case stage::join: {
-        auto const rows = view.num_rows();
-        auto [probe_idx, build_idx] =
-          _joins[s.build]->inner_join(select(view, s.probe_keys), std::nullopt, stream);
-        auto const n = static_cast<cudf::size_type>(probe_idx->size());
-        auto const i32 = cudf::data_type{cudf::type_id::INT32};
-        auto const probe_map = cudf::column_view(
-          i32, n, static_cast<void const*>(probe_idx->data()), nullptr, 0);
-        auto const build_map = cudf::column_view(
-          i32, n, static_cast<void const*>(build_idx->data()), nullptr, 0);
-        auto probe_out = cudf::gather(select(view, s.keep_probe), probe_map,
-                                      cudf::out_of_bounds_policy::DONT_CHECK, stream);
-        auto build_out = cudf::gather(select(_builds[s.build], s.keep_build), build_map,
-                                      cudf::out_of_bounds_policy::DONT_CHECK, stream);
-        auto cols = probe_out->release();
-        for (auto& col : build_out->release()) {
-          cols.push_back(std::move(col));
-        }
-        current = std::make_unique<cudf::table>(std::move(cols));
-        view    = current->view();
-        owned   = true;
-        c       = join_s;
-        std::lock_guard lock(_stats_mutex);
-        _stats[joins] += 1;
-        if (&s == &stages.front()) {
-          _stats[rows_in] += rows;
-          _stats[rows_out] += n;
-        }
-        break;
-      }
-      case stage::compute: {
-        std::vector<std::unique_ptr<cudf::column>> cols;
-        for (auto i = 0; i < view.num_columns(); ++i) {
-          cols.push_back(std::make_unique<cudf::column>(view.column(i), stream));
-        }
-        for (auto const& e : s.exprs) {
-          cols.push_back(evaluate_expression(e, view, stream));
-        }
-        current = std::make_unique<cudf::table>(std::move(cols));
-        view    = current->view();
-        owned   = true;
-        c       = compute_s;
-        break;
-      }
-      case stage::select: {
-        view  = select(view, s.columns);
-        owned = false;
-        break;
-      }
-      case stage::groupby: {
-        std::vector<cudf::groupby::aggregation_request> requests;
-        for (auto v : s.sums) {
-          cudf::groupby::aggregation_request r;
-          r.values = view.column(v);
-          r.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
-          requests.push_back(std::move(r));
-        }
-        cudf::groupby::groupby gb(select(view, s.keys));
-        auto [keys, results] = gb.aggregate(requests, stream);
-        auto cols = keys->release();
-        for (auto& r : results) {
-          cols.push_back(std::move(r.results.front()));
-        }
-        current = std::make_unique<cudf::table>(std::move(cols));
-        view    = current->view();
-        owned   = true;
-        c       = groupby_s;
-        break;
-      }
-    }
-    if (c != 0) {
-      std::lock_guard lock(_stats_mutex);
-      _stats[c] += now() - t0;
-    }
-  }
-  if (!owned) { return std::make_unique<cudf::table>(view, stream); }
-  return current;
-}
-
-std::unique_ptr<cudf::table> probe_pipeline::aggregate(std::size_t branch,
-                                                       cudf::table_view partials,
-                                                       ::cuda::stream_ref stream) const
-{
-  // Partials hold the keys, then one sum per value column: summing the sums again folds them.
-  auto const& last  = _branches[branch].back();
-  auto const n_keys = static_cast<int>(last.keys.size());
-  std::vector<int> keys(n_keys);
-  for (int i = 0; i < n_keys; ++i) {
-    keys[i] = i;
-  }
-  std::vector<cudf::groupby::aggregation_request> requests;
-  for (int v = n_keys; v < partials.num_columns(); ++v) {
-    cudf::groupby::aggregation_request r;
-    r.values = partials.column(v);
-    r.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
-    requests.push_back(std::move(r));
-  }
-  cudf::groupby::groupby gb(select(partials, keys));
-  auto [k, results] = gb.aggregate(requests, stream);
-  auto cols = k->release();
-  for (auto& r : results) {
-    cols.push_back(std::move(r.results.front()));
-  }
-  return std::make_unique<cudf::table>(std::move(cols));
+  std::lock_guard lock(_stats_mutex);
+  _stats[join_s] += c.join_s;
+  _stats[compute_s] += c.compute_s;
+  _stats[groupby_s] += c.groupby_s;
+  _stats[joins] += c.joins;
+  _stats[rows_in] += c.rows_in;
+  _stats[rows_out] += c.rows_out;
 }
 
 void probe_pipeline::fold(std::size_t branch,
@@ -447,7 +266,8 @@ void probe_pipeline::fold(std::size_t branch,
     views.push_back(t->view());
   }
   auto all    = cudf::concatenate(views, stream);
-  auto folded = aggregate(branch, all->view(), stream);
+  auto folded =
+    fold_sums(all->view(), static_cast<int>(_branches[branch].back().keys.size()), stream);
   stream.sync();
   {
     std::lock_guard lock(_fold_mutex[branch]);
@@ -480,7 +300,8 @@ std::vector<std::unique_ptr<cudf::table>> probe_pipeline::finish()
     }
     CUDF_EXPECTS(!views.empty(), "probe_pipeline: no partial aggregates");
     auto all = cudf::concatenate(views, stream);
-    out.push_back(aggregate(b, all->view(), stream));
+    out.push_back(
+      fold_sums(all->view(), static_cast<int>(_branches[b].back().keys.size()), stream));
   }
   stream.sync();
   for (auto& p : _partials) {

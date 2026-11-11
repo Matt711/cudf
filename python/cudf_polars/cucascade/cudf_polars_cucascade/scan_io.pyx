@@ -19,7 +19,11 @@ from rmm.pylibrmm.device_buffer cimport DeviceBuffer
 from rmm.pylibrmm.stream cimport Stream
 
 from cudf_polars_cucascade.libcucascade.scan_io cimport (
+    cpp_broadcast,
+    cpp_chain,
+    cpp_scan_source,
     evaluate_expression_on,
+    scan_task,
     expr_node,
     planned_task,
     probe_pipeline as cpp_probe_pipeline,
@@ -29,12 +33,23 @@ from cudf_polars_cucascade.libcucascade.scan_io cimport (
 )
 from pylibcudf.libcudf.table.table cimport table
 from pylibcudf.libcudf.table.table_view cimport table_view
+from libcpp.memory cimport make_unique, shared_ptr
 from pylibcudf.column cimport Column
+from rapidsmpf.streaming.core.actor cimport CppActor, cpp_Actor
+from rapidsmpf.streaming.core.channel cimport Channel, cpp_Channel
+from rapidsmpf.streaming.core.context cimport Context
 from pylibcudf.libcudf.column.column cimport column
 from pylibcudf.table cimport Table
 from rmm.pylibrmm.memory_resource cimport DeviceMemoryResource
 
-__all__ = ["ProbePipeline", "ScanIO", "evaluate_expression"]
+__all__ = [
+    "ProbePipeline",
+    "ScanIO",
+    "broadcast_actor",
+    "chain_actor",
+    "evaluate_expression",
+    "scan_source_actor",
+]
 
 
 cdef class ScanIO:
@@ -405,3 +420,110 @@ def evaluate_expression(Table table, list nodes) -> Column:
     import rmm.mr
 
     return Column.from_libcudf(move(result), stream, rmm.mr.get_current_device_resource())
+
+
+def scan_source_actor(
+    Context ctx not None,
+    Channel ch_out not None,
+    ScanIO io not None,
+    list tasks,
+    ParquetReaderOptions options not None,
+    bool prune_with_stats,
+    size_t merge_gap,
+    size_t num_producers,
+    list columns,
+    list column_types,
+    size_t max_ahead_bytes,
+) -> CppActor:
+    """
+    A C++ actor reading a remote parquet scan through ``io``: one chunk per task, in order.
+
+    ``tasks`` are ``(paths, split_index, total_splits)``. ``options`` (columns and filter)
+    and ``io`` are kept alive by the actor. ``columns`` and ``column_types`` (type ids) are
+    the output's, in order.
+    """
+    cdef vector[scan_task] c_tasks
+    cdef scan_task t
+    for paths, split_index, total_splits in tasks:
+        t.paths = [p.encode() for p in paths]
+        t.split_index = split_index
+        t.total_splits = total_splits
+        c_tasks.push_back(t)
+    cdef vector[string] c_columns = [c.encode() for c in columns]
+    cdef vector[int] c_types = column_types
+    cdef cpp_Actor actor
+    with nogil:
+        actor = cpp_scan_source(
+            ctx._handle,
+            ch_out._handle,
+            io.c_obj.get(),
+            move(c_tasks),
+            &options.c_obj,
+            prune_with_stats,
+            merge_gap,
+            num_producers,
+            move(c_columns),
+            move(c_types),
+            max_ahead_bytes,
+        )
+    return CppActor.from_handle(make_unique[cpp_Actor](move(actor)), owner=(io, options))
+
+
+def chain_actor(
+    Context ctx not None,
+    list ch_builds,
+    list build_keys,
+    list build_types,
+    Channel ch_in not None,
+    Channel ch_out not None,
+    list branches,
+    size_t concurrency,
+    int fold_keys,
+    list out_types,
+) -> CppActor:
+    """
+    A C++ actor running ``branches`` of stages on every chunk of ``ch_in``.
+
+    Join stages probe the tables collected from ``ch_builds`` (by index). With
+    ``fold_keys < 0`` each result is sent on; otherwise the results are partial sums with
+    ``fold_keys`` key columns, folded into one chunk cast to ``out_types``.
+    """
+    cdef vector[shared_ptr[cpp_Channel]] c_builds
+    for ch in ch_builds:
+        c_builds.push_back((<Channel?>ch)._handle)
+    cdef vector[vector[int]] c_keys = build_keys
+    cdef vector[vector[int]] c_build_types = build_types
+    cdef vector[vector[stage]] c_branches
+    cdef vector[stage] c_stages
+    for stages in branches:
+        c_stages.clear()
+        for d in stages:
+            c_stages.push_back(_stage(d))
+        c_branches.push_back(c_stages)
+    cdef vector[int] c_out_types = out_types
+    cdef cpp_Actor actor
+    with nogil:
+        actor = cpp_chain(
+            ctx._handle,
+            move(c_builds),
+            move(c_keys),
+            move(c_build_types),
+            ch_in._handle,
+            ch_out._handle,
+            move(c_branches),
+            concurrency,
+            fold_keys,
+            move(c_out_types),
+        )
+    return CppActor.from_handle(make_unique[cpp_Actor](move(actor)), owner=None)
+
+
+def broadcast_actor(Context ctx not None, Channel ch_in not None, list chs_out) -> CppActor:
+    """A C++ actor sending every chunk of ``ch_in``, metadata included, to each of ``chs_out``."""
+    cdef vector[shared_ptr[cpp_Channel]] c_out
+    for ch in chs_out:
+        c_out.push_back((<Channel?>ch)._handle)
+    cdef cpp_Actor actor
+    with nogil:
+        actor = cpp_broadcast(ctx._handle, ch_in._handle, move(c_out))
+    return CppActor.from_handle(make_unique[cpp_Actor](move(actor)), owner=None)

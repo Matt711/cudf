@@ -6,6 +6,7 @@
 #pragma once
 
 #include "scan_io.hpp"
+#include "stages.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/join/hash_join.hpp>
@@ -29,66 +30,6 @@
 #include <vector>
 
 namespace cudf_polars_cucascade {
-
-/**
- * @brief One node of a flattened expression: its operands are earlier nodes of the same list, and
- * the last node is the result.
- */
-struct expr_node {
-  enum kind : int {
-    column      = 0,
-    literal     = 1,
-    binary      = 2,
-    year        = 3,
-    cast        = 4,
-    str_literal = 5,
-    ternary     = 6,
-  };
-  int op{column};
-  int column_index{0};  ///< column: index into the current table
-  double value{0.0};    ///< literal: a float64 scalar
-  std::string text;     ///< str_literal
-  int binop{0};         ///< binary: a cudf::binary_operator; cast: a cudf::type_id
-  int dtype{10};        ///< binary: the result's cudf::type_id (FLOAT64 by default)
-  int lhs{0};           ///< binary, year, cast: operand node; ternary: the condition
-  int rhs{0};           ///< binary: operand node; ternary: the value where true
-  int third{0};         ///< ternary: the value where false
-};
-
-/**
- * @brief Evaluate a flattened expression (see @ref expr_node) against @p table.
- * @return The last node's column.
- */
-std::unique_ptr<cudf::column> evaluate_expression(std::vector<expr_node> const& nodes,
-                                                  cudf::table_view table,
-                                                  ::cuda::stream_ref stream);
-
-/** @brief @ref evaluate_expression on a raw stream (for bindings). */
-inline std::unique_ptr<cudf::column> evaluate_expression_on(std::vector<expr_node> const& nodes,
-                                                            cudf::table_view table,
-                                                            cudaStream_t stream)
-{
-  return evaluate_expression(nodes, table, ::cuda::stream_ref{stream});
-}
-
-/** @brief One step of a probe chain, applied to each decoded chunk in order. */
-struct stage {
-  enum kind : int { join = 0, compute = 1, select = 2, groupby = 3 };
-  int op{select};
-  // join: inner join against a build table; the output is the kept probe columns, then the kept
-  // build columns.
-  int build{0};
-  std::vector<int> probe_keys;
-  std::vector<int> keep_probe;
-  std::vector<int> keep_build;
-  // compute: one appended column per expression
-  std::vector<std::vector<expr_node>> exprs;
-  // select
-  std::vector<int> columns;
-  // groupby (last stage): sum of each value column per key
-  std::vector<int> keys;
-  std::vector<int> sums;
-};
 
 /**
  * @brief Runs probe chains over the decoded tasks of a scan, natively, to partial aggregates.
@@ -144,19 +85,13 @@ class probe_pipeline {
  private:
   void worker_main(int index);
   void run_task(std::int64_t id, std::int64_t seq, ::cuda::stream_ref stream);
-  std::unique_ptr<cudf::table> run_branch(std::vector<stage> const& stages,
-                                          cudf::table_view input,
-                                          ::cuda::stream_ref stream);
   void fold(std::size_t branch, std::unique_ptr<cudf::table> partial, ::cuda::stream_ref stream);
-  std::unique_ptr<cudf::table> aggregate(std::size_t branch,
-                                         cudf::table_view partials,
-                                         ::cuda::stream_ref stream) const;
+  void add_counters(stage_counters const& c);
 
   scan_io& _io;
   std::vector<std::vector<stage>> _branches;
-  std::vector<cudf::table_view> _builds;
+  std::vector<build_table> _builds;
   std::vector<std::string> _input_columns;
-  std::vector<std::unique_ptr<cudf::hash_join>> _joins;
   std::vector<cudaStream_t> _streams;  // one per worker, from a process-wide pool
   std::vector<std::thread> _workers;
 

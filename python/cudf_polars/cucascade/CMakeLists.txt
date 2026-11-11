@@ -26,6 +26,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # libcudf and pylibcudf are the ones installed in this environment: everything here that touches a
 # libcudf type is compiled against them, which is why this is built from source and not shipped.
 find_package(cudf "${RAPIDS_VERSION}" REQUIRED)
+find_package(rapidsmpf REQUIRED)
+find_package(cudf_streaming "${RAPIDS_VERSION}" REQUIRED)
 
 include(rapids-cpm)
 rapids_cpm_init()

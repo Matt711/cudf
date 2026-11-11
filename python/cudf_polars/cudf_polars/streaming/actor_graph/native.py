@@ -161,6 +161,18 @@ def _fold_branches(results: list[plc.Table], n_keys: int, stream: Any) -> plc.Ta
     return plc.Table([*keys.columns(), *(r.columns()[0] for r in aggs)])
 
 
+def _cast_to(table: plc.Table, dtypes: list[Any], stream: Any) -> plc.Table:
+    """``table`` with each column cast to its dtype in ``dtypes`` where they differ."""
+    return plc.Table(
+        [
+            c
+            if c.type() == dtype.plc_type
+            else plc.unary.cast(c, dtype.plc_type, stream=stream)
+            for c, dtype in zip(table.columns(), dtypes, strict=True)
+        ]
+    )
+
+
 @define_actor()
 async def native_region_actor(
     context: Context,
@@ -215,14 +227,11 @@ async def native_region_actor(
 
         stream = ir_context.get_cuda_stream()
         table = _fold_branches(results, program.n_keys, stream)
-        columns = [
-            c
-            if c.type() == dtype.plc_type
-            else plc.unary.cast(c, dtype.plc_type, stream=stream)
-            for c, dtype in zip(table.columns(), ir.schema.values(), strict=True)
-        ]
         df = DataFrame.from_table(
-            plc.Table(columns), list(ir.schema), list(ir.schema.values()), stream
+            _cast_to(table, list(ir.schema.values()), stream),
+            list(ir.schema),
+            list(ir.schema.values()),
+            stream,
         )
         await send_metadata(ch_out, context, ChannelMetadata(local_count=1))
         await send_chunk(
@@ -237,10 +246,183 @@ async def native_region_actor(
         await ch_out.drain(context)
 
 
+# ---------------------------------------------------------------- C++ actors
+
+
+def _actors_mode() -> str:
+    """``CUDF_POLARS_NATIVE_ACTORS``: ``fused`` (default), ``composed`` or ``python``."""
+    return os.environ.get("CUDF_POLARS_NATIVE_ACTORS", "fused")
+
+
+def _stage_groups(stages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """One group per operator: a join, a compute or a group-by, with the selects after it."""
+    groups: list[list[dict[str, Any]]] = []
+    for s in stages:
+        if s["op"] == "select" and groups:
+            groups[-1].append(s)
+        else:
+            groups.append([s])
+    return groups
+
+
+@define_actor()
+async def _fold_branches_actor(
+    context: Context,
+    ir: NativeRegion,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    chs_in: list[Channel[TableChunk]],
+) -> None:
+    """Union branches folded separately (composed mode): fold their sums into one chunk."""
+    async with shutdown_on_error(
+        context,
+        chs_in=tuple(chs_in),
+        chs_out=(ch_out,),
+        trace_ir=ir,
+        ir_context=ir_context,
+    ) as actor_scope:
+        ir_context = actor_scope.require_ir_context()
+        tables: list[plc.Table] = []
+        chunks: list[TableChunk] = []
+        for ch in chs_in:
+            await recv_metadata(ch, context)
+            while (msg := await ch.recv(context)) is not None:
+                chunks.append(TableChunk.from_message(msg, br=context.br()))
+        chunks, _ = await make_table_chunks_available_or_wait(
+            context, chunks, reserve_extra=0, net_memory_delta=0
+        )
+        for chunk in chunks:
+            chunk.stream.synchronize()
+            tables.append(chunk_to_frame(chunk, ir).table)
+        stream = ir_context.get_cuda_stream()
+        table = _fold_branches(tables, ir.program.n_keys, stream)
+        df = DataFrame.from_table(
+            _cast_to(table, list(ir.schema.values()), stream),
+            list(ir.schema),
+            list(ir.schema.values()),
+            stream,
+        )
+        await send_metadata(ch_out, context, ChannelMetadata(local_count=1))
+        await send_chunk(
+            context,
+            ch_out,
+            TableChunk.from_pylibcudf_table(
+                df.table, df.stream, exclusive_view=True, br=context.br()
+            ),
+            0,
+            tracer=actor_scope.tracer,
+        )
+        await ch_out.drain(context)
+
+
+def _cpp_sub_network(
+    ir: NativeRegion, rec: SubNetGenerator
+) -> tuple[dict[IR, list[Any]], dict[IR, ChannelManager]]:
+    from cudf_polars_cucascade.scan_io import (
+        broadcast_actor,
+        chain_actor,
+        scan_source_actor,
+    )
+
+    context = rec.state["context"]
+    actors, channels = process_children(ir, rec)
+    chs_build = [channels[child].reserve_output_slot() for child in ir.children]
+    channels[ir] = ChannelManager(context)
+    ch_out = channels[ir].reserve_input_slot()
+    program = ir.program
+    scan = ir.scan
+    ir_context = ir_context_for_node(rec, ir)
+    options, residual = remote_io.scan_options(
+        scan.tasks[0], ir_context.get_cuda_stream()
+    )
+    if residual is not None:
+        raise RuntimeError("native region: the scan's filter is not fully pushed down")
+    type_id = lambda dtype: int(dtype.plc_type.id())  # noqa: E731
+    build_types = [[type_id(t) for t in child.schema.values()] for child in ir.children]
+    out_types = [type_id(t) for t in ir.schema.values()]
+    concurrency = int(os.environ.get("CUDF_POLARS_NATIVE_THREADS", "4"))
+    nodes: list[Any] = []
+    ch_scan = context.create_channel()
+    nodes.append(
+        scan_source_actor(
+            context,
+            ch_scan,
+            remote_io.scan_io(),
+            [(list(t.paths), t.split_index, t.total_splits) for t in scan.tasks],
+            options,
+            scan.tasks[0].parquet_options._hybrid_scan_stats_pruning,
+            remote_io.MERGE_GAP_BYTES,
+            concurrency,
+            program.input_columns,
+            [type_id(scan.schema[c]) for c in program.input_columns],
+            int(os.environ.get("CUDF_POLARS_NATIVE_PREFETCH_MB", "20480")) << 20,
+        )
+    )
+    if _actors_mode() == "fused":
+        nodes.append(
+            chain_actor(
+                context,
+                chs_build,
+                program.build_keys,
+                build_types,
+                ch_scan,
+                ch_out,
+                program.branches,
+                concurrency,
+                program.n_keys,
+                out_types,
+            )
+        )
+    else:
+        # One C++ actor per operator: a fanout to the branches, then per branch a chain of
+        # single-operator actors, each join reading its own build side.
+        if len(program.branches) == 1:
+            branch_inputs = [ch_scan]
+        else:
+            branch_inputs = [context.create_channel() for _ in program.branches]
+            nodes.append(broadcast_actor(context, ch_scan, branch_inputs))
+        branch_outputs = []
+        for stages, ch_branch in zip(program.branches, branch_inputs, strict=True):
+            groups = _stage_groups(stages)
+            ch_in = ch_branch
+            for i, group in enumerate(groups):
+                last = i == len(groups) - 1
+                builds = [s["build"] for s in group if s["op"] == "join"]
+                # Each actor reads only its own build sides: renumber them from 0.
+                local = [
+                    {**s, "build": builds.index(s["build"])} if s["op"] == "join" else s
+                    for s in group
+                ]
+                ch_next = context.create_channel()
+                nodes.append(
+                    chain_actor(
+                        context,
+                        [chs_build[b] for b in builds],
+                        [program.build_keys[b] for b in builds],
+                        [build_types[b] for b in builds],
+                        ch_in,
+                        ch_next,
+                        [local],
+                        concurrency,
+                        program.n_keys if last else -1,
+                        out_types if last else [],
+                    )
+                )
+                ch_in = ch_next
+            branch_outputs.append(ch_in)
+        nodes.append(
+            _fold_branches_actor(context, ir, ir_context, ch_out, branch_outputs)
+        )
+    actors[ir] = nodes
+    return actors, channels
+
+
 @generate_ir_sub_network.register(NativeRegion)
 def _(
     ir: NativeRegion, rec: SubNetGenerator
 ) -> tuple[dict[IR, list[Any]], dict[IR, ChannelManager]]:
+    if _actors_mode() != "python":
+        return _cpp_sub_network(ir, rec)
     # One output slot per build side, so a build feeding two joins is read twice.
     actors, channels = process_children(ir, rec)
     chs_build = [channels[child].reserve_output_slot() for child in ir.children]
