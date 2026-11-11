@@ -102,6 +102,34 @@ if TYPE_CHECKING:
     from cudf_polars.utils.config import StreamingExecutor
 
 
+def _cpu_list(spec: str) -> set[int]:
+    cpus: set[int] = set()
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        cpus.update(range(int(lo), int(hi or lo) + 1))
+    return cpus
+
+
+def _pin_threads() -> None:
+    # Experiment: keep the REST reactors (about 14 busy cores while fetching) off the CPUs the
+    # Python and CUDA threads run on, so a thread holding the GIL is not descheduled for them.
+    # Threads created later inherit the main thread's set.
+    reactor_spec = os.environ.get("CUDF_POLARS_REACTOR_CPUS")
+    other_spec = os.environ.get("CUDF_POLARS_OTHER_CPUS")
+    if not reactor_spec or not other_spec:
+        return
+    reactor_cpus, other_cpus = _cpu_list(reactor_spec), _cpu_list(other_spec)
+    for tid in os.listdir("/proc/self/task"):
+        try:
+            with open(f"/proc/self/task/{tid}/comm") as f:
+                name = f.read().strip()
+            os.sched_setaffinity(
+                int(tid), reactor_cpus if name.startswith("rest-") else other_cpus
+            )
+        except OSError:
+            pass
+
+
 def use_gpu(index: int | str) -> None:
     """
     Restrict this process to a single GPU.
@@ -653,13 +681,21 @@ class SPMDEngine(StreamingEngine):
             service = remote_io.configure_scan_io(
                 arena_bytes=arena_mb << 20,
                 reactors=int(os.environ.get("CUDF_POLARS_SCAN_IO_REACTORS", "8")),
-                connections=int(os.environ.get("CUDF_POLARS_SCAN_IO_CONNECTIONS", "32")),
-                footer_threads=int(os.environ.get("CUDF_POLARS_SCAN_IO_FOOTER_THREADS", "32")),
-                inflight_bytes=int(os.environ.get("CUDF_POLARS_SCAN_IO_INFLIGHT_MB", "0")) << 20,
+                connections=int(
+                    os.environ.get("CUDF_POLARS_SCAN_IO_CONNECTIONS", "32")
+                ),
+                footer_threads=int(
+                    os.environ.get("CUDF_POLARS_SCAN_IO_FOOTER_THREADS", "32")
+                ),
+                inflight_bytes=int(
+                    os.environ.get("CUDF_POLARS_SCAN_IO_INFLIGHT_MB", "0")
+                )
+                << 20,
                 endpoint=os.environ.get("CUDF_POLARS_SCAN_IO_ENDPOINT") or None,
             )
             if warm := os.environ.get("CUDF_POLARS_SCAN_IO_WARMUP_URL"):
                 service.warmup(warm)
+            _pin_threads()
         self.rapidsmpf_options = resolve_rapidsmpf_options(rapidsmpf_options)
         mr_config: MemoryResourceConfig = engine_options.get(
             "memory_resource_config", MemoryResourceConfig.default()

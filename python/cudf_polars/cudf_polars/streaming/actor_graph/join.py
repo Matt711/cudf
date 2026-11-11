@@ -38,6 +38,7 @@ import pylibcudf as plc
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.utils.reshape import broadcast
 from cudf_polars.dsl.ir import IR, Join, Projection
+from cudf_polars.streaming import remote_io
 from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import (
     AllGatherManager,
@@ -119,7 +120,6 @@ if TYPE_CHECKING:
     from cudf_polars.utils.config import StreamingExecutor
 
 
-
 _eval_stats = collections.Counter()
 
 
@@ -143,6 +143,12 @@ def _timed_evaluate(fn: Any, *args: Any, **kwargs: Any) -> Any:
             with _profiles_lock:
                 _profiles.append(profile)
         _eval_stats["calls"] += 1
+        remote_io.trace(
+            "op:JoinCall",
+            id(args[0]) & 0xFFFF if args else 0,
+            0,
+            int((time.perf_counter() - t0) * 1e6),
+        )
         _eval_stats["wall_s"] += time.perf_counter() - t0
         _eval_stats["cpu_s"] += time.thread_time() - c0
 
@@ -168,6 +174,7 @@ def _dump_eval_stats() -> None:
 import atexit  # noqa: E402
 
 atexit.register(_dump_eval_stats)
+
 
 def _join_preserves_side_order(
     how: Literal["Inner", "Left", "Right", "Full", "Semi", "Anti", "Cross"],
@@ -555,7 +562,9 @@ async def _broadcast_join_large_chunk_compute(
                 *([large_df, sdf] if broadcast_side == "right" else [sdf, large_df]),
                 context=ir_context,
                 prebuilt=(
-                    prebuilt[i] if prebuilt is not None and dfs_to_join is small_dfs else None
+                    prebuilt[i]
+                    if prebuilt is not None and dfs_to_join is small_dfs
+                    else None
                 ),
             )
             join_results.append(result)
@@ -656,7 +665,9 @@ async def broadcast_join(
         # Every large-side chunk probes the same small side: build its hash table(s) once.
         on_exprs = ir.right_on if broadcast_side == "right" else ir.left_on
         null_equality = (
-            plc.types.NullEquality.EQUAL if nulls_equal else plc.types.NullEquality.UNEQUAL
+            plc.types.NullEquality.EQUAL
+            if nulls_equal
+            else plc.types.NullEquality.UNEQUAL
         )
 
         def _build(sdf: DataFrame) -> tuple[Any, bool]:

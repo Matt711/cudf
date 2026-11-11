@@ -76,7 +76,10 @@ def configure_scan_io(
                 "AWS_DEFAULT_REGION", "us-east-1"
             )
             _service = ScanIO(
-                endpoint or os.environ.get("AWS_ENDPOINT_URL", f"https://s3.{region}.amazonaws.com"),
+                endpoint
+                or os.environ.get(
+                    "AWS_ENDPOINT_URL", f"https://s3.{region}.amazonaws.com"
+                ),
                 region,
                 os.environ.get("AWS_ACCESS_KEY_ID", ""),
                 os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
@@ -173,18 +176,26 @@ class RemotePlan:
 
 def _merge(plan: RemotePlan) -> None:
     """Merge the ranges of every pass into fewer requests and place them back to back."""
-    items: list[tuple[int, int, int, str, int]] = []  # (source, offset, size, pass, index)
+    items: list[
+        tuple[int, int, int, str, int]
+    ] = []  # (source, offset, size, pass, index)
     for name, (ranges, sources) in plan.passes.items():
         for i, (r, s) in enumerate(zip(ranges, sources, strict=True)):
             items.append((s, r.offset, r.size, name, i))
     items.sort()
-    plan.positions = {name: [0] * len(ranges) for name, (ranges, _) in plan.passes.items()}
+    plan.positions = {
+        name: [0] * len(ranges) for name, (ranges, _) in plan.passes.items()
+    }
     requests: list[list[int]] = []  # [source, offset, end, block position]
     block = 0
     for source, offset, size, name, i in items:
         end = offset + size
         last = requests[-1] if requests else None
-        if last is not None and last[0] == source and offset <= last[2] + MERGE_GAP_BYTES:
+        if (
+            last is not None
+            and last[0] == source
+            and offset <= last[2] + MERGE_GAP_BYTES
+        ):
             if end > last[2]:
                 block += end - last[2]
                 last[2] = end
@@ -206,7 +217,9 @@ def plan(task: ParquetScanTask, stream: Stream) -> RemotePlan:
         size, metadata = service.footer(path)
         footers.append(Footer(path, size, metadata))
     bounds = task._get_task_bounds(footers)
-    with_columns = None if base_scan.with_columns is None else list(base_scan.with_columns)
+    with_columns = (
+        None if base_scan.with_columns is None else list(base_scan.with_columns)
+    )
     plc_filter = residual = None
     if base_scan.predicate is not None:
         plc_filter, residual = to_parquet_filter(
@@ -234,16 +247,23 @@ def plan(task: ParquetScanTask, stream: Stream) -> RemotePlan:
     )
     row_groups = plc.io.experimental.RowGroupIndices.from_lists(bounds.row_groups)
     if plc_filter is not None and parquet_options._hybrid_scan_stats_pruning:
-        row_groups = reader.filter_row_groups_with_stats(row_groups, options, stream=stream)
+        row_groups = reader.filter_row_groups_with_stats(
+            row_groups, options, stream=stream
+        )
     empty = not reader.total_rows_in_row_groups(row_groups)
     two_pass = (
-        plc_filter is not None and parquet_options.pass_mode is not HybridScanPassMode.SINGLE_PASS
+        plc_filter is not None
+        and parquet_options.pass_mode is not HybridScanPassMode.SINGLE_PASS
     )
     passes: dict[str, tuple[list[Any], list[int]]] = {}
     if not empty:
         if two_pass:
-            passes["filter"] = reader.filter_column_chunks_byte_ranges(row_groups, options)
-            passes["payload"] = reader.payload_column_chunks_byte_ranges(row_groups, options)
+            passes["filter"] = reader.filter_column_chunks_byte_ranges(
+                row_groups, options
+            )
+            passes["payload"] = reader.payload_column_chunks_byte_ranges(
+                row_groups, options
+            )
         else:
             passes["all"] = reader.all_column_chunks_byte_ranges(row_groups, options)
     # Estimated decoded bytes: per column, the larger of rows x its fixed width and its
@@ -293,7 +313,9 @@ def scan_options(task: ParquetScanTask, stream: Stream) -> tuple[Any, Any]:
     """The reader options (columns, filter) of a task's scan and the residual predicate."""
     base_scan = task.base_scan
     parquet_options = task.parquet_options
-    with_columns = None if base_scan.with_columns is None else list(base_scan.with_columns)
+    with_columns = (
+        None if base_scan.with_columns is None else list(base_scan.with_columns)
+    )
     plc_filter = residual = None
     if base_scan.predicate is not None:
         plc_filter, residual = to_parquet_filter(
@@ -336,19 +358,26 @@ def plan_native(
     return NativePlan(task_id, empty, staged, decoded, residual, options)
 
 
-def materialize_native(task: ParquetScanTask, plan: NativePlan, stream: Stream) -> DataFrame:
+def materialize_native(
+    task: ParquetScanTask, plan: NativePlan, stream: Stream
+) -> DataFrame:
     """Decode a natively planned task (in the service, without the GIL)."""
     from cudf_polars.dsl.expr import NamedExpr  # noqa: PLC0415
     from cudf_polars.dsl.ir import apply_predicate  # noqa: PLC0415
 
     base_scan = task.base_scan
     schema = base_scan.schema
-    with_columns = None if base_scan.with_columns is None else list(base_scan.with_columns)
+    with_columns = (
+        None if base_scan.with_columns is None else list(base_scan.with_columns)
+    )
     if plan.empty:
         df = _empty_hybrid_scan_dataframe(schema, with_columns, stream)
     else:
+        _t0 = time.perf_counter()
+        _tbl = scan_io().materialize(plan.task_id, stream)
+        trace("mat", -3, plan.task_id, int((time.perf_counter() - _t0) * 1e6))
         _, df = _dataframe_with_source_index_from_hybrid_scan_table(
-            scan_io().materialize(plan.task_id, stream),
+            _tbl,
             schema,
             stream,
             prepended_source_index=False,
@@ -356,7 +385,9 @@ def materialize_native(task: ParquetScanTask, plan: NativePlan, stream: Stream) 
         df = df.select(list(schema.keys()))
     return apply_predicate(
         df,
-        NamedExpr(base_scan.predicate.name, plan.residual) if plan.residual is not None else None,
+        NamedExpr(base_scan.predicate.name, plan.residual)
+        if plan.residual is not None
+        else None,
     )
 
 
@@ -382,7 +413,9 @@ def materialize(
 
     base_scan = task.base_scan
     schema = base_scan.schema
-    with_columns = None if base_scan.with_columns is None else list(base_scan.with_columns)
+    with_columns = (
+        None if base_scan.with_columns is None else list(base_scan.with_columns)
+    )
 
     def spans(name: str) -> list[Any]:
         ranges, _ = plan.passes[name]
@@ -396,7 +429,9 @@ def materialize(
         df = _empty_hybrid_scan_dataframe(schema, with_columns, stream)
     elif not plan.two_pass:
         _, df = _dataframe_with_source_index_from_hybrid_scan_table(
-            reader.materialize_all_columns(row_groups, spans("all"), options, stream=stream),
+            reader.materialize_all_columns(
+                row_groups, spans("all"), options, stream=stream
+            ),
             schema,
             stream,
             prepended_source_index=False,
@@ -436,7 +471,9 @@ def materialize(
         df = DataFrame(columns, stream=stream).select(list(schema.keys()))
     return apply_predicate(
         df,
-        NamedExpr(base_scan.predicate.name, plan.residual) if plan.residual is not None else None,
+        NamedExpr(base_scan.predicate.name, plan.residual)
+        if plan.residual is not None
+        else None,
     )
 
 
@@ -464,7 +501,14 @@ def trace(event: str, scan: int, task: int, nbytes: int) -> None:
     """Record an I/O event (seconds since the query started) when CUDF_POLARS_IO_TRACE is set."""
     if _TRACE_PATH:
         _trace.append(
-            (_query["index"], round(time.perf_counter() - _query["t0"], 4), event, scan, task, nbytes)
+            (
+                _query["index"],
+                round(time.perf_counter() - _query["t0"], 4),
+                event,
+                scan,
+                task,
+                nbytes,
+            )
         )
 
 

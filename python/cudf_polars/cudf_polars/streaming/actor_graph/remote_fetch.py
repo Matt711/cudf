@@ -150,7 +150,9 @@ class _SharedBudget:
         self._held = 0
         self._waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future]] = []
 
-    async def acquire(self, cost: int, scan_idle: Callable[[], bool], budget: int) -> None:
+    async def acquire(
+        self, cost: int, scan_idle: Callable[[], bool], budget: int
+    ) -> None:
         # ``scan_idle`` is asked again on every wake-up: the scan's own chunks are released while
         # it waits, and once it holds none it must be admitted, or it could wait on a scan whose
         # consumer is waiting on it.
@@ -179,8 +181,84 @@ def _wake(waiter: asyncio.Future) -> None:
 
 _budget = _SharedBudget()
 
+_lag_loops: set[int] = set()
 
-def _plan(task: ParquetScanTask, ir_context: IRExecutionContext) -> remote_io.RemotePlan:
+
+def _start_lag_monitor() -> None:
+    # Experiment: how late the actors' event loop wakes a 5 ms sleep (loop congestion).
+    if not os.environ.get("CUDF_POLARS_LOOP_LAG"):
+        return
+    loop = asyncio.get_running_loop()
+    if id(loop) in _lag_loops:
+        return
+    _lag_loops.add(id(loop))
+    import threading as _th  # noqa: PLC0415
+
+    remote_io.trace("looptid", -4, 0, _th.get_native_id())
+
+    async def _monitor() -> None:
+        w0, c0 = time.perf_counter(), time.thread_time()
+        while True:
+            t0 = time.perf_counter()
+            await asyncio.sleep(0.005)
+            t1 = time.perf_counter()
+            remote_io.trace("lag", -4, 0, int((t1 - t0 - 0.005) * 1e6))
+            if t1 - w0 >= 0.25:
+                # Share of wall time the loop thread spent on the CPU (running Python callbacks).
+                c1 = time.thread_time()
+                remote_io.trace("loopcpu", -4, 0, int(1000 * (c1 - c0) / (t1 - w0)))
+                w0, c0 = t1, c1
+
+    asyncio.ensure_future(_monitor())
+
+    if os.environ.get("CUDF_POLARS_LOOP_SLOW"):
+        import logging  # noqa: PLC0415
+
+        handler = logging.FileHandler(os.environ["CUDF_POLARS_LOOP_SLOW"])
+        logging.getLogger("asyncio").addHandler(handler)
+        logging.getLogger("asyncio").setLevel(logging.WARNING)
+        loop.set_debug(True)
+        loop.slow_callback_duration = 0.005
+
+    # A watchdog thread: its own wake-up lag (GIL contention) and samples of the loop thread's
+    # stack (where the loop spends its wall time).
+    import collections  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+    import threading  # noqa: PLC0415
+    import traceback  # noqa: PLC0415
+
+    loop_tid = threading.get_ident()
+    samples: collections.Counter = collections.Counter()
+
+    def _watch() -> None:
+        while True:
+            t0 = time.perf_counter()
+            time.sleep(0.002)
+            remote_io.trace(
+                "thrlag", -4, 0, int((time.perf_counter() - t0 - 0.002) * 1e6)
+            )
+            frame = sys._current_frames().get(loop_tid)
+            if frame is not None:
+                stack = traceback.extract_stack(frame)[-6:]
+                samples[
+                    " <- ".join(f"{f.name}:{f.lineno}" for f in reversed(stack))
+                ] += 1
+
+    def _dump() -> None:
+        with open(os.environ["CUDF_POLARS_LOOP_LAG"], "w") as f:
+            total = sum(samples.values())
+            for stack, n in samples.most_common(40):
+                f.write(f"{n}\t{100 * n / total:.1f}%\t{stack}\n")
+
+    import atexit  # noqa: PLC0415
+
+    atexit.register(_dump)
+    threading.Thread(target=_watch, daemon=True, name="loop-watchdog").start()
+
+
+def _plan(
+    task: ParquetScanTask, ir_context: IRExecutionContext
+) -> remote_io.RemotePlan:
     t0 = time.perf_counter()
     try:
         return remote_io.plan(task, ir_context.get_cuda_stream())
@@ -188,7 +266,9 @@ def _plan(task: ParquetScanTask, ir_context: IRExecutionContext) -> remote_io.Re
         _count("plan_s", time.perf_counter() - t0)
 
 
-def materialize(task: ParquetScanTask, staged: Staged, ir_context: IRExecutionContext) -> DataFrame:
+def materialize(
+    task: ParquetScanTask, staged: Staged, ir_context: IRExecutionContext
+) -> DataFrame:
     """Decode a staged task (inside the caller's device memory reservation)."""
     stream = ir_context.get_cuda_stream()
     if isinstance(staged.plan, remote_io.NativePlan):
@@ -217,7 +297,9 @@ def _drain(task_ids: list[int]) -> None:
 class RemoteFetchAhead:
     """Plans a scan's tasks ahead and has the service fetch them, in task order."""
 
-    def __init__(self, tasks: Sequence[ScanTask], ir_context: IRExecutionContext) -> None:
+    def __init__(
+        self, tasks: Sequence[ScanTask], ir_context: IRExecutionContext
+    ) -> None:
         self._tasks = tasks
         self._ir_context = ir_context
         self._service = remote_io.scan_io()
@@ -232,7 +314,8 @@ class RemoteFetchAhead:
         self._waiter: ThreadPoolExecutor | None = None
         self._read: dict[int, asyncio.Future] = {}
         self._decode_budget = int(
-            float(os.environ.get("CUDF_POLARS_DECODE_MEM_FRAC", "0.45")) * _device_total_bytes()
+            float(os.environ.get("CUDF_POLARS_DECODE_MEM_FRAC", "0.45"))
+            * _device_total_bytes()
         )
         self._decoding = 0
         self._next_admit = 0
@@ -247,6 +330,7 @@ class RemoteFetchAhead:
         self._service.request_footers([p for t in self._tasks for p in t.paths])
         self._stream = self._service.open_stream()
         remote_io.trace("scan_start", self._stream, -1, len(self._tasks))
+        _start_lag_monitor()
         self._feeder = asyncio.ensure_future(self._feed())
 
     async def close(self) -> None:
@@ -287,7 +371,9 @@ class RemoteFetchAhead:
         for i, task in enumerate(self._tasks):
             async with self._cond:
                 await self._cond.wait_for(lambda: i - self._taken < self._ahead)
-            plan = await loop.run_in_executor(self._native_pool, self._plan_native, task)
+            plan = await loop.run_in_executor(
+                self._native_pool, self._plan_native, task
+            )
             if plan is None:
                 # A split the native planner does not handle: plan and queue it in Python.
                 _count("python_planned")
@@ -315,7 +401,9 @@ class RemoteFetchAhead:
             if task_id >= 0:
                 self._read[i] = self._watch(task_id)
                 self._read[i].add_done_callback(
-                    lambda _, i=i, n=plan.nbytes: remote_io.trace("landed", self._stream, i, n)
+                    lambda _, i=i, n=plan.nbytes: remote_io.trace(
+                        "landed", self._stream, i, n
+                    )
                 )
             self._staged[i] = staged
             self._launched[i].set()
@@ -355,7 +443,9 @@ class RemoteFetchAhead:
                 staged = Staged(plan, task_id)
                 self._read[i] = self._watch(task_id)
                 self._read[i].add_done_callback(
-                    lambda _, i=i, n=plan.nbytes: remote_io.trace("landed", self._stream, i, n)
+                    lambda _, i=i, n=plan.nbytes: remote_io.trace(
+                        "landed", self._stream, i, n
+                    )
                 )
             self._staged[i] = staged
             self._launched[i].set()
@@ -376,7 +466,9 @@ class RemoteFetchAhead:
         read = self._read.pop(i, None)
         t0 = time.perf_counter()
         if read is not None:
-            await asyncio.wait([read])  # a read error surfaces again from the copy to device
+            await asyncio.wait(
+                [read]
+            )  # a read error surfaces again from the copy to device
         _count("producer_wait_s", time.perf_counter() - t0)
         remote_io.trace("taken", self._stream, i, 0)
         async with self._cond:
@@ -391,7 +483,9 @@ class RemoteFetchAhead:
         cost = (
             0
             if staged is None
-            else min(staged.plan.decoded_bytes + staged.plan.nbytes, self._decode_budget)
+            else min(
+                staged.plan.decoded_bytes + staged.plan.nbytes, self._decode_budget
+            )
         )
         t0 = time.perf_counter()
         async with self._cond:

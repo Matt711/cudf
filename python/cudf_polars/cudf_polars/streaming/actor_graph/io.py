@@ -31,6 +31,7 @@ from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
     ir_context_for_node,
 )
+from cudf_polars.streaming import remote_io
 from cudf_polars.streaming.actor_graph import remote_fetch
 from cudf_polars.streaming.actor_graph.nodes import define_actor, shutdown_on_error
 from cudf_polars.streaming.actor_graph.scan_ordering import (
@@ -623,6 +624,8 @@ async def read_chunk(
         size=reservation_bytes,
         net_memory_delta=estimated_chunk_bytes,
     )
+    if fetched is not None:
+        remote_io.trace("reserved", -2, seq_num, reservation_bytes)
     with opaque_memory_usage(reservation):
         if fetched is not None:
             df = await ir_context.to_thread(
@@ -751,7 +754,9 @@ async def scan_node(
         # downstream: then producers send as they finish, so a slow task at the head of
         # the order does not hold every later decoded chunk on the device.
         num_producers = min(num_producers, len(tasks))
-        unordered = bool(os.environ.get("CUDF_POLARS_SCAN_UNORDERED")) and partitioning is None
+        unordered = (
+            bool(os.environ.get("CUDF_POLARS_SCAN_UNORDERED")) and partitioning is None
+        )
         lineariser = None if unordered else Lineariser(context, ch_out, num_producers)
 
         # Assign tasks to producers using round-robin
@@ -783,19 +788,32 @@ async def scan_node(
                     nonlocal released, decode_cost
                     if dfa is not None and not released:
                         released = True
+                        remote_io.trace(
+                            "chunk", dfa._stream, task_idx, chunk_bytes or 0
+                        )
                         await dfa.release(fetched)
                         if chunk_bytes is not None:
-                            decode_cost = await dfa.shrink_decode(decode_cost, chunk_bytes)
+                            decode_cost = await dfa.shrink_decode(
+                                decode_cost, chunk_bytes
+                            )
 
-                ch_dest = ch_out if lineariser is None else await lineariser.acquire(producer_id)
+                ch_dest = (
+                    ch_out
+                    if lineariser is None
+                    else await lineariser.acquire(producer_id)
+                )
                 # The decode budget bounds the device memory of decodes and of decoded
                 # chunks not yet forwarded downstream: without it every producer decodes
                 # ahead and its chunk waits on the device (or is spilled and brought back)
                 # until the consumer reaches it. Budget is granted in task order, so a task
                 # only ever waits on earlier tasks, which the lineariser forwards first.
                 decode_cost = (
-                    await dfa.acquire_decode(task_idx, fetched) if dfa is not None else 0
+                    await dfa.acquire_decode(task_idx, fetched)
+                    if dfa is not None
+                    else 0
                 )
+                if dfa is not None:
+                    remote_io.trace("admitted", dfa._stream, task_idx, decode_cost)
                 try:
                     await read_chunk(
                         context,
@@ -810,6 +828,8 @@ async def scan_node(
                     )
                     if lineariser is not None and decode_cost > 0:
                         await lineariser.forwarded(producer_id)
+                    if dfa is not None:
+                        remote_io.trace("forwarded", dfa._stream, task_idx, decode_cost)
                 finally:
                     await _after_decode()
                     if dfa is not None:
