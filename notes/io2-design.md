@@ -196,3 +196,18 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
   Q18 9.3/6.6 (vs 4.6-5.1), Q21 OOM cold / 11.5 warm, Q4 3.9 vs 3.4; waiting for all of a scan's footers costs ~0.22 s per scan
   (reads used to start as each footer landed). Sirius never waits: its coalescer packs each file as its footer lands and the
   pipeline needs no chunk count up front. Task size is near a sweet spot both ways (tail split, 512 MB tasks, fusion all lost).
+
+## 11 Nov (afternoon): what bounds per-chunk operator calls (io106-io121)
+- Join-plan trace (io106): almost every join already broadcasts one side; only Q21's first join (9.6 vs 56.5 GB) and Q4 Semi /
+  Q13 Left (small side is the preserved one) shuffle. Q7's post-scan join calls are broadcast probes lagging the probe stream
+  (~half of 480 calls after the last chunk). Broadcast limit 40 GB: inconclusive (Q9 made the same 106 calls).
+- Join call CPU (Q7): ~9 ms thread CPU per call during the fetch vs 1.7 ms after. perf (PYTHONPERFSUPPORT=1, io111): Python
+  threads 12.8% of process CPU (REST workers 81.6%); of Python-thread CPU ~30% is in libcuda, 86.5% of that cuStreamSynchronize
+  spinning (ioctl); the interpreter is 3-4%. So per-call cost = GPU queueing (behind decode kernels) + synchronize latency, not
+  Python.
+- Blocking sync (CUDA_BLOCKING_SYNC=1): much worse, 140.1/141.8 vs 123.5/124.9 (every phase): spin wake-up latency matters.
+- Priority streams (CUDF_POLARS_PRIORITY_STREAMS=16, e297b6e215: operators on greatest-priority streams, decodes on the pool's):
+  126.8 vs 134.5, 121.4 vs 139.5 (controls second, slow), reversed order 122.3 vs 122.6 (warm 118.4 vs 121.4). Consistent:
+  backlog -1.0 to -2.1 s, post -0.8 to -1.0 s. Adopted into the best config.
+- For a C++ executor: the gain would come from stream-ordered chains with fewer synchronizes and deliberate decode vs compute
+  GPU scheduling, not from removing the interpreter.
