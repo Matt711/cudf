@@ -147,7 +147,7 @@ def _timed_evaluate(fn: Any, *args: Any, **kwargs: Any) -> Any:
         remote_io.trace(
             "op:JoinCall",
             id(args[0]) & 0xFFFF if args else 0,
-            0,
+            int((time.thread_time() - c0) * 1e6),
             int((time.perf_counter() - t0) * 1e6),
         )
         _eval_stats["wall_s"] += time.perf_counter() - t0
@@ -1529,6 +1529,12 @@ def _choose_strategy_from_samples(
         )
     )
 
+    remote_io.trace(
+        f"joinplan:{how}:L{int(left_size_ok)}R{int(right_size_ok)}",
+        int(left_total_rows),
+        int(right_total_rows),
+        (int(left_total) >> 20 << 32) | (int(right_total) >> 20),
+    )
     broadcast_side: Literal["left", "right"] | None = None
     if can_broadcast_left and can_broadcast_right:
         # Choose side that is already duplicated.
