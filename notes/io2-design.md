@@ -222,3 +222,9 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
   (~2-3.5 ms each) vs 8-25 ms per call in the engine. Engine Q7 tail after its last lineitem byte: ~1.8-2.7 s.
 - Not yet measured: build sides fetched in the same query (engine Q7 also reads ~6 GB of orders/customer), memory admission,
   engine integration (lowering a scan -> chunkwise -> broadcast joins -> partial groupby chain to a native node).
+- Engine integration (CUDF_POLARS_NATIVE_REGION=1, e5ed650513): a GroupBy fed by one remote scan through projections, simple
+  expressions and inner joins becomes one native actor (build sides still engine sub-networks). Matches Q3, Q5, Q7, Q9, Q10
+  (Q11 excluded: probe path shared outside the region). Fixed on the way: arena deadlock (read-ahead before builds capped,
+  CUDF_POLARS_NATIVE_PREFETCH_MB), build tables viewing freed chunks, scan filter freed during decode, frees on destroyed streams.
+- Subset Q3/5/7/9/10 with 20 GB read-ahead: 36.2 vs 40.7 s cold. Full pairs: 125.6 vs 128.4, 127.9 vs 136.6 (all valid);
+  Q7 -1.6/-1.8, Q9 -4.7 in the second pair. Not rapidsmpf memory-aware yet (no reservations/spill in the native region).
