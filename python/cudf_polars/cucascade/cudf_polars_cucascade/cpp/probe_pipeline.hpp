@@ -23,6 +23,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -33,12 +34,12 @@ namespace cudf_polars_cucascade {
  * the last node is the result.
  */
 struct expr_node {
-  enum kind : int { column = 0, literal = 1, binary = 2, year = 3 };
+  enum kind : int { column = 0, literal = 1, binary = 2, year = 3, cast = 4 };
   int op{column};
   int column_index{0};  ///< column: index into the current table
   double value{0.0};    ///< literal: a float64 scalar
-  int binop{0};         ///< binary: a cudf::binary_operator
-  int lhs{0};           ///< binary, year: operand node
+  int binop{0};         ///< binary: a cudf::binary_operator; cast: a cudf::type_id
+  int lhs{0};           ///< binary, year, cast: operand node
   int rhs{0};           ///< binary: operand node
 };
 
@@ -77,12 +78,15 @@ class probe_pipeline {
    * @param branches Each branch's stages; the last must be a group-by.
    * @param builds Build tables (views must outlive the pipeline) and their key columns.
    * @param threads Worker threads.
+   * @param input_columns Names of the decoded columns the stages see, in that order (empty: the
+   * decoder's order).
    */
   probe_pipeline(scan_io& io,
                  std::vector<std::vector<stage>> branches,
                  std::vector<cudf::table_view> builds,
                  std::vector<std::vector<int>> build_keys,
-                 int threads);
+                 int threads,
+                 std::vector<std::string> input_columns = {});
   ~probe_pipeline();
 
   probe_pipeline(probe_pipeline const&)            = delete;
@@ -114,6 +118,7 @@ class probe_pipeline {
   scan_io& _io;
   std::vector<std::vector<stage>> _branches;
   std::vector<cudf::table_view> _builds;
+  std::vector<std::string> _input_columns;
   std::vector<std::unique_ptr<cudf::hash_join>> _joins;
   std::vector<cudaStream_t> _streams;  // one per worker, owned
   std::vector<std::thread> _workers;

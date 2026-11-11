@@ -301,6 +301,7 @@ def generate_network(
         "config_options": config_options,
         "partition_info": partition_info,
         "fanout_nodes": fanout_nodes,
+        "ir_dep_count": ir_dep_count,
         "ir_context": ir_context,
         "max_concurrent_io_tasks": config_options.executor.max_concurrent_io_tasks,
         "stats": stats,

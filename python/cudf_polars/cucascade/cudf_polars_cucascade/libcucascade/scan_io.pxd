@@ -118,6 +118,7 @@ cdef extern from "probe_pipeline.hpp" namespace "cudf_polars_cucascade" nogil:
             vector[table_view] builds,
             vector[vector[int]] build_keys,
             int threads,
+            vector[string] input_columns,
         ) except +libcucascade_exception_handler
         void submit(int64_t task_id) except +libcucascade_exception_handler
         vector[unique_ptr[table]] finish() except +libcucascade_exception_handler

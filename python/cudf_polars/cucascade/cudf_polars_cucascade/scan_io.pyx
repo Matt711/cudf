@@ -255,7 +255,7 @@ cdef class ScanIO:
         )
 
 
-_EXPR_OPS = {"column": 0, "literal": 1, "binary": 2, "year": 3}
+_EXPR_OPS = {"column": 0, "literal": 1, "binary": 2, "year": 3, "cast": 4}
 _STAGE_OPS = {"join": 0, "compute": 1, "select": 2, "groupby": 3}
 
 
@@ -303,11 +303,20 @@ cdef class ProbePipeline:
     cdef unique_ptr[cpp_probe_pipeline] c_obj
     cdef list _builds
 
-    def __cinit__(self, ScanIO io, list branches, list builds, list build_keys, int threads):
+    def __cinit__(
+        self,
+        ScanIO io,
+        list branches,
+        list builds,
+        list build_keys,
+        int threads,
+        list input_columns=None,
+    ):
         cdef vector[vector[stage]] c_branches
         cdef vector[stage] c_stages
         cdef vector[table_view] c_builds
         cdef vector[vector[int]] c_keys = build_keys
+        cdef vector[string] c_columns = [c.encode() for c in (input_columns or [])]
         for stages in branches:
             c_stages.clear()
             for d in stages:
@@ -319,7 +328,7 @@ cdef class ProbePipeline:
         with nogil:
             self.c_obj.reset(
                 new cpp_probe_pipeline(
-                    io.c_obj.get()[0], c_branches, c_builds, c_keys, threads
+                    io.c_obj.get()[0], c_branches, c_builds, c_keys, threads, c_columns
                 )
             )
 

@@ -13,6 +13,8 @@
 #include <cudf/datetime.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/unary.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 
 #include <algorithm>
@@ -88,6 +90,12 @@ std::unique_ptr<cudf::column> evaluate(std::vector<expr_node> const& nodes,
           views[n.lhs], cudf::datetime::datetime_component::YEAR, stream);
         views[i] = owned[i]->view();
         break;
+      case expr_node::cast:
+        owned[i] = cudf::cast(views[n.lhs],
+                              cudf::data_type{static_cast<cudf::type_id>(n.binop)},
+                              stream);
+        views[i] = owned[i]->view();
+        break;
       case expr_node::binary: {
         auto const l_lit = scalars[n.lhs] != nullptr;
         auto const r_lit = scalars[n.rhs] != nullptr;
@@ -114,10 +122,12 @@ probe_pipeline::probe_pipeline(scan_io& io,
                                std::vector<std::vector<stage>> branches,
                                std::vector<cudf::table_view> builds,
                                std::vector<std::vector<int>> build_keys,
-                               int threads)
+                               int threads,
+                               std::vector<std::string> input_columns)
   : _io{io},
     _branches(std::move(branches)),
     _builds(std::move(builds)),
+    _input_columns(std::move(input_columns)),
     _fold_mutex(_branches.size()),
     _partials(_branches.size()),
     _stats(n_counters, 0.0)
@@ -154,6 +164,12 @@ probe_pipeline::~probe_pipeline()
   for (auto& w : _workers) {
     if (w.joinable()) { w.join(); }
   }
+  // Device memory allocated on the worker streams goes back on them: free it before they go.
+  for (auto s : _streams) {
+    cudaStreamSynchronize(s);
+  }
+  _partials.clear();
+  _joins.clear();
   for (auto s : _streams) {
     cudaStreamDestroy(s);
   }
@@ -206,8 +222,21 @@ void probe_pipeline::run_task(std::int64_t id, ::cuda::stream_ref stream)
     _stats[decode_s] += t1 - t0;
     if (_t_first < 0 || t0 < _t_first) { _t_first = t0; }
   }
+  auto input = decoded.tbl->view();
+  if (!_input_columns.empty()) {
+    // The stages address columns by position: put the decoded ones in the order they expect.
+    std::vector<int> order;
+    auto const& info = decoded.metadata.schema_info;
+    for (auto const& name : _input_columns) {
+      auto it = std::find_if(
+        info.begin(), info.end(), [&](auto const& c) { return c.name == name; });
+      CUDF_EXPECTS(it != info.end(), "probe_pipeline: decoded table has no column " + name);
+      order.push_back(static_cast<int>(it - info.begin()));
+    }
+    input = select(input, order);
+  }
   for (std::size_t b = 0; b < _branches.size(); ++b) {
-    auto partial = run_branch(_branches[b], decoded.tbl->view(), stream);
+    auto partial = run_branch(_branches[b], input, stream);
     fold(b, std::move(partial), stream);
   }
   std::lock_guard lock(_stats_mutex);
@@ -369,7 +398,8 @@ std::vector<std::unique_ptr<cudf::table>> probe_pipeline::finish()
   }
   _workers.clear();
   if (_error) { std::rethrow_exception(_error); }
-  auto stream = ::cuda::stream_ref{_streams[0]};
+  // The results outlive the pipeline and its streams: build them on the default stream.
+  auto stream = cudf::get_default_stream();
   std::vector<std::unique_ptr<cudf::table>> out;
   for (std::size_t b = 0; b < _branches.size(); ++b) {
     std::vector<cudf::table_view> views;
@@ -381,6 +411,9 @@ std::vector<std::unique_ptr<cudf::table>> probe_pipeline::finish()
     out.push_back(aggregate(b, all->view(), stream));
   }
   stream.sync();
+  for (auto& p : _partials) {
+    p.clear();
+  }
   {
     std::lock_guard lock(_stats_mutex);
     _stats[wall_s] = _t_last - _t_first;
