@@ -9,7 +9,9 @@ from libcpp.utility cimport pair
 from libcpp.vector cimport vector
 
 from cuda.bindings.cyruntime cimport cudaStream_t
+from pylibcudf.libcudf.io.parquet cimport parquet_reader_options
 from pylibcudf.libcudf.io.parquet_schema cimport FileMetaData
+from pylibcudf.libcudf.io.types cimport table_with_metadata
 from rmm.librmm.device_buffer cimport device_buffer
 
 from cudf_polars_cucascade.exception_handler cimport libcucascade_exception_handler
@@ -30,6 +32,14 @@ cdef extern from "scan_io.hpp" namespace "cudf_polars_cucascade" nogil:
         size_t arena_bytes
         size_t footer_threads
         size_t inflight_bytes
+
+    cdef cppclass planned_task "cudf_polars_cucascade::scan_io::planned_task":
+        int64_t id
+        bool empty
+        bool unsupported
+        bool too_big
+        size_t staged_bytes
+        size_t decoded_bytes
 
     cdef cppclass scan_io:
         scan_io(const scan_io_config& cfg) except +libcucascade_exception_handler
@@ -59,3 +69,16 @@ cdef extern from "scan_io.hpp" namespace "cudf_polars_cucascade" nogil:
         ) except +libcucascade_exception_handler
         void release(int64_t id) except +libcucascade_exception_handler
         size_t fetched_bytes()
+        planned_task plan_task(
+            int64_t stream_id,
+            const vector[string]& paths,
+            int split_index,
+            int total_splits,
+            const parquet_reader_options& options,
+            bool prune_with_stats,
+            size_t merge_gap,
+            cudaStream_t stream,
+        ) except +libcucascade_exception_handler
+        table_with_metadata materialize(
+            int64_t id, cudaStream_t stream
+        ) except +libcucascade_exception_handler

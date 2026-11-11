@@ -9,13 +9,17 @@ from libcpp.utility cimport move, pair
 from libcpp.vector cimport vector
 
 from cuda.bindings.cyruntime cimport cudaStream_t
+from pylibcudf.io.parquet cimport ParquetReaderOptions
 from pylibcudf.io.parquet_metadata cimport FileMetaData
+from pylibcudf.io.types cimport TableWithMetadata
+from pylibcudf.libcudf.io.types cimport table_with_metadata
 from pylibcudf.libcudf.io.parquet_schema cimport FileMetaData as cpp_FileMetaData
 from rmm.librmm.device_buffer cimport device_buffer
 from rmm.pylibrmm.device_buffer cimport DeviceBuffer
 from rmm.pylibrmm.stream cimport Stream
 
 from cudf_polars_cucascade.libcucascade.scan_io cimport (
+    planned_task,
     scan_io as cpp_scan_io,
     scan_io_config as cpp_scan_io_config,
 )
@@ -181,3 +185,48 @@ cdef class ScanIO:
         """Give a task's block back (after the work reading it has completed)."""
         with nogil:
             self.c_obj.get().release(task_id)
+
+    def plan_task(
+        self,
+        int64_t stream_id,
+        paths,
+        int split_index,
+        int total_splits,
+        ParquetReaderOptions options,
+        bool prune_with_stats,
+        size_t merge_gap,
+        Stream stream,
+    ) -> tuple[int, bool, bool, bool, int, int]:
+        """
+        Plan a task from its footers and queue its reads (without the GIL).
+
+        Returns ``(task_id, empty, unsupported, too_big, staged_bytes, decoded_bytes)``.
+        ``options`` (the scan's columns and filter) must stay alive until the task is decoded.
+        """
+        cdef vector[string] c_paths = [p.encode() for p in paths]
+        cdef cudaStream_t c_stream = stream._cuda_stream
+        cdef planned_task r
+        with nogil:
+            r = self.c_obj.get().plan_task(
+                stream_id,
+                c_paths,
+                split_index,
+                total_splits,
+                options.c_obj,
+                prune_with_stats,
+                merge_gap,
+                c_stream,
+            )
+        return r.id, r.empty, r.unsupported, r.too_big, r.staged_bytes, r.decoded_bytes
+
+    def materialize(self, int64_t task_id, Stream stream) -> TableWithMetadata:
+        """Decode a planned task from its staged bytes (without the GIL)."""
+        cdef cudaStream_t c_stream = stream._cuda_stream
+        cdef table_with_metadata result
+        with nogil:
+            result = move(self.c_obj.get().materialize(task_id, c_stream))
+        import rmm.mr
+
+        return TableWithMetadata.from_libcudf(
+            result, stream, rmm.mr.get_current_device_resource()
+        )

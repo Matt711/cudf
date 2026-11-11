@@ -33,7 +33,10 @@ from rapidsmpf.streaming.core.memory_reserve_or_wait import (
 )
 from rapidsmpf.streaming.core.message import Message
 
+import pylibcudf as plc
+
 from cudf_polars.containers import DataFrame
+from cudf_polars.dsl.utils.reshape import broadcast
 from cudf_polars.dsl.ir import IR, Join, Projection
 from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import (
@@ -526,6 +529,7 @@ async def _broadcast_join_large_chunk_compute(
     large_child: IR,
     small_size: int,
     broadcast_side: Literal["left", "right"],
+    prebuilt: list[Any] | None = None,
 ) -> TableChunk:
     """Join one large-side chunk with the small DataFrame(s); returns the output chunk."""
     large_df = chunk_to_frame(large_chunk, large_child)
@@ -542,7 +546,7 @@ async def _broadcast_join_large_chunk_compute(
     with opaque_memory_usage(
         await reserve_memory(context, size=input_bytes, net_memory_delta=0)
     ):
-        for sdf in dfs_to_join:
+        for i, sdf in enumerate(dfs_to_join):
             _eval_stats["broadcast_" + ir.options[0]] += 1
             result = await ir_context.to_thread(
                 _timed_evaluate,
@@ -550,6 +554,9 @@ async def _broadcast_join_large_chunk_compute(
                 *ir._non_child_args,
                 *([large_df, sdf] if broadcast_side == "right" else [sdf, large_df]),
                 context=ir_context,
+                prebuilt=(
+                    prebuilt[i] if prebuilt is not None and dfs_to_join is small_dfs else None
+                ),
             )
             join_results.append(result)
 
@@ -638,6 +645,37 @@ async def broadcast_join(
     # permits a consumer to reuse the collective ID after receiving metadata.
     await send_metadata(ch_out, context, metadata_out)
 
+    prebuilt = None
+    how, nulls_equal = ir.options[0], ir.options[1]
+    if (
+        os.environ.get("CUDF_POLARS_BROADCAST_HASH_REUSE")
+        and small_dfs
+        and ir._non_child_args[3] is None
+        and (how == "Inner" or (how == "Left" and broadcast_side == "right"))
+    ):
+        # Every large-side chunk probes the same small side: build its hash table(s) once.
+        on_exprs = ir.right_on if broadcast_side == "right" else ir.left_on
+        null_equality = (
+            plc.types.NullEquality.EQUAL if nulls_equal else plc.types.NullEquality.UNEQUAL
+        )
+
+        def _build(sdf: DataFrame) -> tuple[Any, bool]:
+            keys = DataFrame(
+                broadcast(
+                    *(e.evaluate(sdf) for e in on_exprs),
+                    target_length=sdf.num_rows,
+                    stream=sdf.stream,
+                ),
+                stream=sdf.stream,
+            )
+            hash_join = plc.join.HashJoin(
+                keys.table, compare_nulls=null_equality, stream=sdf.stream
+            )
+            sdf.stream.synchronize()  # probes run on other streams
+            return hash_join, broadcast_side == "left"
+
+        prebuilt = [await ir_context.to_thread(_build, sdf) for sdf in small_dfs]
+
     input_rows = 0
     output_rows = 0
     # Experiment: up to ``concurrency`` large-side chunks join at once (they are independent);
@@ -675,6 +713,7 @@ async def broadcast_join(
                         large_child,
                         small_size,
                         broadcast_side,
+                        prebuilt,
                     )
                 ),
                 msg.sequence_number,

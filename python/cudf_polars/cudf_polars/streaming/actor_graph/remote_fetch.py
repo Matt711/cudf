@@ -131,7 +131,7 @@ def _planner_pool() -> ThreadPoolExecutor:
 class Staged:
     """A planned task whose bytes the service reads into its arena."""
 
-    plan: remote_io.RemotePlan
+    plan: remote_io.RemotePlan | remote_io.NativePlan
     task_id: int
 
 
@@ -191,6 +191,11 @@ def _plan(task: ParquetScanTask, ir_context: IRExecutionContext) -> remote_io.Re
 def materialize(task: ParquetScanTask, staged: Staged, ir_context: IRExecutionContext) -> DataFrame:
     """Decode a staged task (inside the caller's device memory reservation)."""
     stream = ir_context.get_cuda_stream()
+    if isinstance(staged.plan, remote_io.NativePlan):
+        df = remote_io.materialize_native(task, staged.plan, stream)
+        staged.plan.reader = None
+        remote_io.trace("decoded", -1, staged.task_id, 0)
+        return df
     service = remote_io.scan_io()
     block = service.to_device(staged.task_id, stream)
     df = remote_io.materialize(task, staged.plan, block, stream)
@@ -231,6 +236,10 @@ class RemoteFetchAhead:
         )
         self._decoding = 0
         self._next_admit = 0
+        # Plan and queue tasks in the service, without the GIL, in task order (one thread).
+        self._native = os.environ.get("CUDF_POLARS_REMOTE_NATIVE_PLAN", "1") != "0"
+        self._native_pool: ThreadPoolExecutor | None = None
+        self._scan_options: tuple[Any, Any] | None = None
 
     def start(self) -> None:
         # Every footer of the scan is requested at once (the service runs them in parallel); the
@@ -249,9 +258,11 @@ class RemoteFetchAhead:
                 pass
         if self._waiter is not None:
             self._waiter.shutdown(wait=False, cancel_futures=True)
+        if self._native_pool is not None:
+            self._native_pool.shutdown(wait=False, cancel_futures=True)
         # Tasks staged but never taken (an early stop): give their blocks back once their reads
         # have landed.
-        leftover = [s.task_id for s in self._staged if s is not None]
+        leftover = [s.task_id for s in self._staged if s is not None and s.task_id >= 0]
         self._staged = [None] * len(self._staged)
         if leftover:
             await asyncio.to_thread(_drain, leftover)
@@ -259,7 +270,60 @@ class RemoteFetchAhead:
             self._service.close_stream(self._stream)
             self._stream = 0
 
+    def _plan_native(self, task: ParquetScanTask) -> remote_io.NativePlan | None:
+        stream = self._ir_context.get_cuda_stream()
+        if self._scan_options is None:
+            self._scan_options = remote_io.scan_options(task, stream)
+        options, residual = self._scan_options
+        t0 = time.perf_counter()
+        try:
+            return remote_io.plan_native(task, self._stream, options, residual, stream)
+        finally:
+            _count("native_plan_s", time.perf_counter() - t0)
+
+    async def _feed_native(self) -> None:
+        loop = asyncio.get_running_loop()
+        self._native_pool = ThreadPoolExecutor(1, thread_name_prefix="scan-plan-native")
+        for i, task in enumerate(self._tasks):
+            async with self._cond:
+                await self._cond.wait_for(lambda: i - self._taken < self._ahead)
+            plan = await loop.run_in_executor(self._native_pool, self._plan_native, task)
+            if plan is None:
+                # A split the native planner does not handle: plan and queue it in Python.
+                _count("python_planned")
+                plan = await loop.run_in_executor(
+                    self._native_pool, _plan, task, self._ir_context
+                )
+                task_id = self._service.submit(
+                    self._stream,
+                    plan.paths,
+                    [s for s, _, _ in plan.requests],
+                    [o for _, o, _ in plan.requests],
+                    [z for _, _, z in plan.requests],
+                )
+                if task_id < 0:
+                    _count("too_big_for_arena")
+                    self._staged[i] = None
+                    self._launched[i].set()
+                    continue
+            else:
+                task_id = plan.task_id
+            _count("staged")
+            _count("staged_bytes", plan.nbytes)
+            remote_io.trace("planned", self._stream, i, plan.nbytes)
+            staged = Staged(plan, task_id)
+            if task_id >= 0:
+                self._read[i] = self._watch(task_id)
+                self._read[i].add_done_callback(
+                    lambda _, i=i, n=plan.nbytes: remote_io.trace("landed", self._stream, i, n)
+                )
+            self._staged[i] = staged
+            self._launched[i].set()
+
     async def _feed(self) -> None:
+        if self._native:
+            await self._feed_native()
+            return
         loop = asyncio.get_running_loop()
         pool = _planner_pool()
         plans: dict[int, asyncio.Future] = {}
@@ -356,5 +420,5 @@ class RemoteFetchAhead:
 
     async def release(self, staged: Staged | None) -> None:
         """Task decoded: give its block back to the arena."""
-        if staged is not None:
+        if staged is not None and staged.task_id >= 0:
             self._service.release(staged.task_id)

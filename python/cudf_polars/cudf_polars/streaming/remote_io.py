@@ -276,6 +276,90 @@ def plan(task: ParquetScanTask, stream: Stream) -> RemotePlan:
     return result
 
 
+@dataclasses.dataclass
+class NativePlan:
+    """A task planned and queued by the service (its reader stays in the service)."""
+
+    task_id: int
+    empty: bool
+    nbytes: int
+    decoded_bytes: int
+    residual: Any
+    options: Any  # the scan's reader options; must outlive the decode
+    reader: Any = None
+
+
+def scan_options(task: ParquetScanTask, stream: Stream) -> tuple[Any, Any]:
+    """The reader options (columns, filter) of a task's scan and the residual predicate."""
+    base_scan = task.base_scan
+    parquet_options = task.parquet_options
+    with_columns = None if base_scan.with_columns is None else list(base_scan.with_columns)
+    plc_filter = residual = None
+    if base_scan.predicate is not None:
+        plc_filter, residual = to_parquet_filter(
+            _predicate(task, with_columns),
+            stream=stream,
+            unreadable_columns=frozenset(),
+        )
+        if plc_filter is None:
+            residual = base_scan.predicate.value
+    source_info = plc.io.SourceInfo([task.paths[0]])
+    options = (
+        plc.io.parquet.ParquetReaderOptions.builder(source_info)
+        .decimal_width(plc.TypeId.DECIMAL128)
+        .use_jit_filter(use_jit_filter=parquet_options.use_jit_filter)
+        .build()
+    )
+    if with_columns is not None:
+        options.set_column_names(with_columns)
+    if plc_filter is not None:
+        options.set_filter(plc_filter)
+    return options, residual
+
+
+def plan_native(
+    task: ParquetScanTask, stream_id: int, options: Any, residual: Any, stream: Stream
+) -> NativePlan | None:
+    """Plan and queue a task in the service (no GIL); None if it must be planned in Python."""
+    task_id, empty, unsupported, too_big, staged, decoded = scan_io().plan_task(
+        stream_id,
+        list(task.paths),
+        task.split_index,
+        task.total_splits,
+        options,
+        task.parquet_options._hybrid_scan_stats_pruning,
+        MERGE_GAP_BYTES,
+        stream,
+    )
+    if unsupported or too_big:
+        return None
+    return NativePlan(task_id, empty, staged, decoded, residual, options)
+
+
+def materialize_native(task: ParquetScanTask, plan: NativePlan, stream: Stream) -> DataFrame:
+    """Decode a natively planned task (in the service, without the GIL)."""
+    from cudf_polars.dsl.expr import NamedExpr  # noqa: PLC0415
+    from cudf_polars.dsl.ir import apply_predicate  # noqa: PLC0415
+
+    base_scan = task.base_scan
+    schema = base_scan.schema
+    with_columns = None if base_scan.with_columns is None else list(base_scan.with_columns)
+    if plan.empty:
+        df = _empty_hybrid_scan_dataframe(schema, with_columns, stream)
+    else:
+        _, df = _dataframe_with_source_index_from_hybrid_scan_table(
+            scan_io().materialize(plan.task_id, stream),
+            schema,
+            stream,
+            prepended_source_index=False,
+        )
+        df = df.select(list(schema.keys()))
+    return apply_predicate(
+        df,
+        NamedExpr(base_scan.predicate.name, plan.residual) if plan.residual is not None else None,
+    )
+
+
 class _DeviceView:
     """A byte range of a device buffer, with the CUDA array interface (keeps the buffer alive)."""
 

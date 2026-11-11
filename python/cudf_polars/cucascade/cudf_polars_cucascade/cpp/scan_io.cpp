@@ -285,6 +285,13 @@ std::int64_t scan_io::submit(std::int64_t stream,
   for (auto const& path : paths) {
     t->objects.push_back(wait_footer(path)->object);
   }
+  return enqueue(std::move(t));
+}
+
+std::int64_t scan_io::enqueue(std::shared_ptr<task> t)
+{
+  if (aligned(t->size) > _arena_bytes) { return -1; }
+  auto const stream = t->stream;
   std::int64_t id;
   {
     std::lock_guard lock(_mutex);
@@ -297,6 +304,163 @@ std::int64_t scan_io::submit(std::int64_t stream,
   }
   _cv.notify_all();
   return id;
+}
+
+scan_io::planned_task scan_io::plan_task(std::int64_t stream_id,
+                                         std::vector<std::string> const& paths,
+                                         int split_index,
+                                         int total_splits,
+                                         cudf::io::parquet_reader_options const& options,
+                                         bool prune_with_stats,
+                                         std::size_t merge_gap,
+                                         cudaStream_t stream)
+{
+  planned_task result;
+  std::vector<cudf::io::parquet::FileMetaData> metadata;
+  std::vector<std::shared_ptr<cucascade::io::io_object>> objects;
+  metadata.reserve(paths.size());
+  for (auto const& path : paths) {
+    auto entry = wait_footer(path);
+    metadata.push_back(*entry->metadata);
+    objects.push_back(entry->object);
+  }
+
+  // The task's row groups: every row group of every file, or the stride of one split of a
+  // single file (the last split reads to the end), as the scan task bounds do.
+  std::vector<std::vector<cudf::size_type>> row_groups(metadata.size());
+  if (total_splits > 1) {
+    auto const n = static_cast<int>(metadata.size() == 1 ? metadata[0].row_groups.size() : 0);
+    if (metadata.size() != 1 || total_splits > n) {
+      result.unsupported = true;
+      return result;
+    }
+    auto const stride = n / total_splits;
+    auto const start  = stride * split_index;
+    auto const stop   = split_index == total_splits - 1 ? n : start + stride;
+    for (auto rg = start; rg < stop; ++rg) {
+      row_groups[0].push_back(rg);
+    }
+  } else {
+    for (std::size_t f = 0; f < metadata.size(); ++f) {
+      for (std::size_t rg = 0; rg < metadata[f].row_groups.size(); ++rg) {
+        row_groups[f].push_back(static_cast<cudf::size_type>(rg));
+      }
+    }
+  }
+
+  // Estimated decoded bytes: per projected column chunk, the larger of 8 bytes per row and its
+  // uncompressed size (strings), doubled when the decode applies a filter (a filtered copy).
+  auto const columns = options.get_column_names();
+  auto selected      = [&](cudf::io::parquet::ColumnChunk const& chunk) {
+    if (!columns.has_value()) { return true; }
+    auto const& path = chunk.meta_data.path_in_schema;
+    return !path.empty() &&
+           std::find(columns->begin(), columns->end(), path.front()) != columns->end();
+  };
+  std::size_t decoded = 0;
+  for (std::size_t f = 0; f < metadata.size(); ++f) {
+    for (auto rg : row_groups[f]) {
+      auto const& group = metadata[f].row_groups[rg];
+      for (auto const& chunk : group.columns) {
+        if (!selected(chunk)) { continue; }
+        decoded += std::max<std::size_t>(chunk.meta_data.total_uncompressed_size,
+                                         static_cast<std::size_t>(group.num_rows) * 8);
+      }
+    }
+  }
+  auto const filtered = options.get_filter().has_value();
+  result.decoded_bytes = decoded * (filtered ? 2 : 1);
+
+  auto decode     = std::make_shared<decode_state>();
+  decode->options = options;
+  decode->reader =
+    std::make_unique<cudf::io::parquet::experimental::hybrid_scan_multifile>(
+      std::move(metadata), decode->options);
+  if (prune_with_stats && filtered) {
+    row_groups = decode->reader->filter_row_groups_with_stats(
+      row_groups, decode->options, ::cuda::stream_ref{stream});
+  }
+  if (decode->reader->total_rows_in_row_groups(row_groups) == 0) {
+    result.empty = true;
+    return result;
+  }
+  auto [ranges, sources] =
+    decode->reader->all_column_chunks_byte_ranges(row_groups, decode->options);
+  decode->row_groups = std::move(row_groups);
+
+  // Merge neighbouring ranges of a file into fewer requests, placed back to back in the block.
+  std::vector<std::size_t> order(ranges.size());
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  std::sort(order.begin(), order.end(), [&](auto a, auto b) {
+    return std::pair{sources[a], ranges[a].offset()} < std::pair{sources[b], ranges[b].offset()};
+  });
+  auto t    = std::make_shared<task>();
+  t->stream = stream_id;
+  t->objects = std::move(objects);
+  decode->positions.assign(ranges.size(), 0);
+  decode->sizes.resize(ranges.size());
+  std::size_t block = 0;
+  std::int64_t cur_source = -1, cur_offset = 0, cur_end = 0;
+  std::size_t cur_pos = 0;
+  auto flush = [&] {
+    if (cur_source >= 0) {
+      t->sources.push_back(static_cast<std::int32_t>(cur_source));
+      t->offsets.push_back(static_cast<std::size_t>(cur_offset));
+      t->sizes.push_back(static_cast<std::size_t>(cur_end - cur_offset));
+    }
+  };
+  for (auto i : order) {
+    auto const src    = static_cast<std::int64_t>(sources[i]);
+    auto const offset = ranges[i].offset();
+    auto const end    = offset + ranges[i].size();
+    decode->sizes[i]  = static_cast<std::size_t>(ranges[i].size());
+    if (src == cur_source && offset <= cur_end + static_cast<std::int64_t>(merge_gap)) {
+      if (end > cur_end) {
+        block += static_cast<std::size_t>(end - cur_end);
+        cur_end = end;
+      }
+    } else {
+      flush();
+      cur_source = src;
+      cur_offset = offset;
+      cur_end    = end;
+      cur_pos    = block;
+      block += static_cast<std::size_t>(ranges[i].size());
+    }
+    decode->positions[i] = cur_pos + static_cast<std::size_t>(offset - cur_offset);
+  }
+  flush();
+  t->size   = block;
+  t->decode = std::move(decode);
+  result.staged_bytes = block;
+  result.id           = enqueue(std::move(t));
+  result.too_big      = result.id < 0;
+  return result;
+}
+
+cudf::io::table_with_metadata scan_io::materialize(std::int64_t id, cudaStream_t stream)
+{
+  wait(id);
+  auto t        = find(id);
+  auto& decode  = *t->decode;
+  auto const sv = ::cuda::stream_ref{stream};
+  rmm::device_buffer block(t->size, sv);
+  if (t->size > 0) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      block.data(), _arena + t->block_offset, t->size, cudaMemcpyHostToDevice, stream));
+  }
+  std::vector<cudf::device_span<std::uint8_t const>> spans;
+  spans.reserve(decode.positions.size());
+  auto const* base = static_cast<std::uint8_t const*>(block.data());
+  for (std::size_t i = 0; i < decode.positions.size(); ++i) {
+    spans.emplace_back(base + decode.positions[i], decode.sizes[i]);
+  }
+  auto table = decode.reader->materialize_all_columns(
+    decode.row_groups, spans, decode.options, sv, cudf::get_current_device_resource_ref());
+  // The block (and the arena region it was copied from) must outlive the decode's kernels.
+  CUDF_CUDA_TRY(cudaStreamSynchronize(stream));
+  t->decode.reset();  // the reader holds device buffers of the decode
+  return table;
 }
 
 bool scan_io::try_allocate(task& t)

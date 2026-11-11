@@ -9,7 +9,10 @@
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+#include <cudf/io/experimental/hybrid_scan_multifile.hpp>
+#include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
+#include <cudf/io/types.hpp>
 
 #include <rmm/device_buffer.hpp>
 
@@ -137,6 +140,41 @@ class scan_io {
   /** @brief Give task @p id's block back (after the work that reads it has completed). */
   void release(std::int64_t id);
 
+  /** @brief What @ref plan_task decided for a task. */
+  struct planned_task {
+    std::int64_t id{-1};       ///< task id (when neither empty nor unsupported)
+    bool empty{false};         ///< no row group survives: nothing to read
+    bool unsupported{false};   ///< a split this planner does not handle (plan it another way)
+    bool too_big{false};       ///< larger than the arena
+    std::size_t staged_bytes{0};
+    std::size_t decoded_bytes{0};  ///< estimated peak device bytes of the decode
+  };
+
+  /**
+   * @brief Plan a task from its footers and queue its reads, without the GIL.
+   *
+   * Builds the multi-file hybrid scan reader from the held footers and @p options (columns and
+   * filter of the scan), takes the task's row groups (all of them, or the stride of a split of a
+   * single file), prunes them with footer statistics when @p prune_with_stats and the options
+   * hold a filter, computes the column-chunk byte ranges, merges neighbours closer than
+   * @p merge_gap and queues the reads on @p stream_id. The reader stays with the task for
+   * @ref materialize.
+   */
+  planned_task plan_task(std::int64_t stream_id,
+                         std::vector<std::string> const& paths,
+                         int split_index,
+                         int total_splits,
+                         cudf::io::parquet_reader_options const& options,
+                         bool prune_with_stats,
+                         std::size_t merge_gap,
+                         cudaStream_t stream);
+
+  /**
+   * @brief Decode a planned task from its staged bytes: one copy to the device, then the hybrid
+   * scan reader's `materialize_all_columns` (which applies the filter).
+   */
+  cudf::io::table_with_metadata materialize(std::int64_t id, cudaStream_t stream);
+
   /** @brief Bytes requested from the object store so far (data, not footers). */
   [[nodiscard]] std::size_t fetched_bytes() const noexcept { return _fetched_bytes; }
 
@@ -153,7 +191,16 @@ class scan_io {
 
   std::shared_ptr<footer_entry> wait_footer(std::string const& path);
 
+  struct decode_state {
+    std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_multifile> reader;
+    std::vector<std::vector<cudf::size_type>> row_groups;
+    cudf::io::parquet_reader_options options;
+    std::vector<std::size_t> positions;  // block position of each column-chunk range
+    std::vector<std::size_t> sizes;      // size of each column-chunk range
+  };
+
   struct task {
+    std::shared_ptr<decode_state> decode;  // set by plan_task
     std::int64_t stream{0};
     std::vector<std::shared_ptr<cucascade::io::io_object>> objects;
     std::vector<std::int32_t> sources;
@@ -190,6 +237,7 @@ class scan_io {
   static constexpr std::size_t batch_bytes = 64UL << 20;
   [[nodiscard]] std::vector<read_batch> plan_reads(task const& t) const;
 
+  std::int64_t enqueue(std::shared_ptr<task> t);  // -1 if larger than the arena
   void scheduler_main();
   [[nodiscard]] std::pair<std::int64_t, std::shared_ptr<task>> next_grant();  // mutex_ held
   [[nodiscard]] bool try_allocate(task& t);                                    // mutex_ held
