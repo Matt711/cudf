@@ -4,10 +4,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import asyncio
 import collections
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import pylibcudf as plc
@@ -28,7 +28,6 @@ from rapidsmpf.streaming.core.context import Context
 from cudf_polars.containers import DataType
 from cudf_polars.dsl.expr import Col, NamedExpr
 from cudf_polars.dsl.ir import IR, Distinct, GroupBy, Select
-from cudf_polars.streaming.actor_graph import native_region
 from cudf_polars.dsl.utils.naming import names_to_indices, unique_names
 from cudf_polars.streaming.actor_graph.collectives.ordering import adjust_ordering
 from cudf_polars.streaming.actor_graph.collectives.shuffle import ShuffleManager
@@ -191,7 +190,9 @@ class DecomposedGroupBy:
         )
 
 
-_GROUPBY_CONCURRENCY = max(1, int(os.environ.get("CUDF_POLARS_GROUPBY_CONCURRENCY", "1")))
+_GROUPBY_CONCURRENCY = max(
+    1, int(os.environ.get("CUDF_POLARS_GROUPBY_CONCURRENCY", "1"))
+)
 
 
 async def _local_aggregation(
@@ -1044,36 +1045,6 @@ def _(
     if config_options.executor.dynamic_planning is None:
         # Fall back to the default IR handler (bypass GroupBy/Distinct dispatch)
         return generate_ir_sub_network.dispatch(IR)(ir, rec)
-
-    if isinstance(ir, GroupBy) and (
-        region := native_region.match(
-            ir,
-            rec.state["partition_info"],
-            rec.state["comm"].nranks,
-            rec.state.get("ir_dep_count"),
-        )
-    ):
-        # Experiment: the probe chains up to this group-by run natively; only the build
-        # sides of its joins run as sub-networks (one output slot per join they feed).
-        actors, channels = {}, {}
-        chs_build = []
-        for build in region.builds:
-            a, c = rec(build)
-            actors |= a
-            channels |= c
-            chs_build.append(channels[build].reserve_output_slot())
-        channels[ir] = ChannelManager(rec.state["context"])
-        actors[ir] = [
-            native_region.native_region_actor(
-                rec.state["context"],
-                ir,
-                ir_context_for_node(rec, ir),
-                channels[ir].reserve_input_slot(),
-                chs_build,
-                region,
-            )
-        ]
-        return actors, channels
 
     actors, channels = process_children(ir, rec)
     channels[ir] = ChannelManager(rec.state["context"])

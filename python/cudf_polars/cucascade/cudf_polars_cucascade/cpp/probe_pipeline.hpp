@@ -9,6 +9,7 @@
 
 #include <cudf/binaryop.hpp>
 #include <cudf/join/hash_join.hpp>
+#include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
@@ -53,6 +54,22 @@ struct expr_node {
   int rhs{0};           ///< binary: operand node; ternary: the value where true
   int third{0};         ///< ternary: the value where false
 };
+
+/**
+ * @brief Evaluate a flattened expression (see @ref expr_node) against @p table.
+ * @return The last node's column.
+ */
+std::unique_ptr<cudf::column> evaluate_expression(std::vector<expr_node> const& nodes,
+                                                  cudf::table_view table,
+                                                  ::cuda::stream_ref stream);
+
+/** @brief @ref evaluate_expression on a raw stream (for bindings). */
+inline std::unique_ptr<cudf::column> evaluate_expression_on(std::vector<expr_node> const& nodes,
+                                                            cudf::table_view table,
+                                                            cudaStream_t stream)
+{
+  return evaluate_expression(nodes, table, ::cuda::stream_ref{stream});
+}
 
 /** @brief One step of a probe chain, applied to each decoded chunk in order. */
 struct stage {
@@ -109,6 +126,15 @@ class probe_pipeline {
   /** @brief No more tasks: wait for the workers; returns each branch's final aggregate. */
   std::vector<std::unique_ptr<cudf::table>> finish();
 
+  /** @brief Streamed mode (one branch, no group-by): no more tasks will be submitted. */
+  void close();
+
+  /**
+   * @brief Streamed mode: the next task's output and its submission index, or index -1 once
+   * every task is done. Blocks; a full output queue holds the workers back.
+   */
+  std::pair<std::int64_t, std::unique_ptr<cudf::table>> next_output();
+
   /**
    * @brief Counters: tasks, decode s, join s, compute s, groupby s, fold s, wall s of the first
    * task start to the last task end, joins, rows in, rows out of the first branch's joins.
@@ -117,7 +143,7 @@ class probe_pipeline {
 
  private:
   void worker_main(int index);
-  void run_task(std::int64_t id, ::cuda::stream_ref stream);
+  void run_task(std::int64_t id, std::int64_t seq, ::cuda::stream_ref stream);
   std::unique_ptr<cudf::table> run_branch(std::vector<stage> const& stages,
                                           cudf::table_view input,
                                           ::cuda::stream_ref stream);
@@ -131,14 +157,23 @@ class probe_pipeline {
   std::vector<cudf::table_view> _builds;
   std::vector<std::string> _input_columns;
   std::vector<std::unique_ptr<cudf::hash_join>> _joins;
-  std::vector<cudaStream_t> _streams;  // one per worker, owned
+  std::vector<cudaStream_t> _streams;  // one per worker, from a process-wide pool
   std::vector<std::thread> _workers;
 
   std::mutex _mutex;
   std::condition_variable _cv;
-  std::deque<std::int64_t> _queue;
+  std::deque<std::pair<std::int64_t, std::int64_t>> _queue;  // (task id, submission index)
+  std::int64_t _next_seq{0};
   bool _closed{false};
   std::exception_ptr _error;
+
+  // streamed mode: each task's output, in completion order
+  bool _streamed{false};
+  std::size_t _out_cap{0};
+  int _running{0};
+  bool _cancel{false};
+  std::condition_variable _out_cv;
+  std::deque<std::pair<std::int64_t, std::unique_ptr<cudf::table>>> _out;
 
   // per branch: folded partial aggregates (key columns, then one sum per value column)
   std::vector<std::mutex> _fold_mutex;

@@ -19,6 +19,7 @@ from rmm.pylibrmm.device_buffer cimport DeviceBuffer
 from rmm.pylibrmm.stream cimport Stream
 
 from cudf_polars_cucascade.libcucascade.scan_io cimport (
+    evaluate_expression_on,
     expr_node,
     planned_task,
     probe_pipeline as cpp_probe_pipeline,
@@ -28,10 +29,12 @@ from cudf_polars_cucascade.libcucascade.scan_io cimport (
 )
 from pylibcudf.libcudf.table.table cimport table
 from pylibcudf.libcudf.table.table_view cimport table_view
+from pylibcudf.column cimport Column
+from pylibcudf.libcudf.column.column cimport column
 from pylibcudf.table cimport Table
 from rmm.pylibrmm.memory_resource cimport DeviceMemoryResource
 
-__all__ = ["ProbePipeline", "ScanIO"]
+__all__ = ["ProbePipeline", "ScanIO", "evaluate_expression"]
 
 
 cdef class ScanIO:
@@ -359,6 +362,27 @@ cdef class ProbePipeline:
         stream = Stream()  # the results are complete: finish() synchronized
         return [Table.from_libcudf(move(result[i]), stream, mr) for i in range(result.size())]
 
+    def close(self) -> None:
+        """Streamed mode: no more tasks will be submitted."""
+        with nogil:
+            self.c_obj.get().close()
+
+    def next_output(self):
+        """
+        Streamed mode: ``(index, table)`` of the next finished task (its submission index), or
+        None once every task is done. Blocks without the GIL.
+        """
+        cdef pair[int64_t, unique_ptr[table]] item
+        with nogil:
+            item = move(self.c_obj.get().next_output())
+        if item.first < 0:
+            return None
+        import rmm.mr
+
+        return item.first, Table.from_libcudf(
+            move(item.second), Stream(), rmm.mr.get_current_device_resource()
+        )
+
     def stats(self) -> dict:
         """Counters of the work so far."""
         cdef vector[double] v = self.c_obj.get().stats()
@@ -367,3 +391,17 @@ cdef class ProbePipeline:
             "joins", "rows_in", "rows_out",
         )
         return {name: v[i] for i, name in enumerate(names)}
+
+
+def evaluate_expression(Table table, list nodes) -> Column:
+    """Evaluate a native expression program on ``table`` (for testing the contract)."""
+    cdef vector[expr_node] c_nodes = _expr(nodes)
+    cdef table_view view = table.view()
+    stream = Stream()
+    cdef cudaStream_t c_stream = (<Stream>stream)._cuda_stream
+    cdef unique_ptr[column] result
+    with nogil:
+        result = move(evaluate_expression_on(c_nodes, view, c_stream))
+    import rmm.mr
+
+    return Column.from_libcudf(move(result), stream, rmm.mr.get_current_device_resource())

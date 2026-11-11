@@ -44,6 +44,7 @@ from cudf_polars.streaming.base import PartitionInfo
 from cudf_polars.streaming.dispatch import lower_ir_node
 from cudf_polars.streaming.hint_sorted import HintSorted
 from cudf_polars.streaming.io import _clear_source_info_cache
+from cudf_polars.streaming.native import rewrite_native_regions
 from cudf_polars.streaming.plan_metadata import PlanMetadata
 from cudf_polars.streaming.repartition import Repartition
 from cudf_polars.streaming.utils import (
@@ -168,6 +169,9 @@ def _lower_ir_graph_impl(
     )
     mapper: LowerIRTransformer = CachingVisitor(lower_ir_node, state=state)
     lowered, partition_info = mapper(optimized)
+    lowered, partition_info = rewrite_native_regions(
+        lowered, partition_info, nranks=nranks
+    )
     return LoweringInfo(
         optimized=optimized,
         lowered=lowered,

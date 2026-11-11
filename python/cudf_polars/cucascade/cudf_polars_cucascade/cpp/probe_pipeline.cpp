@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
+#include <tuple>
 #include <string>
 
 namespace cudf_polars_cucascade {
@@ -66,10 +67,27 @@ cudf::table_view select(cudf::table_view t, std::vector<int> const& columns)
   return cudf::table_view(cols);
 }
 
-// Evaluates a flattened expression against `t`; returns the result column.
-std::unique_ptr<cudf::column> evaluate(std::vector<expr_node> const& nodes,
-                                       cudf::table_view t,
-                                       ::cuda::stream_ref stream)
+
+// Worker streams come from a process-wide pool that is never destroyed: tables built on them
+// (streamed outputs, results) are freed on them after the pipeline is gone.
+cudaStream_t pooled_stream(std::size_t i)
+{
+  static std::mutex mutex;
+  static std::vector<cudaStream_t> pool;
+  std::lock_guard lock(mutex);
+  while (pool.size() <= i) {
+    cudaStream_t s = nullptr;
+    CUDF_CUDA_TRY(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    pool.push_back(s);
+  }
+  return pool[i];
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::column> evaluate_expression(std::vector<expr_node> const& nodes,
+                                                  cudf::table_view t,
+                                                  ::cuda::stream_ref stream)
 {
   CUDF_EXPECTS(!nodes.empty(), "probe_pipeline: empty expression");
   // Each node's value: a column (owned or a view into `t`) or a scalar.
@@ -123,8 +141,6 @@ std::unique_ptr<cudf::column> evaluate(std::vector<expr_node> const& nodes,
   return std::move(owned.back());
 }
 
-}  // namespace
-
 probe_pipeline::probe_pipeline(scan_io& io,
                                std::vector<std::vector<stage>> branches,
                                std::vector<cudf::table_view> builds,
@@ -140,15 +156,19 @@ probe_pipeline::probe_pipeline(scan_io& io,
     _stats(n_counters, 0.0)
 {
   CUDF_EXPECTS(_builds.size() == build_keys.size(), "probe_pipeline: one key list per build");
-  for (auto const& stages : _branches) {
-    CUDF_EXPECTS(!stages.empty() && stages.back().op == stage::groupby,
-                 "probe_pipeline: every branch must end in a group-by");
+  _streamed = _branches.size() == 1 && !_branches[0].empty() &&
+              _branches[0].back().op != stage::groupby;
+  if (!_streamed) {
+    for (auto const& stages : _branches) {
+      CUDF_EXPECTS(!stages.empty() && stages.back().op == stage::groupby,
+                   "probe_pipeline: every branch must end in a group-by (or one branch streams)");
+    }
   }
   for (int i = 0; i < std::max(threads, 1); ++i) {
-    cudaStream_t s = nullptr;
-    CUDF_CUDA_TRY(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-    _streams.push_back(s);
+    _streams.push_back(pooled_stream(static_cast<std::size_t>(i)));
   }
+  _out_cap  = 2 * _streams.size();
+  _running  = threads;
   for (std::size_t i = 0; i < _builds.size(); ++i) {
     _joins.push_back(std::make_unique<cudf::hash_join>(select(_builds[i], build_keys[i]),
                                                        cudf::null_equality::UNEQUAL,
@@ -165,20 +185,16 @@ probe_pipeline::~probe_pipeline()
   {
     std::lock_guard lock(_mutex);
     _closed = true;
+    _cancel = true;
     _queue.clear();
   }
   _cv.notify_all();
+  _out_cv.notify_all();
   for (auto& w : _workers) {
     if (w.joinable()) { w.join(); }
   }
-  // Device memory allocated on the worker streams goes back on them: free it before they go.
   for (auto s : _streams) {
     cudaStreamSynchronize(s);
-  }
-  _partials.clear();
-  _joins.clear();
-  for (auto s : _streams) {
-    cudaStreamDestroy(s);
   }
 }
 
@@ -186,9 +202,32 @@ void probe_pipeline::submit(std::int64_t task_id)
 {
   {
     std::lock_guard lock(_mutex);
-    _queue.push_back(task_id);
+    _queue.emplace_back(task_id, _next_seq++);
   }
   _cv.notify_one();
+}
+
+void probe_pipeline::close()
+{
+  {
+    std::lock_guard lock(_mutex);
+    _closed = true;
+  }
+  _cv.notify_all();
+  _out_cv.notify_all();
+}
+
+std::pair<std::int64_t, std::unique_ptr<cudf::table>> probe_pipeline::next_output()
+{
+  std::unique_lock lock(_mutex);
+  _out_cv.wait(lock, [&] { return !_out.empty() || _error || (_closed && _running == 0); });
+  if (_error) { std::rethrow_exception(_error); }
+  if (_out.empty()) { return {-1, nullptr}; }
+  auto item = std::move(_out.front());
+  _out.pop_front();
+  lock.unlock();
+  _out_cv.notify_all();
+  return item;
 }
 
 void probe_pipeline::worker_main(int index)
@@ -196,11 +235,17 @@ void probe_pipeline::worker_main(int index)
   auto stream = ::cuda::stream_ref{_streams[index]};
   while (true) {
     std::int64_t id;
+    std::int64_t seq;
     {
       std::unique_lock lock(_mutex);
       _cv.wait(lock, [&] { return _closed || !_queue.empty(); });
-      if (_queue.empty()) { return; }
-      id = _queue.front();
+      if (_queue.empty()) {
+        --_running;
+        lock.unlock();
+        _out_cv.notify_all();
+        return;
+      }
+      std::tie(id, seq) = _queue.front();
       _queue.pop_front();
       if (_error) {
         lock.unlock();
@@ -209,16 +254,19 @@ void probe_pipeline::worker_main(int index)
       }
     }
     try {
-      run_task(id, stream);
+      run_task(id, seq, stream);
     } catch (...) {
-      std::lock_guard lock(_mutex);
-      if (!_error) { _error = std::current_exception(); }
+      {
+        std::lock_guard lock(_mutex);
+        if (!_error) { _error = std::current_exception(); }
+      }
+      _out_cv.notify_all();
     }
     _io.release(id);
   }
 }
 
-void probe_pipeline::run_task(std::int64_t id, ::cuda::stream_ref stream)
+void probe_pipeline::run_task(std::int64_t id, std::int64_t seq, ::cuda::stream_ref stream)
 {
   auto const t0 = now();
   auto decoded  = _io.materialize(id, stream.get());
@@ -242,9 +290,19 @@ void probe_pipeline::run_task(std::int64_t id, ::cuda::stream_ref stream)
     }
     input = select(input, order);
   }
-  for (std::size_t b = 0; b < _branches.size(); ++b) {
-    auto partial = run_branch(_branches[b], input, stream);
-    fold(b, std::move(partial), stream);
+  if (_streamed) {
+    auto out = run_branch(_branches[0], input, stream);
+    stream.sync();  // complete before another thread hands it on
+    std::unique_lock lock(_mutex);
+    _out_cv.wait(lock, [&] { return _out.size() < _out_cap || _cancel; });
+    if (!_cancel) { _out.emplace_back(seq, std::move(out)); }
+    lock.unlock();
+    _out_cv.notify_all();
+  } else {
+    for (std::size_t b = 0; b < _branches.size(); ++b) {
+      auto partial = run_branch(_branches[b], input, stream);
+      fold(b, std::move(partial), stream);
+    }
   }
   std::lock_guard lock(_stats_mutex);
   _t_last = std::max(_t_last, now());
@@ -255,7 +313,8 @@ std::unique_ptr<cudf::table> probe_pipeline::run_branch(std::vector<stage> const
                                                         ::cuda::stream_ref stream)
 {
   std::unique_ptr<cudf::table> current;  // owns the current view's data after the first stage
-  auto view = input;
+  auto view  = input;
+  bool owned = false;  // whether `view` is all of `current`
   for (auto const& s : stages) {
     auto const t0 = now();
     std::size_t c = 0;
@@ -281,6 +340,7 @@ std::unique_ptr<cudf::table> probe_pipeline::run_branch(std::vector<stage> const
         }
         current = std::make_unique<cudf::table>(std::move(cols));
         view    = current->view();
+        owned   = true;
         c       = join_s;
         std::lock_guard lock(_stats_mutex);
         _stats[joins] += 1;
@@ -296,15 +356,17 @@ std::unique_ptr<cudf::table> probe_pipeline::run_branch(std::vector<stage> const
           cols.push_back(std::make_unique<cudf::column>(view.column(i), stream));
         }
         for (auto const& e : s.exprs) {
-          cols.push_back(evaluate(e, view, stream));
+          cols.push_back(evaluate_expression(e, view, stream));
         }
         current = std::make_unique<cudf::table>(std::move(cols));
         view    = current->view();
+        owned   = true;
         c       = compute_s;
         break;
       }
       case stage::select: {
-        view = select(view, s.columns);
+        view  = select(view, s.columns);
+        owned = false;
         break;
       }
       case stage::groupby: {
@@ -323,6 +385,7 @@ std::unique_ptr<cudf::table> probe_pipeline::run_branch(std::vector<stage> const
         }
         current = std::make_unique<cudf::table>(std::move(cols));
         view    = current->view();
+        owned   = true;
         c       = groupby_s;
         break;
       }
@@ -332,6 +395,7 @@ std::unique_ptr<cudf::table> probe_pipeline::run_branch(std::vector<stage> const
       _stats[c] += now() - t0;
     }
   }
+  if (!owned) { return std::make_unique<cudf::table>(view, stream); }
   return current;
 }
 
@@ -405,6 +469,7 @@ std::vector<std::unique_ptr<cudf::table>> probe_pipeline::finish()
   }
   _workers.clear();
   if (_error) { std::rethrow_exception(_error); }
+  if (_streamed) { return {}; }
   // The results outlive the pipeline and its streams: build them on the default stream.
   auto stream = cudf::get_default_stream();
   std::vector<std::unique_ptr<cudf::table>> out;
