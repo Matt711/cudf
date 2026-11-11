@@ -699,8 +699,10 @@ def execute_ir_on_rank(
         quent_query_worker_state=quent_query_worker_state,
     )
 
+    remote_io.mark("net_start")
     try:
         run_actor_network(ctx, actors=nodes)
+        remote_io.mark("net_end")
     except (MemoryError, BaseExceptionGroup) as e:
         if (mem_error := _find_memory_error(e)) is not None:
             target_partition_size = config_options.executor.target_partition_size
@@ -742,6 +744,7 @@ def execute_ir_on_rank(
             list(ir.schema.values()),
             stream,
         )
+    remote_io.mark("result")
     return df, metadata_collector
 
 

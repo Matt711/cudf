@@ -70,6 +70,7 @@ from cudf_polars.streaming.actor_graph.tracing import send_chunk
 from cudf_polars.streaming.actor_graph.utils import (
     CUDF_ROW_LIMIT,
     MAX_ROWS_PER_PARTITION,
+    PostChannel,
     ChannelManager,
     ChunkSampler,
     ChunkStore,
@@ -2321,6 +2322,11 @@ def _(
     # Create output ChannelManager
     channels[ir] = ChannelManager(rec.state["context"])
     ir_context = ir_context_for_node(rec, ir)
+    post = rec.state.get("post_chains", {}).get(ir)  # type: ignore[attr-defined]
+
+    def _out() -> Any:
+        ch = channels[ir].reserve_input_slot()
+        return ch if post is None else PostChannel(ch, post, ir_context)
 
     if pwise_join:
         # Partition-wise join (use default_node_multi)
@@ -2358,7 +2364,7 @@ def _(
                 rec.state["comm"],
                 ir,
                 ir_context,
-                channels[ir].reserve_input_slot(),
+                _out(),
                 channels[left].reserve_output_slot(),
                 channels[right].reserve_output_slot(),
                 tuple(
@@ -2385,7 +2391,7 @@ def _(
                 rec.state["comm"],
                 ir,
                 ir_context,
-                channels[ir].reserve_input_slot(),
+                _out(),
                 channels[left].reserve_output_slot(),
                 channels[right].reserve_output_slot(),
                 broadcast_side=broadcast_side,

@@ -479,6 +479,31 @@ def _evaluate_chunk_sync(
 _INLINE_CHEAP = bool(__import__("os").environ.get("CUDF_POLARS_INLINE_CHEAP"))
 
 
+_ONE_HOP = bool(__import__("os").environ.get("CUDF_POLARS_ONE_HOP"))
+
+
+def _evaluate_chain_sync(
+    chunk: TableChunk,
+    irs: tuple[IR, ...],
+    ir_context: IRExecutionContext,
+    br: Any,
+    ordering_metadata: OrderingMetadata | None,
+) -> TableChunk:
+    for single_ir in irs:
+        t0 = time.perf_counter()
+        chunk = _evaluate_chunk_sync(
+            chunk, single_ir, ir_context, br, ordering_metadata=ordering_metadata
+        )
+        remote_io.trace(
+            f"op:{type(single_ir).__name__}",
+            id(single_ir) & 0xFFFF,
+            0,
+            int((time.perf_counter() - t0) * 1e6),
+        )
+        ordering_metadata = None
+    return chunk
+
+
 async def evaluate_chunk(
     context: Context,
     chunk: TableChunk,
@@ -528,6 +553,16 @@ async def evaluate_chunk(
             net_memory_delta=0,
         )
     with opaque_memory_usage(reservation):
+        if _ONE_HOP and len(irs) > 1:
+            # The whole chain in one thread hop.
+            return await ir_context.to_thread(
+                _evaluate_chain_sync,
+                chunk,
+                irs,
+                ir_context,
+                context.br(),
+                ordering_metadata,
+            )
         for single_ir in irs:
             if _INLINE_CHEAP and type(single_ir).__name__ in ("Projection", "Select"):
                 # Experiment: cheap column selections run inline, without a thread hop.
@@ -556,6 +591,56 @@ async def evaluate_chunk(
                 )
             ordering_metadata = None
         return chunk
+
+
+class PostChannel:
+    """
+    An actor's output channel that runs a chain of chunkwise IR nodes on each chunk it sends.
+
+    Experiment (CUDF_POLARS_FUSE_JOIN_POST): the chain runs in the producing actor instead of
+    in actors of its own. Partitioning metadata is remapped through the chain.
+    """
+
+    def __init__(
+        self, ch: Any, post: tuple[IR, ...], ir_context: IRExecutionContext
+    ) -> None:
+        self._ch = ch
+        self._post = post
+        self._ir_context = ir_context
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._ch, name)
+
+    async def send_metadata(self, ctx: Context, msg: Message) -> None:
+        from cudf_polars.streaming.actor_graph.partitioning import (  # noqa: PLC0415
+            maybe_remap_partitioning,
+        )
+
+        metadata = ChannelMetadata.from_message(msg)
+        partitioning = metadata.partitioning
+        for node in self._post:
+            partitioning = maybe_remap_partitioning(node, partitioning, context=ctx)
+        await self._ch.send_metadata(
+            ctx,
+            Message(
+                0,
+                ChannelMetadata(
+                    local_count=metadata.local_count,
+                    partitioning=partitioning,
+                    duplicated=metadata.duplicated,
+                ),
+            ),
+        )
+
+    async def send(self, ctx: Context, msg: Message) -> None:
+        seq = msg.sequence_number
+        chunk = await evaluate_chunk(
+            ctx,
+            TableChunk.from_message(msg, br=ctx.br()),
+            *self._post,
+            ir_context=self._ir_context,
+        )
+        await self._ch.send(ctx, Message(seq, chunk))
 
 
 async def allgather_and_reduce(

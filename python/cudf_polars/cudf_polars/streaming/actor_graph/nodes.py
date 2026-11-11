@@ -19,7 +19,7 @@ from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
 
-from cudf_polars.dsl.ir import IR, Empty, HConcat
+from cudf_polars.dsl.ir import IR, Empty, HConcat, Join
 from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
     ir_context_for_node,
@@ -585,6 +585,7 @@ async def fanout_node_unbounded(
 # Experiment: run a chain of single-input chunkwise nodes in one actor (one thread hop and no
 # channel hop per chunk between them).
 _FUSE_CHUNKWISE = bool(__import__("os").environ.get("CUDF_POLARS_FUSE_CHUNKWISE"))
+_FUSE_JOIN_POST = bool(__import__("os").environ.get("CUDF_POLARS_FUSE_JOIN_POST"))
 
 
 def _fusable(node: IR, rec: SubNetGenerator) -> bool:
@@ -610,6 +611,20 @@ def _default_sub_network(
     ):
         while _fusable((fused[0] if fused else ir).children[0], rec):
             fused = ((fused[0] if fused else ir).children[0], *fused)
+    source = (fused[0] if fused else ir).children[0] if len(ir.children) == 1 else None
+    if (
+        _FUSE_JOIN_POST
+        and isinstance(source, Join)
+        and source not in rec.state["fanout_nodes"]
+        and rec.state["quent_operator_map"] is None
+    ):
+        # The join runs the chain on each chunk it sends: no actor of its own.
+        rec.state.setdefault("post_chains", {})[source] = (*fused, ir)  # type: ignore[typeddict-item]
+        nodes, channels = rec(source)
+        nodes, channels = dict(nodes), dict(channels)
+        nodes[ir] = []
+        channels[ir] = channels[source]
+        return nodes, channels
     if fused:
         # Process the input of the first fused node instead of the children
         nodes, channels = rec(fused[0].children[0])

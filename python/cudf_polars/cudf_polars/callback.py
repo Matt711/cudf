@@ -273,7 +273,11 @@ def _callback(
         elif config_options.executor.name == "streaming":
             from cudf_polars.streaming.parallel import evaluate_streaming
 
+            from cudf_polars.streaming import remote_io
+
+            remote_io.mark("callback")
             df = evaluate_streaming(ir, config_options)
+            remote_io.mark("polars_out")
             record_signal("gpu_executed", gpu_executed)
             return df
         assert_never(config_options.executor)
@@ -302,6 +306,9 @@ def execute_with_cudf(nt: NodeTraverser, *, config: GPUEngine) -> None:
     -----
     The NodeTraverser is mutated if the libcudf executor can handle the plan.
     """
+    from cudf_polars.streaming import remote_io
+
+    remote_io.mark_entry()
     # Translation can decline a plan before the execution callback is installed.
     record_signal("gpu_attempted", gpu_attempted)
     memory_resource = config.memory_resource

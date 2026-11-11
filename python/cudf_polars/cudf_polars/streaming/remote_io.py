@@ -491,10 +491,27 @@ def begin_query() -> None:
         _physical_types.cache_clear()
         _query["index"] += 1
         _query["t0"] = time.perf_counter()
-        trace("query", -1, -1, 0)
+        mark("begin_query")
+        trace("query", -1, -1, int((_query["t0"] - _entry[0]) * 1e6) if _entry else 0)
 
 
 _trace: list[tuple] = []
+_entry: list[float] = []
+
+
+_marks: list[tuple[str, float]] = []
+
+
+def mark_entry() -> None:
+    """Record when the engine got the query (the 'query' event then carries the setup time)."""
+    _entry[:] = [time.perf_counter()]
+    mark("entry")
+
+
+def mark(name: str) -> None:
+    """Record an absolute timestamp (dumped next to the trace, as <trace>.marks)."""
+    if _TRACE_PATH:
+        _marks.append((name, time.perf_counter()))
 
 
 def trace(event: str, scan: int, task: int, nbytes: int) -> None:
@@ -513,6 +530,10 @@ def trace(event: str, scan: int, task: int, nbytes: int) -> None:
 
 
 def _dump_trace() -> None:
+    if _TRACE_PATH and _marks:
+        with open(_TRACE_PATH + ".marks", "w") as f:
+            for name, t in _marks:
+                f.write(f"{name}\t{t:.6f}\n")
     if _TRACE_PATH and _trace:
         with open(_TRACE_PATH, "w") as f:
             f.write("query\tt\tevent\tscan\ttask\tbytes\n")
