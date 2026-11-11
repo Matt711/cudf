@@ -63,6 +63,42 @@ void debug(int actor, char const* what, Args... args)
   std::fputc('\n', stderr);
 }
 
+// Compute runs on streams of the highest priority (CUDF_POLARS_PRIORITY_STREAMS=N of them), so its
+// kernels are scheduled ahead of queued decode kernels; unset, it runs on the input's stream.
+// The streams live for the process: tables built on them are freed on them later.
+// Order @p waiter after the work queued on @p waited so far.
+void stream_wait(::cuda::stream_ref waiter, ::cuda::stream_ref waited)
+{
+  if (waiter.get() == waited.get()) { return; }
+  cudaEvent_t event = nullptr;
+  CUDF_CUDA_TRY(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+  CUDF_CUDA_TRY(cudaEventRecord(event, waited.get()));
+  CUDF_CUDA_TRY(cudaStreamWaitEvent(waiter.get(), event));
+  CUDF_CUDA_TRY(cudaEventDestroy(event));
+}
+
+::cuda::stream_ref compute_stream_after(::cuda::stream_ref input)
+{
+  static std::vector<cudaStream_t> const pool = [] {
+    std::vector<cudaStream_t> streams;
+    auto const* v = std::getenv("CUDF_POLARS_PRIORITY_STREAMS");
+    auto const n  = v == nullptr ? 0 : std::atoi(v);
+    int least = 0, greatest = 0;
+    if (n > 0) { CUDF_CUDA_TRY(cudaDeviceGetStreamPriorityRange(&least, &greatest)); }
+    for (int i = 0; i < n; ++i) {
+      cudaStream_t s = nullptr;
+      CUDF_CUDA_TRY(cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, greatest));
+      streams.push_back(s);
+    }
+    return streams;
+  }();
+  static std::atomic<std::size_t> next{0};
+  if (pool.empty()) { return input; }
+  auto const stream = ::cuda::stream_ref{pool[next++ % pool.size()]};
+  stream_wait(stream, input);  // the input's work comes first
+  return stream;
+}
+
 // How long a producer waiting on the scan service sleeps between checks (after yielding its
 // executor thread), so waiting costs neither a thread nor a spinning core.
 constexpr auto poll_interval = std::chrono::microseconds(100);
@@ -265,12 +301,14 @@ rs::Actor work(std::shared_ptr<rs::Context> ctx,
     auto const seq = msg.sequence_number();
     auto input     = msg.release<table_chunk>();
     auto chunk     = co_await input.make_available(ctx);
-    auto stream    = chunk.stream();
+    auto stream    = compute_stream_after(chunk.stream());
     std::vector<std::unique_ptr<cudf::table>> outs;
     for (auto const& stages : branches) {
       outs.push_back(run_stages(stages, chunk.table_view(), st->builds, stream));
     }
     auto out = concat_tables(outs, stream);
+    // The input is freed on its own stream when this iteration ends: after the compute reads it.
+    stream_wait(chunk.stream(), stream);
     if (fold_keys < 0) {
       while (st->ordered && st->next_send.load() != turn) {
         co_await ctx->executor()->yield();

@@ -541,6 +541,7 @@ def begin_query() -> None:
         _physical_types.cache_clear()
         _query["index"] += 1
         _query["t0"] = time.perf_counter()
+        _channels.clear()
         mark("begin_query")
         trace("query", -1, -1, int((_query["t0"] - _entry[0]) * 1e6) if _entry else 0)
         # Cumulative data bytes fetched and taken from shared chunks, as of this query's start.
@@ -588,6 +589,10 @@ def _dump_trace() -> None:
         with open(_TRACE_PATH + ".marks", "w") as f:
             for name, t in _marks:
                 f.write(f"{name}\t{t:.6f}\n")
+    if _TRACE_PATH and _channel_labels:
+        with open(_TRACE_PATH + ".chans", "w") as f:
+            for cid, label in _channel_labels.items():
+                f.write(f"{cid}\t{label}\n")
     if _TRACE_PATH and _trace:
         with open(_TRACE_PATH, "w") as f:
             f.write("query\tt\tevent\tscan\ttask\tbytes\n")
@@ -599,6 +604,42 @@ _TRACE_PATH = os.environ.get("CUDF_POLARS_IO_TRACE")
 _sampler: list[threading.Thread] = []
 
 
+_channels: list[
+    tuple[int, Any, list[int]]
+] = []  # this query's (id, channel, last sample)
+_channel_labels: dict[int, str] = {}
+_channel_ids = itertools.count()
+
+
+def register_channel(label: str, channel: Any) -> None:
+    """Sample ``channel``'s traffic and occupancy with the I/O trace (when tracing)."""
+    if not _TRACE_PATH:
+        return
+    cid = next(_channel_ids)
+    _channel_labels[cid] = f"{_query['index']}\t{label}"
+    _channels.append((cid, channel, [-1, -1]))
+
+
+def _metric(m: Any, name: str) -> Any:
+    value = getattr(m, name)
+    return value() if callable(value) else value
+
+
+def _sample_channels(t: float) -> None:
+    # Per channel, when it changed: messages sent so far and bytes in it (sent - received).
+    for cid, channel, last in list(_channels):
+        try:
+            m = channel.metrics()
+            sent = sum(_metric(m, "send_bytes").values())
+            occupancy = sent - sum(_metric(m, "recv_bytes").values())
+            messages = _metric(m, "message_count")
+        except Exception:  # noqa: BLE001  (a closed channel; tracing must not fail the query)
+            continue
+        if [messages, occupancy] != last:
+            last[:] = [messages, occupancy]
+            _trace.append((_query["index"], t, "chan", cid, messages, occupancy >> 10))
+
+
 def _start_sampler(service: Any) -> None:
     # Every 10 ms: tasks waiting for a block, bytes in flight, bytes queued, free arena bytes.
     if not _TRACE_PATH or _sampler or not hasattr(service, "snapshot"):
@@ -608,13 +649,23 @@ def _start_sampler(service: Any) -> None:
         while True:
             time.sleep(0.01)
             if _query["index"] >= 0:
+                t = round(time.perf_counter() - _query["t0"], 4)
                 w, inflight, queued, free = service.snapshot()
                 _trace.append(
-                    (_query["index"], round(time.perf_counter() - _query["t0"], 4), "iostat",
-                     int(w), int(queued >> 20), (int(inflight >> 20) << 32) | int(free >> 20))
+                    (
+                        _query["index"],
+                        t,
+                        "iostat",
+                        int(w),
+                        int(queued >> 20),
+                        (int(inflight >> 20) << 32) | int(free >> 20),
+                    )
                 )
+                _sample_channels(t)
 
     t = threading.Thread(target=_run, daemon=True, name="io-sampler")
     _sampler.append(t)
     t.start()
+
+
 atexit.register(_dump_trace)

@@ -32,6 +32,7 @@ from cudf_polars.containers import DataType
 from cudf_polars.dsl.expr import Col, NamedExpr
 from cudf_polars.dsl.ir import IR, Distinct, GroupBy, Select
 from cudf_polars.dsl.utils.naming import names_to_indices, unique_names
+from cudf_polars.streaming import remote_io
 from cudf_polars.streaming.actor_graph import native
 from cudf_polars.streaming.actor_graph.collectives.ordering import adjust_ordering
 from cudf_polars.streaming.actor_graph.collectives.shuffle import ShuffleManager
@@ -1080,6 +1081,9 @@ def _(
         # The piecewise aggregation runs in a C++ actor in front of this one.
         piecewise_ir, stages = plan
         ch_partials = rec.state["context"].create_channel()
+        remote_io.register_channel(
+            f"GroupBy@{id(ir) & 0xFFFFFF:x}.partials", ch_partials
+        )
         actors[ir].append(
             native.native_piecewise_actor(
                 rec.state["context"],

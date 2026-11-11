@@ -245,3 +245,11 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
   difference beyond network noise: C++ channel hops cost nothing measurable, so the speedup is from removing Python per-chunk
   handoffs, not from fusion. Next design step: lower supported operators to C++ actors individually (no region carving).
   Open: output partitioning metadata per operator, runtime join strategy, high-cardinality group-by via the existing reduction.
+- Native operators (d1779338ac; CUDF_POLARS_NATIVE_JOIN/CHUNKWISE/GROUPBY): Python keeps the control plane, a C++ chain actor
+  runs each operator's per-chunk loop (rapidsmpf when_all). Full pairs 134.4 vs 136.2 (Q22 +4.3 outlier) and 119.6 vs 124.5,
+  all 22 valid. Q7 has no per-chunk Python left (7.2-7.5 s). Native compute now on high-priority streams (event-ordered after
+  the decode; the input waits for the compute before it is freed).
+- Pipeline timeline (channel metrics sampled every 10 ms with the I/O trace; notes/pipeline.py): Q7 probes start at 3.6-4.2 s
+  though lineitem arrives from 1.8 s, because the build sides (orders scan sharing bandwidth) finish at 3.5-4.2 s; the bounded
+  lineitem fanout waits on the slower branch 100%. Q9: orders chunks (probe side) wait 1-10 s for the lineitem-derived broadcast
+  side. Q21: 4.1 s tail in Python operators (semi/anti joins, counts, shuffles). Next: build-first fetch priority.

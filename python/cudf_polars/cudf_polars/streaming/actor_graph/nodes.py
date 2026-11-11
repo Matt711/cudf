@@ -20,6 +20,7 @@ from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
 
 from cudf_polars.dsl.ir import IR, Empty, HConcat, Join
+from cudf_polars.streaming import remote_io
 from cudf_polars.streaming.actor_graph import native
 from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
@@ -829,6 +830,9 @@ def generate_ir_sub_network_wrapper(
         corresponding streaming-network output ChannelManager.
     """
     nodes, channels = generate_ir_sub_network(ir, rec)
+    label = f"{type(ir).__name__}@{id(ir) & 0xFFFFFF:x}"
+    for i, ch in enumerate(channels[ir]._channel_slots):
+        remote_io.register_channel(f"{label}.{i}", ch)
 
     # Check if this node needs fanout
     if (fanout_info := rec.state["fanout_nodes"].get(ir)) is not None:
@@ -843,6 +847,8 @@ def generate_ir_sub_network_wrapper(
             channels[ir] = _PerConsumerChannels(managers)  # type: ignore[assignment]
             return nodes, channels
         manager = ChannelManager(rec.state["context"], count=count)
+        for i, ch in enumerate(manager._channel_slots):
+            remote_io.register_channel(f"{label}.fanout{i}", ch)
         ir_context = ir_context_for_node(rec, ir)
         fanout_node: Any
         if fanout_info.unbounded:

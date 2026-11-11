@@ -351,6 +351,7 @@ def _cpp_sub_network(
     concurrency = int(os.environ.get("CUDF_POLARS_NATIVE_THREADS", "4"))
     nodes: list[Any] = []
     ch_scan = context.create_channel()
+    remote_io.register_channel(f"NativeRegion@{id(ir) & 0xFFFFFF:x}.scan", ch_scan)
     nodes.append(
         scan_source_actor(
             context,
@@ -497,6 +498,7 @@ async def native_broadcast_probe(
     from rapidsmpf.streaming.core.actor import when_all
 
     ch_build: Channel[TableChunk] = context.create_channel()
+    remote_io.register_channel(f"Join.build@{id(ch_large) & 0xFFFFFF:x}", ch_build)
     actor = chain_actor(
         context,
         [ch_build],
