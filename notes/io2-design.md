@@ -234,3 +234,14 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
 - Paused for design here (Matt, 11 Nov). Uncommitted, built only into cudf-ext-io2g-site: C++ streamed-output mode for the
   probe pipeline (bounded output queue, close()/next_output(), process-wide worker stream pool) for a "native probe source"
   that would emit one chunk per task into the regular engine; the Python matcher/actor for it is not written.
+
+## 12 Nov: native regions on rapidsmpf C++ actors (io151-io166)
+- Step 1 (24f2eaae01): NativeRegion IR node from a lowering pass, cudf_polars.streaming.native package, 29 unit tests. Same six
+  queries match; gate pairs 117.5 vs 122.9 and 127.1 vs 140.1 (native queries -4.6 / -9.4 s), all valid.
+- Step 2 (6e75013ba4): rapidsmpf C++ actors in the extension (scan_source, chain, broadcast), stage code shared in stages.cpp.
+  rapidsmpf's C++ fanout forwards data only, so broadcast sends channel metadata first (found with CUDF_POLARS_NATIVE_DEBUG=1:
+  every chain waited for input metadata).
+- Fused vs composed vs python (Q3/5/7/8/9/10, alternating): fused 41.8 / 44.7, composed 42.7 / 41.9, python 42.6 / 43.9 s. No
+  difference beyond network noise: C++ channel hops cost nothing measurable, so the speedup is from removing Python per-chunk
+  handoffs, not from fusion. Next design step: lower supported operators to C++ actors individually (no region carving).
+  Open: output partitioning metadata per operator, runtime join strategy, high-cardinality group-by via the existing reduction.
