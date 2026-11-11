@@ -253,3 +253,51 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
   though lineitem arrives from 1.8 s, because the build sides (orders scan sharing bandwidth) finish at 3.5-4.2 s; the bounded
   lineitem fanout waits on the slower branch 100%. Q9: orders chunks (probe side) wait 1-10 s for the lineitem-derived broadcast
   side. Q21: 4.1 s tail in Python operators (semi/anti joins, counts, shuffles). Next: build-first fetch priority.
+
+## 13 Nov: build-first fetch priority (io179-io187)
+- aa4c65dc2d, CUDF_POLARS_SCAN_PRIORITY=1: each service stream opens with priority = its scan's task count; granting arena room
+  and issuing reads take the lowest first. The query tells the service how many streams it will open (set_expected_streams);
+  until opened, each stream's arena share counts them. Off by default (old behaviour unchanged).
+- Two bugs on the way, both visible only in the arena columns of the trace (scratchpad fetch_rate.py), not in query times:
+  1) expected count held for the whole query (closed streams leave _streams): lineitem capped at arena/N -> Q7 10.6 s, Q9 14.5 s.
+  2) counted every remote StreamingScan, but single-task scans (nation, region) are read directly and never open a stream:
+     still 25 of 32 GB arena free and in-flight 2.8 of 4 GB -> Q7 9.2 s. Fixed by counting native region scans + scans of >1 task.
+- Fixed version (io183 vs control io182, Q7/9/21): Q7 build sides ready at 2.5-3.1 s (was 3.6-4.2), in-flight at the 4 GB cap
+  throughout, Q7 7.30 vs 7.52, Q9 10.96 vs 10.08 (noise), cold 28.8 vs 28.7. Q7 is now bound by lineitem's fetch (last byte
+  6.4 s, done 7.1 s): moving builds earlier only helps where the tail waits on a build.
+
+## Later (Matt, 13 Nov): the arena becomes the cache
+- Stay on cold for now. When warm resumes: Matt's cuCascade integration PRs reached 88-89 s warm with a 100-130 GiB cache, so with
+  today's cold gains warm should beat that by a lot. Sirius uses a 100-200 GiB pinned cache for both cold and warm, with
+  readahead landing in the cache itself.
+- Direction: make the arena the cache (one pinned pool; blocks in use = pinned, decoded blocks retained and evictable, a hit is a
+  read that completes at once). Worth doing for cold too: a larger pool means more read-ahead room. Keep "full of in-use" and
+  "full of retained" apart in any arena measurement.
+- Also later (Matt, 13 Nov): rapidsmpf spills to its own pinned pool (async pool, on by default, no cap; tiers DEVICE >
+  PINNED_HOST > HOST > DISK) while the arena is a separate 32 GB cudaHostAlloc: two pinned allocators, no shared budget.
+  Direction: one pinned budget owned by rapidsmpf; the arena/cache allocates from it and registers as a PINNED_HOST spill
+  tenant (evict retained blocks first: refetchable, no write-out). First measure spill bytes and pool size in cold runs.
+- Full pairs (all valid): priority 132.3 / 123.0 vs control 128.9 / 129.5 -> neutral (-0.8 s mean; Q7 -0.6, Q18 -0.6). Kept opt-in.
+  Machine slow today (control 129 vs 118-124 earlier).
+- Where a cold run's time goes (control io185, 128.9 s; scratchpad budget.py): fetch spans 104 s for 1,071 GB (10.3 GB/s
+  average), tails after each query's last byte 21 s, startup before the first read 1.3 s. Arena-limited time: 0 in every
+  query (arena never under 2 GB free with in-flight below the cap). Of the sampled fetch time, ~87% at the 4 GB in-flight
+  cap (network-bound, 10.3-11.6 GB/s) and ~11 s with in-flight below the cap and nothing queued (scans not asking): Q8 2.7,
+  Q21 2.2, Q18 1.0, small queries. Biggest tails: Q21 3.6, Q18 2.6, Q13 2.4, then ~1 s in Q1/4/7/9/10/20.
+  Q21 and Q18 lead tail, starvation and duplicate bytes (20.7 + 6.4 GB): next target.
+
+## 13 Nov: key-order inference (CUDF_POLARS_INFER_KEY_ORDER=1, io188-io191, experimental)
+- lineitem (60 files) and orders (15 files) are globally ordered by orderkey: ascending, non-overlapping file ranges, no key
+  spanning row groups or files. But scans list files lexicographically (part.0, part.1, part.10, ...), so in task order the
+  bounds are not monotonic.
+- Upstream (rjzamora, story NVIDIA/cudf#22128, all merged parts in our base): footer ordering inference (#24199) runs only for
+  explicit set_sorted hints; joins/groupbys send strict (hash) requests. Open: #25143 (generalized ordered groupby).
+- Experiment: join/groupby leading keys become inference candidates; footers come from the scan service; tasks are reordered
+  by their footer key bounds (assumes the scan's row order is not observed). Q18/Q21 valid.
+- Q21: 9.6 / 9.4 s (was ~10.0): every groupby and join runs chunkwise (60 msgs) as lineitem arrives, the query ends 0.06 s
+  after its scans; but inference delays the lineitem scans to 2-3 s (footers + bounds before the stream opens).
+- Q18: 16.6 / 12.8 s (was ~7.1): lineitem groupby (60 chunks) ordered-joins orders (15 chunks) on different boundaries; the
+  ordered join's alignment emits its first output at 11 s (last byte 6.3 s) and blocks upstream.
+- To make it real: (1) inference off the critical path (footers already in flight; bounds cheap), (2) ordered join of
+  mismatched chunk boundaries that streams (lineitem files nest 4:1 in orders files), (3) a correct rule for when a scan may
+  reorder its tasks. Overlaps rjzamora's upstream work: coordinate before going further.

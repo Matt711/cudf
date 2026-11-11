@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import pylibcudf as plc
@@ -22,7 +23,10 @@ from cudf_polars.streaming.actor_graph.collectives.ordering import (
     _extract_boundaries_from_endpoint_rows as _extract_ordering_boundaries,
 )
 from cudf_polars.streaming.io import ParquetScanTask
-from cudf_polars.streaming.partitioning_requests import OrderPartitioningRequest
+from cudf_polars.streaming.partitioning_requests import (
+    OrderPartitioningRequest,
+    StrictPartitioningRequest,
+)
 from cudf_polars.utils.dtypes import is_order_preserving_cast
 
 if TYPE_CHECKING:
@@ -60,9 +64,32 @@ def _get_ordering_candidates(
     ir: StreamingScan,
     requests: tuple[PartitioningRequest, ...],
 ) -> list[tuple[str, OrderKey]]:
-    """Return distinct leading keys from explicit ordering hints."""
+    """
+    Return distinct leading keys from explicit ordering hints.
+
+    With ``CUDF_POLARS_INFER_KEY_ORDER=1``, the leading key of a join or group-by
+    (a strict partitioning request) is a candidate too, ascending: when the footer
+    statistics prove the scan is ordered on it with strict boundaries, the consumer
+    runs chunkwise or ordered instead of shuffling.
+    """
     candidates: list[tuple[str, OrderKey]] = []
     for request in requests:
+        if isinstance(request, StrictPartitioningRequest):
+            if not (_infer_key_order() and request.keys):
+                continue
+            name = request.keys[0]
+            if name not in ir.schema:
+                continue
+            (column_index,) = names_to_indices((name,), ir.schema)
+            candidate = (
+                name,
+                OrderKey(
+                    column_index, plc.types.Order.ASCENDING, plc.types.NullOrder.BEFORE
+                ),
+            )
+            if candidate not in candidates:
+                candidates.append(candidate)
+            continue
         if (
             not isinstance(request, OrderPartitioningRequest)
             or request.source != "hint"
@@ -80,6 +107,10 @@ def _get_ordering_candidates(
     return candidates
 
 
+def _infer_key_order() -> bool:
+    return os.environ.get("CUDF_POLARS_INFER_KEY_ORDER") == "1"
+
+
 def _get_rank_parquet_info_map(
     base_scan: Scan,
     paths: list[str],
@@ -92,6 +123,23 @@ def _get_rank_parquet_info_map(
     }
     if set(cached_parquet_info_map) == path_set:
         return cached_parquet_info_map
+
+    from cudf_polars.streaming import remote_io
+
+    if remote_io.scan_io() is not None and all(
+        plc.io.SourceInfo._is_remote_uri(p) for p in paths
+    ):
+        # The scan service fetches every footer of a remote scan anyway: request them now and
+        # parse them from the service, without a request of our own.
+        from cudf_polars.dsl.utils.io import CachedParquetInfo
+
+        service = remote_io.scan_io()
+        service.request_footers(paths)
+        infos = {}
+        for p in paths:
+            size, metadata = service.footer(p)
+            infos[p] = CachedParquetInfo(p, size, metadata)
+        return infos
 
     from cudf_polars.dsl.utils.io import _prefetch_parquet_footers_for_paths
 
@@ -324,27 +372,33 @@ async def parquet_metadata_ordering(
     requests: tuple[PartitioningRequest, ...],
     ir_context: IRExecutionContext,
     collective_id: int,
-) -> Partitioning | None:
+) -> tuple[Partitioning | None, list[ParquetScanTask]]:
     """
-    Return partitioning inferred from Parquet footer statistics.
+    Return partitioning inferred from Parquet footer statistics, and the scan's tasks.
 
     Only the leading key of each ordering request is inspected. For a request
     on ``[a, b]``, this inspects ``a`` but not ``b``, because single-column
     statistics cannot prove ordering on ``[a, b]``. Inference succeeds only
     when task bounds are globally ordered.
+
+    With ``CUDF_POLARS_INFER_KEY_ORDER=1`` the tasks are first put in the order of
+    the leading candidate's footer bounds (files are often listed in an order that
+    is not the key's, e.g. ``part.10`` before ``part.2``); the returned tasks are
+    the order the scan must read them in. (Experimental: assumes the scan's row
+    order is not otherwise observed.)
     """
     assert ir.base_scan.typ == "parquet", (
         f"Expected parquet Scan, got {ir.base_scan.typ}."
     )
     assert global_chunk_count > 0, "Scan partition count must be positive."
 
-    if not (candidates := _get_ordering_candidates(ir, requests)):
-        return None
-
     tasks: list[ParquetScanTask] = []
     for task in ir.tasks:
         assert isinstance(task, ParquetScanTask)
         tasks.append(task)
+
+    if not (candidates := _get_ordering_candidates(ir, requests)):
+        return None, tasks
 
     paths = list(dict.fromkeys(path for task in tasks for path in task.paths))
     rank_parquet_info_map = await ir_context.to_thread(
@@ -354,6 +408,16 @@ async def parquet_metadata_ordering(
     local_task_bounds = _extract_local_task_bounds(
         ir, tasks, candidates, rank_parquet_info_map, stream
     )
+    if _infer_key_order() and comm.nranks == 1 and len(tasks) > 1:
+        starts = local_task_bounds.columns()[0]
+        if not starts.null_count():
+            values = starts.to_arrow().to_pylist()[0::2]
+            order = sorted(range(len(tasks)), key=values.__getitem__)
+            if order != list(range(len(tasks))):
+                tasks = [tasks[i] for i in order]
+                local_task_bounds = _extract_local_task_bounds(
+                    ir, tasks, candidates, rank_parquet_info_map, stream
+                )
     global_task_bounds = local_task_bounds
     if comm.nranks > 1:
         local_chunk = TableChunk.from_pylibcudf_table(
@@ -373,4 +437,4 @@ async def parquet_metadata_ordering(
     )
     return _partitioning_from_task_bounds(
         context, candidates, global_task_bounds, global_chunk_count, stream
-    )
+    ), tasks

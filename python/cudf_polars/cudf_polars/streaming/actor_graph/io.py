@@ -710,7 +710,7 @@ async def scan_node(
         ir_context = actor_scope.require_ir_context()
         # Send basic metadata
         ir_context = dataclasses.replace(ir_context, tracer=tracer)
-        partitioning = (
+        partitioning, ordered_tasks = (
             await parquet_metadata_ordering(
                 context,
                 comm,
@@ -721,8 +721,14 @@ async def scan_node(
                 collective_id,
             )
             if infer_ordering and ir.base_scan.typ == "parquet"
-            else None
+            else (None, tasks)
         )
+        if partitioning is not None:
+            tasks = ordered_tasks
+        if infer_ordering and ir.base_scan.typ == "parquet":
+            remote_io.trace(
+                "ordering", -1, len(tasks), 0 if partitioning is None else 1
+            )
         if partitioning is not None and tracer is not None:
             tracer.decision = "parquet_ordering"
         if partitioning is None:
