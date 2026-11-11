@@ -17,6 +17,7 @@ from __future__ import annotations
 import atexit
 import dataclasses
 import functools
+import itertools
 import os
 import threading
 import time
@@ -479,6 +480,54 @@ def materialize(
 
 
 _query = {"index": -1, "t0": 0.0}
+
+_decode_streams: list[Any] = []  # [getter] of the streams scan decodes run on
+
+
+class _RawStream:
+    def __init__(self, handle: int) -> None:
+        self._handle = handle
+
+    def __cuda_stream__(self) -> tuple[int, int]:
+        return (0, self._handle)
+
+
+_priority_pool: list[Any] = []
+_priority_next = itertools.count()
+
+
+def priority_streams(pool_get: Any) -> Any:
+    """
+    Experiment: operators on the highest-priority streams, scan decodes on the pool's.
+
+    ``CUDF_POLARS_PRIORITY_STREAMS=N``: N non-blocking streams of the greatest priority are
+    handed out round robin to every operator, while scan decodes keep ``pool_get``'s streams
+    (the lowest priority), so join and aggregation kernels are not queued behind decodes.
+    Returns the operators' stream getter.
+    """
+    from cuda.bindings import runtime as rt  # noqa: PLC0415
+    from rmm.pylibrmm.stream import Stream  # noqa: PLC0415
+
+    _decode_streams[:] = [pool_get]
+    if not _priority_pool:
+        err, _least, greatest = rt.cudaDeviceGetStreamPriorityRange()
+        n = int(os.environ.get("CUDF_POLARS_PRIORITY_STREAMS", "16"))
+        for _ in range(n):
+            err, handle = rt.cudaStreamCreateWithPriority(
+                rt.cudaStreamNonBlocking, greatest
+            )
+            assert err == rt.cudaError_t.cudaSuccess, err
+            _priority_pool.append(Stream(_RawStream(int(handle))))
+
+    def get() -> Any:
+        return _priority_pool[next(_priority_next) % len(_priority_pool)]
+
+    return get
+
+
+def decode_stream(ir_context: Any) -> Any:
+    """The stream a scan decode runs on."""
+    return _decode_streams[0]() if _decode_streams else ir_context.get_cuda_stream()
 
 
 def begin_query() -> None:

@@ -999,8 +999,11 @@ def _evaluate_on_rank(
             logical_op_by_id=logical_op_by_id,
         )
         quent_operator_map = build_quent_operator_map(ir, physical_op_by_id)
+    get_cuda_stream = ctx.br().stream_pool.get_stream
+    if os.environ.get("CUDF_POLARS_PRIORITY_STREAMS"):
+        get_cuda_stream = remote_io.priority_streams(get_cuda_stream)
     ir_context = IRExecutionContext(
-        py_executor, get_cuda_stream=ctx.br().stream_pool.get_stream, query_id=query_id
+        py_executor, get_cuda_stream=get_cuda_stream, query_id=query_id
     )
 
     # Remote parquet footers are fetched by the scans themselves, in parallel and without a stage

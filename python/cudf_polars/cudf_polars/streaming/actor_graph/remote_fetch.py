@@ -342,7 +342,7 @@ def materialize(
     task: ParquetScanTask, staged: Staged, ir_context: IRExecutionContext
 ) -> DataFrame:
     """Decode a staged task (inside the caller's device memory reservation)."""
-    stream = ir_context.get_cuda_stream()
+    stream = remote_io.decode_stream(ir_context)
     if isinstance(staged.plan, remote_io.NativePlan):
         df = remote_io.materialize_native(task, staged.plan, stream)
         staged.plan.reader = None
