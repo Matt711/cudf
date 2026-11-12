@@ -39,6 +39,8 @@ cdef extern from "scan_io.hpp" namespace "cudf_polars_cucascade" nogil:
         size_t arena_bytes
         size_t footer_threads
         size_t inflight_bytes
+        size_t cache_bytes
+        size_t cache_chunk_bytes
 
     cdef cppclass planned_task "cudf_polars_cucascade::scan_io::planned_task":
         int64_t id
@@ -62,6 +64,7 @@ cdef extern from "scan_io.hpp" namespace "cudf_polars_cucascade" nogil:
         ) except +libcucascade_exception_handler
         vector[uint8_t] footer_file(const string& path) except +libcucascade_exception_handler
         void clear_footers() except +libcucascade_exception_handler
+        size_t clear_cache() except +libcucascade_exception_handler
         size_t arena_bytes()
         int64_t open_stream(int64_t priority) except +libcucascade_exception_handler
         void set_expected_streams(size_t count) except +libcucascade_exception_handler

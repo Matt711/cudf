@@ -80,6 +80,12 @@ cdef class ScanIO:
     inflight_bytes : int, default 0
         Bytes of reads on the network at once (0: no limit). Reads are issued in task order,
         so a limit near bandwidth x latency makes tasks land roughly in order.
+    cache_bytes : int, default 0
+        Size of a pinned cuCascade cache the reads go through (0: none, reads
+        land in the arena, which is then pinned). With a cache, ``arena_bytes``
+        only bounds the bytes of granted, unreleased reads.
+    cache_chunk_bytes : int, default 262144
+        Bytes per cache chunk.
     """
 
     cdef unique_ptr[cpp_scan_io] c_obj
@@ -98,6 +104,8 @@ cdef class ScanIO:
         size_t stall_seconds=5,
         size_t footer_threads=32,
         size_t inflight_bytes=0,
+        size_t cache_bytes=0,
+        size_t cache_chunk_bytes=262144,
     ):
         cdef cpp_scan_io_config cfg
         cfg.endpoint = endpoint.encode()
@@ -111,6 +119,8 @@ cdef class ScanIO:
         cfg.stall_seconds = stall_seconds
         cfg.footer_threads = footer_threads
         cfg.inflight_bytes = inflight_bytes
+        cfg.cache_bytes = cache_bytes
+        cfg.cache_chunk_bytes = cache_chunk_bytes
         with nogil:
             self.c_obj.reset(new cpp_scan_io(cfg))
 
@@ -171,6 +181,13 @@ cdef class ScanIO:
         with nogil:
             file = move(self.c_obj.get().footer_file(c_path))
         return (<char*>file.data())[:file.size()]
+
+    def clear_cache(self) -> int:
+        """Empty the cache, if there is one (a cold query); returns the bytes freed."""
+        cdef size_t freed
+        with nogil:
+            freed = self.c_obj.get().clear_cache()
+        return freed
 
     def clear_footers(self) -> None:
         """Forget every footer and open object, so the next request fetches them again."""

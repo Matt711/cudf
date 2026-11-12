@@ -691,6 +691,14 @@ class SPMDEngine(StreamingEngine):
                     os.environ.get("CUDF_POLARS_SCAN_IO_INFLIGHT_MB", "0")
                 )
                 << 20,
+                # Experimental: reads go through a pinned cuCascade cache of this size
+                # (the arena is then only a budget); cleared per query by --io-mode cold.
+                cache_bytes=int(os.environ.get("CUDF_POLARS_SCAN_IO_CACHE_MB", "0"))
+                << 20,
+                cache_chunk_bytes=int(
+                    os.environ.get("CUDF_POLARS_SCAN_IO_CACHE_CHUNK_KB", "256")
+                )
+                << 10,
                 endpoint=os.environ.get("CUDF_POLARS_SCAN_IO_ENDPOINT") or None,
             )
             if warm := os.environ.get("CUDF_POLARS_SCAN_IO_WARMUP_URL"):

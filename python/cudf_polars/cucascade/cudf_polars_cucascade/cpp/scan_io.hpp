@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -53,6 +54,12 @@ struct scan_io_config {
   /// roughly in order and decodes start as soon as the first one lands, instead of every task in
   /// flight sharing the bandwidth and finishing together.
   std::size_t inflight_bytes{0};
+  /// Pinned cuCascade cache the reads go through (0: no cache, reads land in the arena). With a
+  /// cache, every read is a prefetch into its chunks and a decode copies from them to the device;
+  /// @c arena_bytes is then only the budget of granted, unreleased reads (nothing is pinned for
+  /// it). Chunks outlive their query until @ref scan_io::clear_cache (cold) or eviction.
+  std::size_t cache_bytes{0};
+  std::size_t cache_chunk_bytes{256UL << 10};  ///< bytes per cache chunk
 };
 
 /**
@@ -196,6 +203,14 @@ class scan_io {
    */
   cudf::io::table_with_metadata materialize(std::int64_t id, cudaStream_t stream);
 
+  /**
+   * @brief Empty the cache (without a cache, nothing): the next query reads every byte from the
+   * object store. Call between queries.
+   *
+   * @return Bytes returned to the cache's pool.
+   */
+  std::size_t clear_cache();
+
   /** @brief Bytes requested from the object store so far (data, not footers). */
   [[nodiscard]] std::size_t fetched_bytes() const noexcept { return _fetched_bytes; }
 
@@ -239,6 +254,9 @@ class scan_io {
     bool done{false};
     std::size_t pending{0};  // reads in flight
     std::exception_ptr error;
+    // With a cache: the prefetching requests of the task's reads, which keep their chunks from
+    // being reclaimed until the task is released.
+    std::vector<std::unique_ptr<cucascade::io::cache::cache_handle>> handles;
   };
 
   struct stream_state {
@@ -271,6 +289,8 @@ class scan_io {
   [[nodiscard]] bool try_allocate(task& t);                                    // mutex_ held
   void issue(queued_batch q);  // no lock
   void finish_read(std::shared_ptr<task> const& t, std::size_t bytes, std::exception_ptr error);
+  /// Copy task @p t's bytes, back to back, to @p dst on @p stream (from the arena or the cache).
+  void copy_to_device(task const& t, std::uint8_t* dst, cudaStream_t stream);
   std::shared_ptr<task> find(std::int64_t id);
 
   std::unique_ptr<cucascade::memory::memory_reservation_manager> _memory;
@@ -288,6 +308,7 @@ class scan_io {
   // data
   std::uint8_t* _arena{nullptr};
   std::size_t _arena_bytes{0};
+  bool _cached{false};  // reads go through the cuCascade cache
   std::mutex _mutex;
   std::condition_variable _cv;
   std::unordered_map<std::int64_t, stream_state> _streams;

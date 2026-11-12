@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 __all__ = [
     "RemotePlan",
     "begin_query",
+    "clear_cache",
     "configure_scan_io",
     "materialize",
     "plan",
@@ -65,6 +66,8 @@ def configure_scan_io(
     connections: int = 32,
     footer_threads: int = 32,
     inflight_bytes: int = 0,
+    cache_bytes: int = 0,
+    cache_chunk_bytes: int = 256 << 10,
     endpoint: str | None = None,
 ) -> Any:
     """Create the process-wide service (once), with credentials from the environment."""
@@ -90,6 +93,8 @@ def configure_scan_io(
                 connections=connections,
                 footer_threads=footer_threads,
                 inflight_bytes=inflight_bytes,
+                cache_bytes=cache_bytes,
+                cache_chunk_bytes=cache_chunk_bytes,
             )
             _start_sampler(_service)
         return _service
@@ -564,6 +569,11 @@ def _remote_scan_count(ir: Any) -> int:
         ):
             count += 1
     return count
+
+
+def clear_cache() -> int:
+    """Empty the service's cache, if it has one, for a cold query; returns the bytes freed."""
+    return 0 if _service is None else int(_service.clear_cache())
 
 
 def begin_query(ir: Any = None) -> None:

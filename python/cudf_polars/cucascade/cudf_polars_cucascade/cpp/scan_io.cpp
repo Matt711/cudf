@@ -6,6 +6,7 @@
 #include "scan_io.hpp"
 
 #include <cucascade/io/config.hpp>
+#include <cucascade/io/details/std_future.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/memory/config.hpp>
 
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <future>
 #include <numeric>
 #include <span>
 #include <stdexcept>
@@ -34,18 +36,31 @@ std::size_t aligned(std::size_t size) { return std::max(align, (size + align - 1
 constexpr std::size_t staging_bytes = 256UL << 20;
 constexpr std::size_t staging_block = 1UL << 20;
 
+constexpr std::size_t cache_pool_bytes = 128UL << 20;  // one pinned pool of the cache
+
 constexpr std::size_t parquet_trailer_bytes = 8;  // footer length (4) + "PAR1" (4)
 }  // namespace
 
 scan_io::scan_io(scan_io_config const& cfg)
-  : _arena_bytes{aligned(cfg.arena_bytes)}, _inflight_limit{cfg.inflight_bytes}
+  : _arena_bytes{aligned(cfg.arena_bytes)},
+    _cached{cfg.cache_bytes > 0},
+    _inflight_limit{cfg.inflight_bytes}
 {
   cucascade::memory::host_memory_space_config host;
-  host.memory_capacity            = staging_bytes;
   host.reservation_limit_fraction = 1.0;
-  host.block_size                 = staging_block;
-  host.pool_size                  = staging_bytes / staging_block;
-  host.initial_number_pools       = 1;
+  if (_cached) {
+    // The cache: pinned now, in pools of cache_pool_bytes, cut into chunks.
+    host.memory_capacity      = cfg.cache_bytes;
+    host.block_size           = cfg.cache_chunk_bytes;
+    host.pool_size            = cache_pool_bytes / cfg.cache_chunk_bytes;
+    host.initial_number_pools = (cfg.cache_bytes + cache_pool_bytes - 1) / cache_pool_bytes;
+    host.initial_pool_threads = 8;
+  } else {
+    host.memory_capacity      = staging_bytes;
+    host.block_size           = staging_block;
+    host.pool_size            = staging_bytes / staging_block;
+    host.initial_number_pools = 1;
+  }
   std::vector<cucascade::memory::memory_space_config> spaces;
   spaces.emplace_back(host);
   _memory = std::make_unique<cucascade::memory::memory_reservation_manager>(std::move(spaces));
@@ -55,7 +70,9 @@ scan_io::scan_io(scan_io_config const& cfg)
   config.rest_n_reactors                = cfg.reactors;
   config.rest.max_connections           = cfg.connections;
   config.rest.stall_time_s              = cfg.stall_seconds;
-  config.cache.mode                     = cucascade::io::cache::cache_mode::none;
+  config.cache.mode = _cached ? cucascade::io::cache::cache_mode::cucs
+                              : cucascade::io::cache::cache_mode::none;
+  config.cache.eviction = cucascade::io::cache::eviction_policy::lru;
   config.object_store.endpoint          = cfg.endpoint;
   config.object_store.region            = cfg.region;
   config.object_store.access_key        = cfg.access_key;
@@ -71,12 +88,15 @@ scan_io::scan_io(scan_io_config const& cfg)
       "scan_io: could not create the REST io context (check endpoint, region and credentials)");
   }
   _context->start();
+  if (_cached) { _context->initialize_cache(*_memory, config.cache, nullptr); }
 
   if (_arena_bytes > 0) {
-    void* ptr = nullptr;
-    CUDF_CUDA_TRY(cudaHostAlloc(&ptr, _arena_bytes, cudaHostAllocPortable));
-    _arena = static_cast<std::uint8_t*>(ptr);
-    _free.emplace_back(0, _arena_bytes);
+    if (!_cached) {
+      void* ptr = nullptr;
+      CUDF_CUDA_TRY(cudaHostAlloc(&ptr, _arena_bytes, cudaHostAllocPortable));
+      _arena = static_cast<std::uint8_t*>(ptr);
+    }
+    _free.emplace_back(0, _arena_bytes);  // with a cache, a budget: offsets but no memory
   }
 
   for (std::size_t i = 0; i < std::max<std::size_t>(cfg.footer_threads, 1); ++i) {
@@ -115,6 +135,8 @@ scan_io::~scan_io()
     });
   }
   if (_arena != nullptr) { cudaFreeHost(_arena); }
+  _tasks.clear();  // their cache requests go before the cache
+  if (_cached) { _context->shutdown_cache(); }
   _context->shutdown();
 }
 
@@ -478,10 +500,7 @@ cudf::io::table_with_metadata scan_io::materialize(std::int64_t id, cudaStream_t
   auto& decode  = *t->decode;
   auto const sv = ::cuda::stream_ref{stream};
   rmm::device_buffer block(t->size, sv);
-  if (t->size > 0) {
-    CUDF_CUDA_TRY(cudaMemcpyAsync(
-      block.data(), _arena + t->block_offset, t->size, cudaMemcpyHostToDevice, stream));
-  }
+  copy_to_device(*t, static_cast<std::uint8_t*>(block.data()), stream);
   std::vector<cudf::device_span<std::uint8_t const>> spans;
   spans.reserve(decode.positions.size());
   auto const* base = static_cast<std::uint8_t const*>(block.data());
@@ -652,7 +671,9 @@ std::vector<scan_io::read_batch> scan_io::plan_reads(task const& t) const
       }
       auto& b          = batches[open[f]];
       auto const piece = std::min(remaining, batch_bytes - b.bytes);
-      b.slices.emplace_back(offset, piece, _arena + pos);
+      // With a cache the slices only carry the ranges (the reads land in its chunks).
+      static std::uint8_t no_destination;
+      b.slices.emplace_back(offset, piece, _arena != nullptr ? _arena + pos : &no_destination);
       b.bytes += piece;
       offset += piece;
       pos += piece;
@@ -665,6 +686,24 @@ std::vector<scan_io::read_batch> scan_io::plan_reads(task const& t) const
 void scan_io::issue(queued_batch q)
 {
   auto const bytes = q.batch.bytes;
+  if (_cached) {
+    std::vector<cucascade::io::byte_range> ranges;
+    ranges.reserve(q.batch.slices.size());
+    for (auto const& sl : q.batch.slices) {
+      ranges.emplace_back(static_cast<std::int64_t>(sl.offset()), static_cast<std::int64_t>(sl.size()));
+    }
+    // A prefetch that loads nothing (already resident, or refused) is not an error: the decode
+    // reads the ranges through the cache either way.
+    auto handle = _context->cache()->prefetch_ranges(
+      *q.t->objects[q.batch.file], ranges, [this, t = q.t, bytes](auto const&) noexcept {
+        finish_read(t, bytes, nullptr);
+      });
+    if (handle) {
+      std::lock_guard lock(_mutex);
+      q.t->handles.push_back(std::move(handle));
+    }
+    return;
+  }
   auto future      = _context->host_readv_async_io(*q.t->objects[q.batch.file], q.batch.slices);
   // Runs on a reactor thread: only bookkeeping, then the scheduler issues what comes next.
   std::move(future).install_callback(
@@ -714,11 +753,47 @@ std::unique_ptr<rmm::device_buffer> scan_io::to_device(std::int64_t id, cudaStre
   wait(id);
   auto t   = find(id);
   auto buf = std::make_unique<rmm::device_buffer>(t->size, ::cuda::stream_ref{stream});
-  if (t->size > 0) {
-    CUDF_CUDA_TRY(cudaMemcpyAsync(
-      buf->data(), _arena + t->block_offset, t->size, cudaMemcpyHostToDevice, stream));
-  }
+  copy_to_device(*t, static_cast<std::uint8_t*>(buf->data()), stream);
   return buf;
+}
+
+void scan_io::copy_to_device(task const& t, std::uint8_t* dst, cudaStream_t stream)
+{
+  if (t.size == 0) { return; }
+  if (!_cached) {
+    CUDF_CUDA_TRY(
+      cudaMemcpyAsync(dst, _arena + t.block_offset, t.size, cudaMemcpyHostToDevice, stream));
+    return;
+  }
+  // Each range to its place in the block, per file, read through the cache: from its chunks where
+  // resident, from the object store otherwise. Waits for the copies.
+  std::vector<std::vector<cucascade::io::slice>> per_file(t.objects.size());
+  std::size_t pos = 0;
+  for (std::size_t i = 0; i < t.sizes.size(); ++i) {
+    if (t.sizes[i] > 0) {
+      per_file[static_cast<std::size_t>(t.sources[i])].emplace_back(
+        t.offsets[i], t.sizes[i], dst + pos);
+    }
+    pos += t.sizes[i];
+  }
+  auto* cache = _context->cache();
+  std::vector<std::future<std::size_t>> reads;
+  for (std::size_t f = 0; f < per_file.size(); ++f) {
+    if (per_file[f].empty()) { continue; }
+    reads.push_back(cucascade::io::bridge_semi_to_std([&] {
+      return cache->device_read_ranges_async(
+        *t.objects[f], per_file[f], ::cuda::stream_ref{stream});
+    }));
+  }
+  for (auto& r : reads) {
+    r.get();
+  }
+}
+
+std::size_t scan_io::clear_cache()
+{
+  auto* cache = _cached ? _context->cache() : nullptr;
+  return cache == nullptr ? 0 : cache->reclaim(cucascade::io::cache::reclaim_mode::forced);
 }
 
 void scan_io::release(std::int64_t id)
