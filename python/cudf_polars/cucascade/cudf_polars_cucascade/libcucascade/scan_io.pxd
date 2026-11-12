@@ -41,6 +41,7 @@ cdef extern from "scan_io.hpp" namespace "cudf_polars_cucascade" nogil:
         size_t inflight_bytes
         size_t cache_bytes
         size_t cache_chunk_bytes
+        double admission_budget
 
     cdef cppclass planned_task "cudf_polars_cucascade::scan_io::planned_task":
         int64_t id

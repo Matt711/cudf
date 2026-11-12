@@ -51,6 +51,13 @@ scan_io::scan_io(scan_io_config const& cfg)
     _chunk_bytes{cfg.cache_bytes > 0 ? cfg.cache_chunk_bytes : 1},
     _inflight_limit{cfg.inflight_bytes}
 {
+  if (_cached && cfg.admission_budget > 0) {
+    _admission = std::make_unique<cucascade::io::column_admission>(
+      cucascade::io::column_admission_config{
+        .budget_bytes =
+          static_cast<std::size_t>(static_cast<double>(cfg.cache_bytes) * cfg.admission_budget),
+        .chunk_bytes = cfg.cache_chunk_bytes});
+  }
   cucascade::memory::host_memory_space_config host;
   host.reservation_limit_fraction = 1.0;
   if (_cached) {
@@ -78,6 +85,14 @@ scan_io::scan_io(scan_io_config const& cfg)
   config.cache.mode = _cached ? cucascade::io::cache::cache_mode::cucs
                               : cucascade::io::cache::cache_mode::none;
   config.cache.eviction = cucascade::io::cache::eviction_policy::lru;
+  // Experiment: when the evictor starts (share of the cache filled) and how much of it one pass
+  // frees; cucascade::io::scan_cache uses 0.97 and 0.02.
+  if (auto const* v = std::getenv("CUDF_POLARS_SCAN_IO_EVICT_THRESHOLD")) {
+    config.cache.eviction_threshold_fraction = std::stod(v);
+  }
+  if (auto const* v = std::getenv("CUDF_POLARS_SCAN_IO_EVICT_BATCH")) {
+    config.cache.eviction_batch_fraction = std::stod(v);
+  }
   config.object_store.endpoint          = cfg.endpoint;
   config.object_store.region            = cfg.region;
   config.object_store.access_key        = cfg.access_key;
@@ -198,6 +213,30 @@ void scan_io::load_footer(std::string const& path, footer_entry& entry)
     std::span<std::uint8_t const>(footer.data(), footer.size()),
     cudf::io::parquet_reader_options{});
   auto metadata = std::make_unique<cudf::io::parquet::FileMetaData>(reader.parquet_metadata());
+  if (_admission && !_admission->has_layout(object->object_path())) {
+    // Columns are ranked across a table: the files of one directory.
+    auto const& file = object->object_path();
+    auto const dir   = file.substr(0, file.find_last_of('/'));
+    std::vector<std::string> columns;
+    std::vector<std::uint32_t> column_of_chunk;
+    std::vector<std::uint64_t> offsets;
+    std::vector<std::uint64_t> sizes;
+    for (auto const& group : metadata->row_groups) {
+      for (auto const& chunk : group.columns) {
+        auto const& md   = chunk.meta_data;
+        auto const name  = md.path_in_schema.empty() ? std::string{} : md.path_in_schema.front();
+        auto it          = std::find(columns.begin(), columns.end(), name);
+        if (it == columns.end()) { it = columns.insert(columns.end(), name); }
+        column_of_chunk.push_back(static_cast<std::uint32_t>(it - columns.begin()));
+        offsets.push_back(static_cast<std::uint64_t>(
+          md.dictionary_page_offset > 0 ? std::min(md.dictionary_page_offset, md.data_page_offset)
+                                        : md.data_page_offset));
+        sizes.push_back(static_cast<std::uint64_t>(md.total_compressed_size));
+      }
+    }
+    _admission->register_layout(
+      file, dir.substr(dir.find_last_of('/') + 1), columns, column_of_chunk, offsets, sizes);
+  }
   std::lock_guard lock(entry.mutex);
   entry.object   = std::move(object);
   entry.metadata = std::move(metadata);
@@ -704,24 +743,47 @@ void scan_io::issue(queued_batch q)
 {
   auto const bytes = q.batch.bytes;
   if (_cached) {
-    std::vector<cucascade::io::byte_range> ranges;
-    ranges.reserve(q.batch.slices.size());
+    auto const& obj = *q.t->objects[q.batch.file];
+    // With column admission, the ranges of admitted columns are cached at their priority and the
+    // rest at the lowest, so that data read once is evicted first.
+    std::vector<cucascade::io::byte_range> kept;
+    std::vector<cucascade::io::byte_range> rest;
+    std::uint8_t priority = 0;
     for (auto const& sl : q.batch.slices) {
-      ranges.emplace_back(static_cast<std::int64_t>(sl.offset()), static_cast<std::int64_t>(sl.size()));
+      cucascade::io::byte_range const r{static_cast<std::int64_t>(sl.offset()),
+                                        static_cast<std::int64_t>(sl.size())};
+      if (_admission) {
+        auto const advice = _admission->advise(obj.object_path(), sl.offset(), sl.size(), obj.size());
+        if (!advice.ranges.empty()) {
+          priority = std::max(priority, advice.eviction_priority);
+          kept.push_back(r);
+          continue;
+        }
+      }
+      rest.push_back(r);
     }
-    // A prefetch that loads nothing (already resident, or refused) is not an error: the decode
-    // reads the ranges through the cache either way.
-    auto handle = _context->cache()->prefetch_ranges(
-      *q.t->objects[q.batch.file], ranges, [this, t = q.t, bytes](auto const& r) noexcept {
-        _st_prefetch.fetch_add(1, std::memory_order_relaxed);
-        if (!r.covered) { _st_uncovered.fetch_add(1, std::memory_order_relaxed); }
-        finish_read(t, bytes, nullptr);
-      });
-    if (!handle) { _st_nohandle.fetch_add(1, std::memory_order_relaxed); }
-    if (handle) {
-      std::lock_guard lock(_mutex);
-      q.t->handles.push_back(std::move(handle));
-    }
+    // One read completes when every prefetch of it has (a prefetch that loads nothing, already
+    // resident or refused, is not an error: the decode reads the ranges through the cache).
+    auto const parts = static_cast<int>(!kept.empty()) + static_cast<int>(!rest.empty());
+    auto left        = std::make_shared<std::atomic<int>>(parts);
+    auto issue_part  = [&](std::vector<cucascade::io::byte_range> const& ranges, std::uint8_t p) {
+      auto handle = _context->cache()->prefetch_ranges(
+        obj,
+        ranges,
+        [this, t = q.t, bytes, left](auto const& r) noexcept {
+          _st_prefetch.fetch_add(1, std::memory_order_relaxed);
+          if (!r.covered) { _st_uncovered.fetch_add(1, std::memory_order_relaxed); }
+          if (left->fetch_sub(1, std::memory_order_acq_rel) == 1) { finish_read(t, bytes, nullptr); }
+        },
+        p);
+      if (!handle) { _st_nohandle.fetch_add(1, std::memory_order_relaxed); }
+      if (handle) {
+        std::lock_guard lock(_mutex);
+        q.t->handles.push_back(std::move(handle));
+      }
+    };
+    if (!kept.empty()) { issue_part(kept, std::max<std::uint8_t>(priority, 1)); }
+    if (!rest.empty()) { issue_part(rest, 0); }
     return;
   }
   auto future      = _context->host_readv_async_io(*q.t->objects[q.batch.file], q.batch.slices);

@@ -86,6 +86,10 @@ cdef class ScanIO:
         only bounds the bytes of granted, unreleased reads.
     cache_chunk_bytes : int, default 262144
         Bytes per cache chunk.
+    admission_budget : float, default 0.0
+        With a cache, the share of it kept for the columns read most (column
+        admission); the other bytes are cached at the lowest eviction priority.
+        0 turns admission off.
     """
 
     cdef unique_ptr[cpp_scan_io] c_obj
@@ -106,6 +110,7 @@ cdef class ScanIO:
         size_t inflight_bytes=0,
         size_t cache_bytes=0,
         size_t cache_chunk_bytes=262144,
+        double admission_budget=0.0,
     ):
         cdef cpp_scan_io_config cfg
         cfg.endpoint = endpoint.encode()
@@ -121,6 +126,7 @@ cdef class ScanIO:
         cfg.inflight_bytes = inflight_bytes
         cfg.cache_bytes = cache_bytes
         cfg.cache_chunk_bytes = cache_chunk_bytes
+        cfg.admission_budget = admission_budget
         with nogil:
             self.c_obj.reset(new cpp_scan_io(cfg))
 

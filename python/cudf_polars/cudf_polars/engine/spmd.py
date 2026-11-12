@@ -699,6 +699,9 @@ class SPMDEngine(StreamingEngine):
                     os.environ.get("CUDF_POLARS_SCAN_IO_CACHE_CHUNK_KB", "256")
                 )
                 << 10,
+                admission_budget=float(
+                    os.environ.get("CUDF_POLARS_SCAN_IO_ADMISSION", "0")
+                ),
                 endpoint=os.environ.get("CUDF_POLARS_SCAN_IO_ENDPOINT") or None,
             )
             if warm := os.environ.get("CUDF_POLARS_SCAN_IO_WARMUP_URL"):

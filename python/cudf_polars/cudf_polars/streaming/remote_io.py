@@ -68,6 +68,7 @@ def configure_scan_io(
     inflight_bytes: int = 0,
     cache_bytes: int = 0,
     cache_chunk_bytes: int = 256 << 10,
+    admission_budget: float = 0.0,
     endpoint: str | None = None,
 ) -> Any:
     """Create the process-wide service (once), with credentials from the environment."""
@@ -95,6 +96,7 @@ def configure_scan_io(
                 inflight_bytes=inflight_bytes,
                 cache_bytes=cache_bytes,
                 cache_chunk_bytes=cache_chunk_bytes,
+                admission_budget=admission_budget,
             )
             _start_sampler(_service)
         return _service

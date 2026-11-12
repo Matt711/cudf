@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/column_admission.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -61,6 +62,10 @@ struct scan_io_config {
   /// it). Chunks outlive their query until @ref scan_io::clear_cache (cold) or eviction.
   std::size_t cache_bytes{0};
   std::size_t cache_chunk_bytes{256UL << 10};  ///< bytes per cache chunk
+  /// With a cache: the share of it kept for the columns read most (column admission, as in
+  /// cucascade::io::scan_cache); the other bytes are cached at the lowest eviction priority. 0
+  /// turns admission off (every byte at the same priority).
+  double admission_budget{0.0};
 };
 
 /**
@@ -314,6 +319,8 @@ class scan_io {
   std::uint8_t* _arena{nullptr};
   std::size_t _arena_bytes{0};
   bool _cached{false};  // reads go through the cuCascade cache
+  // With a cache: which columns to keep at a raised eviction priority (null: none)
+  std::unique_ptr<cucascade::io::column_admission> _admission;
   std::size_t _chunk_bytes{1};  // the cache's chunk size (1 without a cache)
   std::mutex _mutex;
   std::condition_variable _cv;
