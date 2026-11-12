@@ -60,7 +60,7 @@ from cudf_polars.streaming.rank_aware_source import RankAwareSource
 from cudf_polars.streaming.utils import _fallback_inform
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 
     from polars import polars as plrs  # type: ignore[attr-defined]
 
@@ -788,8 +788,17 @@ async def scan_node(
             else None
         )
 
+        async def _assigned(producer_id: int) -> AsyncIterator[tuple[int, ScanTask]]:
+            # Unordered with ready-order claiming: whichever task has landed, by any producer.
+            if lineariser is None and dfa is not None and dfa.ready_order:
+                while (claimed := await dfa.claim()) is not None:
+                    yield claimed, tasks[claimed]
+                return
+            for item in producer_tasks[producer_id]:
+                yield item
+
         async def _producer(producer_id: int) -> None:
-            for task_idx, task in producer_tasks[producer_id]:
+            async for task_idx, task in _assigned(producer_id):
                 fetched = await dfa.take(task_idx) if dfa is not None else None
                 released = False
                 decode_cost = 0

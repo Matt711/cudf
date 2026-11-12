@@ -396,3 +396,36 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
 - Q21 and Q18 have mid-query gaps with nothing in flight: their scans fetch a bounded window ahead of
   consumption, and the consumer is slow. Q21 profile (nsys): 4.9 s of kernels in a 10.1 s run; group-by
   hash builds 1.45 s (n_unique per l_orderkey on ~60M-row chunks), gathers 0.6 s, spill packing 0.3 s.
+
+### Root cause of the cache-mode failures: cudaMemcpyBatchAsync (12 Nov 2026, evening)
+
+- Kernel log: every Xid on this box (9 and 12 Nov) was in a run copying from the cuCascade cache through
+  cucascade::cuda::device_copy_batch: io217 (Xid 31 write fault, wrong Q4), why1 (Xid 31 write at 0x0),
+  cn1 (Xid 13 illegal instruction), and Matt's PR cache runs on 9 Nov (bs1, cd1, cf6). ECC clean.
+- Standalone repro (scratchpad batch_stress.cu): 16 threads, batches of up to 4000 pinned->device pieces,
+  concurrent compute, every destination verified. cudaMemcpyBatchAsync faults (Xid 13, same ESR as cn1) in
+  about 2 of 7 one-minute runs, with or without cudaMemcpyFlagPreferOverlapWithCompute; one cudaMemcpyAsync
+  per piece: 4 runs, 61M copies, no fault. Driver 595.58, CUDA 13.2.
+- Fix: device_copy_batch issues one cudaMemcpyAsync per run of contiguous pieces (CUCASCADE_BATCH_MEMCPY=1
+  restores the batch call). Harness: cache-mode copies byte-identical to the arena path.
+- Still exposed: cudf::detail::memcpy_batch_async and rapidsmpf::cuda_memcpy_batch_async call the same API.
+- Pushed to Matt's forks (no PR): cudf task/io2-base 7a0ab9bfde, cuCascade task/cucascade-readahead 88932f1
+  (the best cold and lukewarm configurations so far; the batch fix is not in them yet).
+- Fault-free copies, measured (all valid, no Xid in 15 runs): one cudaMemcpyAsync per merged piece: cold
+  129-137 s (threads block issuing ~600k copies per run); cub::DeviceMemcpy::Batched: cold 136-148 s (fills
+  every SM, decode waits: last byte -> last decode 14 -> 25 s); own copy kernel on 16 blocks (aligned 16-byte
+  host loads through shared memory, 49 GB/s standalone): cold 125.9 vs batch control 126.5 s (alternating
+  ky/kz), but lukewarm/hot 89-90 / 72 s vs 78 / 62 s. In-engine the kernel reaches ~7.6 GB/s per task (Q1
+  hot nsys). Not explained by host memory kind (cudaHostAlloc, registered THP, registered 4K: all 49 GB/s),
+  stream priority, or merge count (sorting buffers: 7.8x -> 9.3x merge, no change).
+- Decision (Matt asked why): the batch call stays the default; cuCascade ec78934 makes the safe copy opt-in
+  (CUCASCADE_SAFE_COPY=1). Every run validates, so a faulty run is detected, not reported.
+
+### Ready-order decode (12 Nov 2026, night)
+- Measured with 8 waiter threads per scan (true landing times, wt1): tasks land out of order constantly (Q1: 44 of
+  60 before a lower-numbered task), and in-order taking leaves landed tasks waiting past the query's last byte (Q1
+  12 tasks up to 0.96 s, Q4 50 up to 1.4 s, Q18 51 up to 4.5 s).
+- CUDF_POLARS_SCAN_UNORDERED=1 + CUDF_POLARS_SCAN_READY_ORDER=1: producers claim the lowest-numbered landed task
+  of the fetch window (any producer), decode budget in claim order, 8 waiter threads per scan. Unordered alone
+  (ro1, 130.1 s) does nothing. Cold per pass, alternating, all valid: ready 118.2 / 123.3 / 115.7 (avg 119.1)
+  vs control 122.1 / 130.9 / 120.7 (avg 124.6); last byte -> last decode 9.2-10.1 vs 13.1-13.5 s.

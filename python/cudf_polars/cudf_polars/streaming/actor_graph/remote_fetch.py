@@ -391,6 +391,11 @@ class RemoteFetchAhead:
         )
         self._decoding = 0
         self._next_admit = 0
+        # Experiment (CUDF_POLARS_SCAN_READY_ORDER): producers claim tasks in the order they land
+        # rather than in task order (for a scan whose chunks need no order downstream).
+        self._ready_order = bool(os.environ.get("CUDF_POLARS_SCAN_READY_ORDER"))
+        self._claimed: set[int] = set()
+        self._unclaimed_lo = 0
         # Plan and queue tasks in the service, without the GIL, in task order (one thread).
         self._native = os.environ.get("CUDF_POLARS_REMOTE_NATIVE_PLAN", "1") != "0"
         self._native_pool: ThreadPoolExecutor | None = None
@@ -528,9 +533,14 @@ class RemoteFetchAhead:
             self._launched[i].set()
 
     def _watch(self, task_id: int) -> asyncio.Future:
-        # One thread per scan blocks (without the GIL) on each task in turn.
+        # One thread per scan blocks (without the GIL) on each task in turn. Measurement
+        # (CUDF_POLARS_SCAN_WAITERS): more threads, so each task is seen when it lands.
         if self._waiter is None:
-            self._waiter = ThreadPoolExecutor(1, thread_name_prefix="scan-wait")
+            default = "8" if self._ready_order else "1"
+            self._waiter = ThreadPoolExecutor(
+                int(os.environ.get("CUDF_POLARS_SCAN_WAITERS", default)),
+                thread_name_prefix="scan-wait",
+            )
         return asyncio.get_running_loop().run_in_executor(
             self._waiter, self._service.wait, task_id
         )
@@ -553,6 +563,58 @@ class RemoteFetchAhead:
             self._cond.notify_all()
         return staged
 
+    @property
+    def ready_order(self) -> bool:
+        """Whether tasks are claimed in the order they land (see :meth:`claim`)."""
+        return self._ready_order
+
+    async def claim(self) -> int | None:
+        """
+        The next task to decode: the lowest-numbered submitted task whose bytes are in.
+
+        Waits for one to land when none has; None once every task is claimed.
+        """
+        n = len(self._tasks)
+        while True:
+            while self._unclaimed_lo < n and self._unclaimed_lo in self._claimed:
+                self._unclaimed_lo += 1
+            if self._unclaimed_lo >= n:
+                return None
+            candidates = [
+                i
+                for i in range(self._unclaimed_lo, n)
+                if i not in self._claimed and self._launched[i].is_set()
+            ]
+            for i in candidates:
+                read = self._read.get(i)
+                if read is None or read.done():
+                    self._claimed.add(i)
+                    return i
+            # Nothing has landed: wait for a read in flight or the next submission.
+            waits: list[asyncio.Future] = [
+                self._read[i] for i in candidates if i in self._read
+            ]
+            unlaunched = next(
+                (
+                    i
+                    for i in range(self._unclaimed_lo, n)
+                    if i not in self._claimed and not self._launched[i].is_set()
+                ),
+                None,
+            )
+            launch = (
+                asyncio.ensure_future(self._launched[unlaunched].wait())
+                if unlaunched is not None
+                else None
+            )
+            if launch is not None:
+                waits.append(launch)
+            try:
+                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                if launch is not None and not launch.done():
+                    launch.cancel()
+
     async def acquire_decode(self, i: int, staged: Staged | None) -> int:
         """Wait until task ``i`` fits the decode budget (in task order); returns its cost."""
         if self._decode_budget <= 0:
@@ -565,8 +627,9 @@ class RemoteFetchAhead:
             )
         )
         t0 = time.perf_counter()
-        async with self._cond:
-            await self._cond.wait_for(lambda: self._next_admit == i)
+        if not self._ready_order:
+            async with self._cond:
+                await self._cond.wait_for(lambda: self._next_admit == i)
         await _budget.acquire(cost, lambda: self._decoding == 0, self._decode_budget)
         # No await between taking the budget and recording it, so a cancellation cannot leak it.
         self._decoding += cost
