@@ -780,9 +780,11 @@ std::unique_ptr<rmm::device_buffer> scan_io::to_device(std::int64_t id, cudaStre
 void scan_io::copy_to_device(task& t, std::uint8_t* dst, cudaStream_t stream)
 {
   if (t.size == 0) { return; }
+  static bool const verify = std::getenv("CUDF_POLARS_SCAN_IO_VERIFY") != nullptr;
   if (!_cached) {
     CUDF_CUDA_TRY(
       cudaMemcpyAsync(dst, _arena + t.block_offset, t.size, cudaMemcpyHostToDevice, stream));
+    if (verify) { verify_block(t, dst, stream); }
     return;
   }
   // Each range to its place in the block, per file. Where every byte of a file's ranges is
@@ -829,6 +831,69 @@ void scan_io::copy_to_device(task& t, std::uint8_t* dst, cudaStream_t stream)
     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
       .count(),
     std::memory_order_relaxed);
+  if (verify) { verify_block(t, dst, stream); }
+}
+
+void scan_io::verify_block(task const& t, std::uint8_t const* dst, cudaStream_t stream)
+{
+  CUDF_CUDA_TRY(cudaStreamSynchronize(stream));
+  std::vector<std::uint8_t> got(t.size);
+  CUDF_CUDA_TRY(cudaMemcpy(got.data(), dst, t.size, cudaMemcpyDeviceToHost));
+  // The same ranges read again past the cache, all at once.
+  std::vector<std::uint8_t> all(t.size);
+  std::vector<std::vector<cucascade::io::slice>> per_file(t.objects.size());
+  for (std::size_t i = 0, p = 0; i < t.sizes.size(); p += t.sizes[i], ++i) {
+    if (t.sizes[i] > 0) {
+      per_file[static_cast<std::size_t>(t.sources[i])].emplace_back(
+        t.offsets[i], t.sizes[i], all.data() + p);
+    }
+  }
+  std::vector<std::future<std::size_t>> reads;
+  for (std::size_t f = 0; f < per_file.size(); ++f) {
+    if (per_file[f].empty()) { continue; }
+    reads.push_back(cucascade::io::bridge_semi_to_std(
+      [&] { return _context->host_readv_async_io(*t.objects[f], per_file[f]); }));
+  }
+  for (auto& r : reads) {
+    r.get();
+  }
+  std::vector<std::uint8_t> want;
+  std::size_t pos = 0;
+  for (std::size_t i = 0; i < t.sizes.size(); pos += t.sizes[i], ++i) {
+    auto const n = t.sizes[i];
+    if (n == 0 || std::memcmp(got.data() + pos, all.data() + pos, n) == 0) { continue; }
+    auto const& obj = *t.objects[static_cast<std::size_t>(t.sources[i])];
+    want.assign(all.begin() + pos, all.begin() + pos + n);
+    std::size_t first = n, last = 0, diffs = 0;
+    for (std::size_t k = 0; k < n; ++k) {
+      if (got[pos + k] != want[k]) {
+        first = std::min(first, k);
+        last  = k;
+        ++diffs;
+      }
+    }
+    // Where the bytes went wrong: in the pinned chunk itself, or between it and the device.
+    char const* where = "fallback read";
+    auto const* bad   = dst + pos + first;
+    for (auto const& r : t.resident) {
+      for (auto const& p : r->pieces()) {
+        if (bad >= p.dst && bad < p.dst + p.size) {
+          where = p.src[bad - p.dst] == want[first] ? "copy (chunk right)" : "chunk bytes";
+        }
+      }
+    }
+    auto again = want;
+    _context->host_read_io(obj, t.offsets[i], n, again.data());
+    auto const off = t.offsets[i] + first;
+    std::fprintf(stderr,
+                 "scan_io VERIFY MISMATCH %s range [%zu, +%zu) slice %zu of %zu: %zu bytes differ, "
+                 "first at +%zu (file offset %zu, chunk %zu +%zu), last at +%zu; %s; reread %s\n",
+                 obj.object_path().c_str(), t.offsets[i], n, i, t.sizes.size(), diffs, first, off,
+                 off / _chunk_bytes, off % _chunk_bytes, last, where,
+                 again == want ? "stable" : "DIFFERS");
+    _st_bad.fetch_add(1, std::memory_order_relaxed);
+  }
+  _st_verified.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::size_t scan_io::clear_cache()
@@ -848,11 +913,12 @@ std::size_t scan_io::clear_cache()
   if (std::getenv("CUDF_POLARS_SCAN_IO_STATS") != nullptr) {
     std::fprintf(stderr,
                  "scan_io stats: prefetch %lu uncovered %lu nohandle %lu pinned %lu fallback %lu "
-                 "(%.2f GB) copy %.2f s | live tasks at clear %zu, after wait %zu\n",
+                 "(%.2f GB) copy %.2f s | live tasks at clear %zu, after wait %zu | verified %lu "
+                 "bad %lu\n",
                  _st_prefetch.exchange(0), _st_uncovered.exchange(0), _st_nohandle.exchange(0),
                  _st_pinned.exchange(0), _st_fallback.exchange(0),
                  _st_fallback_bytes.exchange(0) / 1e9, _st_copy_ns.exchange(0) / 1e9,
-                 live_before, live_after);
+                 live_before, live_after, _st_verified.exchange(0), _st_bad.exchange(0));
   }
   return cache->reclaim(cucascade::io::cache::reclaim_mode::forced);
 }

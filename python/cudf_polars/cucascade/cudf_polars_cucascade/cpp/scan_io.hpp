@@ -294,6 +294,8 @@ class scan_io {
   void finish_read(std::shared_ptr<task> const& t, std::size_t bytes, std::exception_ptr error);
   /// Copy task @p t's bytes, back to back, to @p dst on @p stream (from the arena or the cache).
   void copy_to_device(task& t, std::uint8_t* dst, cudaStream_t stream);
+  /// Debugging (CUDF_POLARS_SCAN_IO_VERIFY): compare the copied block with a direct read.
+  void verify_block(task const& t, std::uint8_t const* dst, cudaStream_t stream);
   std::shared_ptr<task> find(std::int64_t id);
 
   std::unique_ptr<cucascade::memory::memory_reservation_manager> _memory;
@@ -328,7 +330,7 @@ class scan_io {
   std::size_t _inflight_limit{0};
   // Measurement (CUDF_POLARS_SCAN_IO_STATS): cache-mode outcomes, printed and reset by clear_cache.
   std::atomic<std::uint64_t> _st_prefetch{0}, _st_uncovered{0}, _st_nohandle{0}, _st_pinned{0},
-    _st_fallback{0}, _st_fallback_bytes{0}, _st_copy_ns{0};
+    _st_fallback{0}, _st_fallback_bytes{0}, _st_copy_ns{0}, _st_verified{0}, _st_bad{0};
   std::size_t _inflight{0};             // bytes of issued, unfinished reads
   std::deque<queued_batch> _to_issue;  // read batches of granted tasks, in grant order
   std::thread _scheduler;
