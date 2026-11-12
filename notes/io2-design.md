@@ -352,3 +352,13 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
   resident. The harness missed it (row-group tasks are never cut). Fix: batches part only on chunk boundaries (a range that
   starts in the chunk the last one ended in stays in the batch). Harness, one task per file: 390/420 uncovered, 0/30 pinned
   -> 0/420, 30/30.
+- Runs after the batch fix (cold, 100 GiB cache, 256 KiB chunks; arena runs interleaved): cache io215 124.9/124.9, io219
+  125.2/129.0, io220 120.9/117.6 s vs arena io216 128.4/133.0, io218 128.0/122.5, io222 125.0/125.5, io224 118.4/116.0 s:
+  parity (means 123.8 vs 124.6). Per run ~2,750 file reads pinned, ~35 fall back (chunk shared with a neighbouring task and
+  cached with an edge-anchored fill too narrow for it). Waiting for loading chunks before falling back (io221/io223) cost Q1
+  +4 s: reverted. Live tasks at every clear: 0.
+- OPEN: io217 (same build as io215) returned wrong Q4 results then cudaErrorIllegalAddress in materialize; 1 of 6 cache
+  runs with the pinned copy path; none of 79 recent arena/other runs. Not reproduced in the harness with byte verification
+  (row-group and per-file tasks, two concurrent projections of the same files, clears every 50 ms during in-flight reads).
+  Ruled out: pin lifetime (stream synced before release), leftover tasks at clear, double free in reclaim (CAS), per-op
+  completion publishing. Do not use cache mode for results until this is found.

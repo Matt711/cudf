@@ -834,15 +834,27 @@ void scan_io::copy_to_device(task& t, std::uint8_t* dst, cudaStream_t stream)
 std::size_t scan_io::clear_cache()
 {
   auto* cache = _cached ? _context->cache() : nullptr;
-  if (cache != nullptr && std::getenv("CUDF_POLARS_SCAN_IO_STATS") != nullptr) {
+  if (cache == nullptr) { return 0; }
+  // A forced reclaim must not race live requests: wait for every task to be released (an earlier
+  // query's leftover read-ahead is released by its owner, possibly after the query returned).
+  std::size_t live_before = 0;
+  std::size_t live_after  = 0;
+  {
+    std::unique_lock lock(_mutex);
+    live_before = _tasks.size();
+    _cv.wait_for(lock, std::chrono::seconds(30), [&] { return _tasks.empty(); });
+    live_after = _tasks.size();
+  }
+  if (std::getenv("CUDF_POLARS_SCAN_IO_STATS") != nullptr) {
     std::fprintf(stderr,
                  "scan_io stats: prefetch %lu uncovered %lu nohandle %lu pinned %lu fallback %lu "
-                 "(%.2f GB) copy %.2f s\n",
+                 "(%.2f GB) copy %.2f s | live tasks at clear %zu, after wait %zu\n",
                  _st_prefetch.exchange(0), _st_uncovered.exchange(0), _st_nohandle.exchange(0),
                  _st_pinned.exchange(0), _st_fallback.exchange(0),
-                 _st_fallback_bytes.exchange(0) / 1e9, _st_copy_ns.exchange(0) / 1e9);
+                 _st_fallback_bytes.exchange(0) / 1e9, _st_copy_ns.exchange(0) / 1e9,
+                 live_before, live_after);
   }
-  return cache == nullptr ? 0 : cache->reclaim(cucascade::io::cache::reclaim_mode::forced);
+  return cache->reclaim(cucascade::io::cache::reclaim_mode::forced);
 }
 
 void scan_io::release(std::int64_t id)
