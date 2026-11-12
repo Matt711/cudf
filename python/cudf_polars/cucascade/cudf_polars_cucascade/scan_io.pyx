@@ -336,6 +336,8 @@ cdef stage _stage(dict d):
     s.columns = d.get("columns", [])
     s.keys = d.get("keys", [])
     s.sums = d.get("sums", [])
+    s.aggs = d.get("aggs", [])
+    s.agg_types = d.get("agg_types", [])
     return s
 
 

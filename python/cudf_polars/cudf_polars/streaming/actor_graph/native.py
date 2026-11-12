@@ -451,6 +451,13 @@ def _(
 # ---------------------------------------------------------------- native operators
 
 
+def why_python(where: str, ir: IR, reason: object) -> None:
+    """Record why ``ir`` stays in Python, as an I/O trace event (``CUDF_POLARS_IO_TRACE``)."""
+    remote_io.trace(
+        f"python:{where}:{type(ir).__name__}:{reason}", -5, id(ir) & 0xFFFFFF, 0
+    )
+
+
 def native_join_enabled() -> bool:
     """Whether broadcast joins probe natively (``CUDF_POLARS_NATIVE_JOIN=1``)."""
     return os.environ.get("CUDF_POLARS_NATIVE_JOIN") == "1"
@@ -474,7 +481,8 @@ def native_probe_plan(
             builds=builds,
             build_keys=build_keys,
         )
-    except NoMatch:
+    except NoMatch as e:
+        why_python("join", ir, e)
         return None
     return stages, build_keys[0]
 
@@ -539,7 +547,12 @@ def native_chunkwise_plan(nodes: tuple[IR, ...]) -> list[dict[str, Any]] | None:
     """The native stages of a chain of chunkwise nodes, or None when unsupported."""
     try:
         return translate_chunkwise(nodes)
-    except NoMatch:
+    except NoMatch as e:
+        why_python(
+            "chunkwise",
+            nodes[-1],
+            f"{e} in {'/'.join(type(n).__name__ for n in nodes)}",
+        )
         return None
 
 
@@ -587,43 +600,60 @@ def native_piecewise_plan(
     """
     The piecewise group-by of ``ir`` and its native stages, or None.
 
-    Only group-bys whose aggregations are all sums: re-aggregating a sum's partials gives the
-    same sums, so every strategy the group-by actor picks stays correct.
+    Only group-bys whose piecewise aggregations are sums and counts (so also means, which
+    decompose into both): their partials are re-aggregated by sums, so every strategy the
+    group-by actor picks stays correct.
     """
     from cudf_polars.streaming.actor_graph.groupby import (
         DecomposedGroupBy,
     )
 
-    if ir.zlice is not None or not all(
-        isinstance(req.value, E.Agg) and req.value.name == "sum"
-        for req in ir.agg_requests
-    ):
+    if ir.zlice is not None:
+        why_python("groupby", ir, "slice")
         return None
-    piecewise = DecomposedGroupBy.from_ir(ir).piecewise_ir
+    decomposed = DecomposedGroupBy.from_ir(ir)
+    piecewise = decomposed.piecewise_ir
     assert isinstance(piecewise, GroupBy)
-    if not all(isinstance(k.value, E.Col) for k in piecewise.keys) or not all(
-        isinstance(req.value, E.Agg) and req.value.name == "sum"
-        for req in piecewise.agg_requests
-    ):
+    if decomposed.need_preshuffle:
+        why_python("groupby", ir, "needs a preshuffle")
+        return None
+    if not all(isinstance(k.value, E.Col) for k in piecewise.keys):
+        why_python("groupby", ir, "keys are not columns")
         return None
     names = list(piecewise.children[0].schema)
+    # 0: sum, 1: count of non-nulls, 2: count of rows
+    kinds: list[int] = []
+    inputs: list[E.NamedExpr] = []
+    for req in piecewise.agg_requests:
+        value = req.value
+        if isinstance(value, E.Len):
+            kinds.append(2)
+            inputs.append(E.NamedExpr(req.name, piecewise.keys[0].value))
+        elif isinstance(value, E.Agg) and value.name in ("sum", "count"):
+            kinds.append(0 if value.name == "sum" else (2 if value.options else 1))
+            inputs.append(E.NamedExpr(req.name, value.children[0]))
+        else:
+            why_python(
+                "groupby",
+                ir,
+                f"piecewise {getattr(value, 'name', type(value).__name__)}",
+            )
+            return None
     stages: list[dict[str, Any]] = []
     try:
-        values = compute(
-            tuple(
-                E.NamedExpr(req.name, req.value.children[0])
-                for req in piecewise.agg_requests
-            ),
-            names,
-            stages,
-        )
-    except NoMatch:
+        values = compute(tuple(inputs), names, stages)
+    except NoMatch as e:
+        why_python("groupby", ir, e)
         return None
     stages.append(
         {
             "op": "groupby",
             "keys": [names.index(k.value.name) for k in piecewise.keys],
             "sums": [names.index(v) for v in values],
+            "aggs": kinds,
+            "agg_types": [
+                int(req.value.dtype.plc_type.id()) for req in piecewise.agg_requests
+            ],
         }
     )
     return piecewise, stages

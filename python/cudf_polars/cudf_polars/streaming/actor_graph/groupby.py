@@ -957,20 +957,28 @@ async def groupby_actor(
                 partitioning=output_partitioning,
                 duplicated=metadata_in.duplicated,
             )
+            # Partials computed natively are reduced, not aggregated again (a count of
+            # partial counts is not their total).
+            reduce_partials = DecomposedGroupBy.from_ir(ir) if partials_in else None
             await chunkwise_evaluate(
                 context,
-                ir,
+                (reduce_partials.select_ir or reduce_partials.reduction_ir)
+                if reduce_partials is not None
+                else ir,
                 ir_context,
                 ch_out,
                 ch_in,
                 metadata_out,
                 input_metadata=metadata_in,
                 tracer=tracer,
+                fused=(reduce_partials.reduction_ir,)
+                if reduce_partials is not None and reduce_partials.select_ir
+                else (),
             )
             return
 
         decomposed = DecomposedGroupBy.from_ir(ir)
-        # Sums only: re-aggregating partials elsewhere stays correct.
+        # Sums and counts only: their partials are re-aggregated by sums.
         decomposed.partials_in = partials_in
         assert not decomposed.need_preshuffle, "Should already be shuffled."
 

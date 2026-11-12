@@ -656,6 +656,16 @@ async def broadcast_join(
     # permits a consumer to reuse the collective ID after receiving metadata.
     await send_metadata(ch_out, context, metadata_out)
 
+    if native.native_join_enabled() and (
+        prefilter_statistics is not None or len(small_dfs) != 1
+    ):
+        native.why_python(
+            "join",
+            ir,
+            "prefilter statistics"
+            if prefilter_statistics is not None
+            else f"{len(small_dfs)} build chunks",
+        )
     if (
         native.native_join_enabled()
         and prefilter_statistics is None

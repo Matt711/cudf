@@ -81,9 +81,13 @@ struct stage {
   std::vector<std::vector<expr_node>> exprs;
   // select
   std::vector<int> columns;
-  // groupby (last stage): sum of each value column per key
+  // groupby (last stage): an aggregation of each value column per key; a sum unless `aggs` names
+  // another kind per value (0 sum, 1 count of non-nulls, 2 count of rows), cast to `agg_types`
+  // where one is given (a cudf type id, -1 to keep the result's type)
   std::vector<int> keys;
   std::vector<int> sums;
+  std::vector<int> aggs;
+  std::vector<int> agg_types;
 };
 
 /** @brief A build table and the hash table built on its key columns. */

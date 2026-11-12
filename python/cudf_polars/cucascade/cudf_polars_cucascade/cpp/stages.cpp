@@ -29,24 +29,55 @@ double now()
     .count();
 }
 
-std::unique_ptr<cudf::table> sum_by_keys(cudf::table_view keys,
-                                         std::vector<cudf::column_view> const& values,
-                                         ::cuda::stream_ref stream)
+std::unique_ptr<cudf::table> aggregate_by_keys(cudf::table_view keys,
+                                               std::vector<cudf::column_view> const& values,
+                                               std::vector<int> const& aggs,
+                                               std::vector<int> const& agg_types,
+                                               ::cuda::stream_ref stream)
 {
+  CUDF_EXPECTS(aggs.empty() || aggs.size() == values.size(),
+               "native stages: one aggregation per group-by value");
+  CUDF_EXPECTS(agg_types.empty() || agg_types.size() == values.size(),
+               "native stages: one result type per group-by value");
   std::vector<cudf::groupby::aggregation_request> requests;
-  for (auto const& v : values) {
+  for (std::size_t i = 0; i < values.size(); ++i) {
     cudf::groupby::aggregation_request r;
-    r.values = v;
-    r.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+    r.values = values[i];
+    switch (aggs.empty() ? 0 : aggs[i]) {
+      case 0: r.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>()); break;
+      case 1:
+        r.aggregations.push_back(
+          cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE));
+        break;
+      case 2:
+        r.aggregations.push_back(
+          cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE));
+        break;
+      default: CUDF_FAIL("native stages: unknown group-by aggregation");
+    }
     requests.push_back(std::move(r));
   }
   cudf::groupby::groupby gb(keys);
   auto [k, results] = gb.aggregate(requests, stream);
   auto cols         = k->release();
-  for (auto& r : results) {
-    cols.push_back(std::move(r.results.front()));
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    auto result = std::move(results[i].results.front());
+    if (!agg_types.empty() && agg_types[i] >= 0 &&
+        result->type().id() != static_cast<cudf::type_id>(agg_types[i])) {
+      result = cudf::cast(result->view(),
+                          cudf::data_type{static_cast<cudf::type_id>(agg_types[i])},
+                          stream);
+    }
+    cols.push_back(std::move(result));
   }
   return std::make_unique<cudf::table>(std::move(cols));
+}
+
+std::unique_ptr<cudf::table> sum_by_keys(cudf::table_view keys,
+                                         std::vector<cudf::column_view> const& values,
+                                         ::cuda::stream_ref stream)
+{
+  return aggregate_by_keys(keys, values, {}, {}, stream);
 }
 
 }  // namespace
@@ -203,7 +234,8 @@ std::unique_ptr<cudf::table> run_stages(std::vector<stage> const& stages,
         for (auto v : s.sums) {
           values.push_back(view.column(v));
         }
-        current = sum_by_keys(select_columns(view, s.keys), values, stream);
+        current =
+          aggregate_by_keys(select_columns(view, s.keys), values, s.aggs, s.agg_types, stream);
         view    = current->view();
         owned   = true;
         if (counters != nullptr) { timer = &counters->groupby_s; }

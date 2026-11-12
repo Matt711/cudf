@@ -122,6 +122,8 @@ cdef extern from "probe_pipeline.hpp" namespace "cudf_polars_cucascade" nogil:
         vector[int] columns
         vector[int] keys
         vector[int] sums
+        vector[int] aggs
+        vector[int] agg_types
 
     unique_ptr[column] evaluate_expression_on(
         const vector[expr_node]& nodes, table_view table, cudaStream_t stream
