@@ -18,6 +18,9 @@
 #include <cuda/stream>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <array>
 #include <cstring>
 #include <future>
@@ -45,6 +48,7 @@ constexpr std::size_t parquet_trailer_bytes = 8;  // footer length (4) + "PAR1" 
 scan_io::scan_io(scan_io_config const& cfg)
   : _arena_bytes{aligned(cfg.arena_bytes)},
     _cached{cfg.cache_bytes > 0},
+    _chunk_bytes{cfg.cache_bytes > 0 ? cfg.cache_chunk_bytes : 1},
     _inflight_limit{cfg.inflight_bytes}
 {
   cucascade::memory::host_memory_space_config host;
@@ -660,18 +664,30 @@ std::vector<scan_io::read_batch> scan_io::plan_reads(task const& t) const
   // by the reactors, which write the bytes where the slices point.
   std::vector<read_batch> batches;
   std::vector<std::size_t> open(t.objects.size(), SIZE_MAX);  // file -> its open batch
+  // With a cache, batches only part on chunk boundaries: a chunk split between two prefetches is
+  // filled from one edge by whichever claims it, and the other's bytes in it are then not resident.
+  std::vector<std::size_t> last_end(t.objects.size(), SIZE_MAX);  // file -> end of its last slice
   std::size_t pos = t.block_offset;
   for (std::size_t i = 0; i < t.sizes.size(); ++i) {
     auto offset    = t.offsets[i];
     auto remaining = t.sizes[i];
     auto const f   = static_cast<std::size_t>(t.sources[i]);
     while (remaining > 0) {
-      if (open[f] == SIZE_MAX || batches[open[f]].bytes >= batch_bytes) {
+      bool const shares_chunk =
+        last_end[f] != SIZE_MAX && (last_end[f] - 1) / _chunk_bytes == offset / _chunk_bytes;
+      if (open[f] == SIZE_MAX || (batches[open[f]].bytes >= batch_bytes && !shares_chunk)) {
         open[f] = batches.size();
         batches.push_back({f, {}, 0});
       }
-      auto& b          = batches[open[f]];
-      auto const piece = std::min(remaining, batch_bytes - b.bytes);
+      auto& b    = batches[open[f]];
+      auto piece = std::min(remaining, b.bytes < batch_bytes ? batch_bytes - b.bytes : 0);
+      if (piece < remaining) {
+        auto const cut = (offset + piece) / _chunk_bytes * _chunk_bytes;
+        piece          = cut > offset ? cut - offset
+                                      : std::min(remaining, offset / _chunk_bytes * _chunk_bytes +
+                                                              _chunk_bytes - offset);
+      }
+      last_end[f] = offset + piece;
       // With a cache the slices only carry the ranges (the reads land in its chunks).
       static std::uint8_t no_destination;
       b.slices.emplace_back(offset, piece, _arena != nullptr ? _arena + pos : &no_destination);
@@ -696,9 +712,12 @@ void scan_io::issue(queued_batch q)
     // A prefetch that loads nothing (already resident, or refused) is not an error: the decode
     // reads the ranges through the cache either way.
     auto handle = _context->cache()->prefetch_ranges(
-      *q.t->objects[q.batch.file], ranges, [this, t = q.t, bytes](auto const&) noexcept {
+      *q.t->objects[q.batch.file], ranges, [this, t = q.t, bytes](auto const& r) noexcept {
+        _st_prefetch.fetch_add(1, std::memory_order_relaxed);
+        if (!r.covered) { _st_uncovered.fetch_add(1, std::memory_order_relaxed); }
         finish_read(t, bytes, nullptr);
       });
+    if (!handle) { _st_nohandle.fetch_add(1, std::memory_order_relaxed); }
     if (handle) {
       std::lock_guard lock(_mutex);
       q.t->handles.push_back(std::move(handle));
@@ -779,7 +798,8 @@ void scan_io::copy_to_device(task& t, std::uint8_t* dst, cudaStream_t stream)
     }
     pos += t.sizes[i];
   }
-  auto* cache = _context->cache();
+  auto* cache    = _context->cache();
+  auto const t0  = std::chrono::steady_clock::now();
   cucascade::cuda::device_copy_batch copies;
   std::vector<std::future<std::size_t>> reads;
   for (std::size_t f = 0; f < per_file.size(); ++f) {
@@ -789,7 +809,12 @@ void scan_io::copy_to_device(task& t, std::uint8_t* dst, cudaStream_t stream)
         copies.add(p.dst, p.src, p.size);
       }
       t.resident.push_back(std::move(pinned));
+      _st_pinned.fetch_add(1, std::memory_order_relaxed);
       continue;
+    }
+    _st_fallback.fetch_add(1, std::memory_order_relaxed);
+    for (auto const& sl : per_file[f]) {
+      _st_fallback_bytes.fetch_add(sl.size(), std::memory_order_relaxed);
     }
     reads.push_back(cucascade::io::bridge_semi_to_std([&] {
       return cache->device_read_ranges_async(
@@ -800,11 +825,23 @@ void scan_io::copy_to_device(task& t, std::uint8_t* dst, cudaStream_t stream)
   for (auto& r : reads) {
     r.get();
   }
+  _st_copy_ns.fetch_add(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+      .count(),
+    std::memory_order_relaxed);
 }
 
 std::size_t scan_io::clear_cache()
 {
   auto* cache = _cached ? _context->cache() : nullptr;
+  if (cache != nullptr && std::getenv("CUDF_POLARS_SCAN_IO_STATS") != nullptr) {
+    std::fprintf(stderr,
+                 "scan_io stats: prefetch %lu uncovered %lu nohandle %lu pinned %lu fallback %lu "
+                 "(%.2f GB) copy %.2f s\n",
+                 _st_prefetch.exchange(0), _st_uncovered.exchange(0), _st_nohandle.exchange(0),
+                 _st_pinned.exchange(0), _st_fallback.exchange(0),
+                 _st_fallback_bytes.exchange(0) / 1e9, _st_copy_ns.exchange(0) / 1e9);
+  }
   return cache == nullptr ? 0 : cache->reclaim(cucascade::io::cache::reclaim_mode::forced);
 }
 

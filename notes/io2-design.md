@@ -321,3 +321,34 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
 - Matt: cold = cache cleared after every query; lukewarm = not cleared; hot = iteration 1 of lukewarm. The benchmark's
   --io-mode cold never touched the cuCascade cache (it only drops the OS page cache of local files), so earlier "cold" cache
   numbers were lukewarm. Added scan_cache::clear + ScanCache.clear + cucascade.clear_cache(), called by --io-mode cold.
+- Matt's PR cache path (io2 tree, scan service off, 100 GiB cuCascade cache, streaming sink copy on), same day:
+  strict cold (io199, cache cleared before every query): 180.5 s / 169.3 s (both iterations cold), ~1,130 GB per iteration;
+  lukewarm (io200): iteration 0 90.9 s (lukewarm), iteration 1 79.2 s (hot), 509 GB for both. io2 strict cold: 120.4-125.4 s.
+  So io2's scheduler is ~50-60 s faster under strict cold; the cache path already beats 88-89 s lukewarm/hot. Next: io2's
+  scheduler reading through the cache (step b) for both.
+- Step b (io2 scheduler reading through fs_cache: prefetch_ranges + device_read_ranges_async; cudf c3df2559f7, cuCascade 4215b3d):
+  chunk size matters (Q7/Q9 cold: 256 KiB 11.3/12.1 s, 4 MiB 8.9/10.9 s; 16 MiB exhausts the reactor staging pool). Full runs,
+  same day, streaming on: io2 arena cold 126.1/127.3 s (2,174 GB both iterations); io2 through cache cold 151.6/144.9 s (2,435
+  GB: +12% from chunk rounding; download 122 vs 102 s); through cache lukewarm 152.1/132.8 s with 2,205 GB: no reuse (every byte
+  cached, plain LRU at 100 GiB churns ~1 TB per run; no column admission; objects reopened each query). Cache mode is a loss for
+  cold; lukewarm needs admission (Matt's PR path gets ~300 GB lukewarm through column_admission).
+- Why step b was slow (Matt: "it makes no sense"; he was right). Standalone harness svc_cache.py (real lineitem column-chunk
+  ranges, 2,820 tasks / 53 GB, 16 consumer threads, to device), arena 10.6-11.0 GB/s:
+  1. Over-read: a chunk holds an edge-anchored extent, so a range inside a chunk widens to the nearer edge. 4 MiB chunks read
+     22% more bytes (NIC 64.9 vs 53.6 GB); 1 MiB 3%; 256 KiB 0.5%.
+  2. One GET per chunk: fs_cache::prefetch made one slice per chunk, so the REST reactor never merged chunks into its 4-16 MiB
+     segments. 256 KiB chunks fetched at 8.7 GB/s. Fix (cuCascade b5e28dc): contiguous fills join one multi-chunk slice ->
+     11.5 GB/s fetch at 64 KiB and 256 KiB, same as the arena.
+  3. Copy to device: device_read_ranges_async retires every call through cudaStreamAddCallback + a ticket poll (2 waiter
+     threads, backoff to 256 us) and blocks the caller until the copy is done. Resident-only copy rate 13.5 GB/s flat from 4 to
+     64 threads (arena 25-27 in the same harness; raw H2D is 54 GB/s for cudaHostAlloc and registered THP memory alike, one copy
+     or a 256 KiB batch). Fix: fs_cache::pin_resident_ranges + io2 copies the pieces itself in one cudaMemcpyBatchAsync and
+     keeps the pins until release() (cudf 0f779ab5ca), the arena contract.
+  After both: cache 256 KiB 10.9-11.5 GB/s end to end vs arena 10.6-10.8, same NIC bytes, same CPU.
+- Full cold A/B after those fixes (io210-213): cache 132.6/136.2, 127.9/125.4 s vs arena 118.5/117.8, 126.9/122.3 s. Counters
+  (CUDF_POLARS_SCAN_IO_STATS, io214) showed ~92% of prefetches "uncovered" and nearly every file falling back to the blocking
+  device_read_ranges_async: plan_reads cut a big task's ranges into 64 MiB batches at arbitrary offsets, so two prefetches
+  shared the chunk at each cut; the first filled it from one edge, the second skipped it (loading), and its bytes were never
+  resident. The harness missed it (row-group tasks are never cut). Fix: batches part only on chunk boundaries (a range that
+  starts in the chunk the last one ended in stays in the batch). Harness, one task per file: 390/420 uncovered, 0/30 pinned
+  -> 0/420, 30/30.

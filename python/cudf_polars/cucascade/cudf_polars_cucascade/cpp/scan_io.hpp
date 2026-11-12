@@ -19,6 +19,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -311,6 +312,7 @@ class scan_io {
   std::uint8_t* _arena{nullptr};
   std::size_t _arena_bytes{0};
   bool _cached{false};  // reads go through the cuCascade cache
+  std::size_t _chunk_bytes{1};  // the cache's chunk size (1 without a cache)
   std::mutex _mutex;
   std::condition_variable _cv;
   std::unordered_map<std::int64_t, stream_state> _streams;
@@ -324,6 +326,9 @@ class scan_io {
   bool _stop{false};
   std::size_t _fetched_bytes{0};
   std::size_t _inflight_limit{0};
+  // Measurement (CUDF_POLARS_SCAN_IO_STATS): cache-mode outcomes, printed and reset by clear_cache.
+  std::atomic<std::uint64_t> _st_prefetch{0}, _st_uncovered{0}, _st_nohandle{0}, _st_pinned{0},
+    _st_fallback{0}, _st_fallback_bytes{0}, _st_copy_ns{0};
   std::size_t _inflight{0};             // bytes of issued, unfinished reads
   std::deque<queued_batch> _to_issue;  // read batches of granted tasks, in grant order
   std::thread _scheduler;
