@@ -378,3 +378,21 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
 - Tools for the next occurrence: `CUCASCADE_POOL_CHECK=1` (cheap, keep on) and `CUDF_POLARS_SCAN_IO_VERIFY=1`
   (names the file, range, chunk and whether the chunk or the copy was wrong; about 6x slower, so only for a
   targeted repro).
+
+### Tails and a second cache-mode failure (12 Nov 2026, later)
+
+- tcp_slow_start_after_idle=0 (Matt set it): no change. Small-query fetch rate 9.5 GB/s at both settings
+  (dfc1-10 at 1, dfc12-14 at 0).
+- why1 (cache mode, io2z): Q21 iteration 0 hit cudaErrorIllegalAddress in a group-by reduce_by_key; the CUDA
+  context died, so Q21 it1 and Q22 failed too. Pool check silent. Cache mode: 2 failed of 22 runs (io217 Q4,
+  why1 Q21). The chunk checksum check (CUCASCADE_CHUNK_CHECK) is 2-3x slower in full runs: not usable as is.
+- Tail anatomy (dfc1-14, per pass): 13.6 s from last byte to last decode, 9.9 s from last decode to the end.
+  Per query: Q21 3.4 + 0.2, Q18 2.1 + 0.3, Q13 0.9 + 1.7, Q1 1.3 + 0.3; queries already fully native (Q5-Q9)
+  have tails of 0.3-0.6 s.
+- Native group-by of counts and means (1c82a76bd8): all valid, Q1 tail unchanged. Q1's tail is the network:
+  300-650 GETs stay in flight until the last 0.2-0.5 s (drain).
+- S3 GETs (rq1, 787k): total p50 0.11 s, p99 0.48, p99.9 0.84, max 2.2; first byte p99 0.10. 196 over 1 s.
+  Stragglers are rare; drain averages 0.2-0.5 s per query (5.8 s per pass).
+- Q21 and Q18 have mid-query gaps with nothing in flight: their scans fetch a bounded window ahead of
+  consumption, and the consumer is slow. Q21 profile (nsys): 4.9 s of kernels in a 10.1 s run; group-by
+  hash builds 1.45 s (n_unique per l_orderkey on ~60M-row chunks), gathers 0.6 s, spill packing 0.3 s.
