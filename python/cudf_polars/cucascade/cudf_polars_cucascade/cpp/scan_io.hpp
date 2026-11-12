@@ -257,6 +257,8 @@ class scan_io {
     // With a cache: the prefetching requests of the task's reads, which keep their chunks from
     // being reclaimed until the task is released.
     std::vector<std::unique_ptr<cucascade::io::cache::cache_handle>> handles;
+    // With a cache: the chunks the task's copies to device read from, pinned until it is released.
+    std::vector<std::unique_ptr<cucascade::io::cache::fs_cache::resident_ranges>> resident;
   };
 
   struct stream_state {
@@ -290,7 +292,7 @@ class scan_io {
   void issue(queued_batch q);  // no lock
   void finish_read(std::shared_ptr<task> const& t, std::size_t bytes, std::exception_ptr error);
   /// Copy task @p t's bytes, back to back, to @p dst on @p stream (from the arena or the cache).
-  void copy_to_device(task const& t, std::uint8_t* dst, cudaStream_t stream);
+  void copy_to_device(task& t, std::uint8_t* dst, cudaStream_t stream);
   std::shared_ptr<task> find(std::int64_t id);
 
   std::unique_ptr<cucascade::memory::memory_reservation_manager> _memory;

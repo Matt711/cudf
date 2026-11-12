@@ -5,6 +5,7 @@
 
 #include "scan_io.hpp"
 
+#include <cucascade/cuda/device_copy_batch.hpp>
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/details/std_future.hpp>
 #include <cucascade/io/types.hpp>
@@ -757,7 +758,7 @@ std::unique_ptr<rmm::device_buffer> scan_io::to_device(std::int64_t id, cudaStre
   return buf;
 }
 
-void scan_io::copy_to_device(task const& t, std::uint8_t* dst, cudaStream_t stream)
+void scan_io::copy_to_device(task& t, std::uint8_t* dst, cudaStream_t stream)
 {
   if (t.size == 0) { return; }
   if (!_cached) {
@@ -765,8 +766,10 @@ void scan_io::copy_to_device(task const& t, std::uint8_t* dst, cudaStream_t stre
       cudaMemcpyAsync(dst, _arena + t.block_offset, t.size, cudaMemcpyHostToDevice, stream));
     return;
   }
-  // Each range to its place in the block, per file, read through the cache: from its chunks where
-  // resident, from the object store otherwise. Waits for the copies.
+  // Each range to its place in the block, per file. Where every byte of a file's ranges is
+  // resident, as after the task's own prefetch, its chunks stay pinned until the task is released
+  // and one batch copies them without waiting, as from the arena. Otherwise the ranges are read
+  // through the cache (from the object store where not resident), waiting for the copies.
   std::vector<std::vector<cucascade::io::slice>> per_file(t.objects.size());
   std::size_t pos = 0;
   for (std::size_t i = 0; i < t.sizes.size(); ++i) {
@@ -777,14 +780,23 @@ void scan_io::copy_to_device(task const& t, std::uint8_t* dst, cudaStream_t stre
     pos += t.sizes[i];
   }
   auto* cache = _context->cache();
+  cucascade::cuda::device_copy_batch copies;
   std::vector<std::future<std::size_t>> reads;
   for (std::size_t f = 0; f < per_file.size(); ++f) {
     if (per_file[f].empty()) { continue; }
+    if (auto pinned = cache->pin_resident_ranges(*t.objects[f], per_file[f])) {
+      for (auto const& p : pinned->pieces()) {
+        copies.add(p.dst, p.src, p.size);
+      }
+      t.resident.push_back(std::move(pinned));
+      continue;
+    }
     reads.push_back(cucascade::io::bridge_semi_to_std([&] {
       return cache->device_read_ranges_async(
         *t.objects[f], per_file[f], ::cuda::stream_ref{stream});
     }));
   }
+  CUDF_CUDA_TRY(copies.enqueue(::cuda::stream_ref{stream}));
   for (auto& r : reads) {
     r.get();
   }
