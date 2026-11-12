@@ -10,7 +10,16 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 from cudf_polars.dsl import expr as E
-from cudf_polars.dsl.ir import IR, GroupBy, HStack, Join, Projection, Select, Union
+from cudf_polars.dsl.ir import (
+    IR,
+    Filter,
+    GroupBy,
+    HStack,
+    Join,
+    Projection,
+    Select,
+    Union,
+)
 from cudf_polars.dsl.traversal import CachingVisitor, reuse_if_unchanged, traversal
 from cudf_polars.streaming import remote_io
 from cudf_polars.streaming.base import PartitionInfo
@@ -184,6 +193,11 @@ def _translate(
     elif isinstance(node, Select):
         src = compute(node.exprs, names, stages)
         select(src, [ne.name for ne in node.exprs], names, stages)
+    elif isinstance(node, Filter):
+        (mask,) = compute((node.mask,), names, stages)
+        stages.append({"op": "filter", "columns": [names.index(mask)]})
+        cols = list(node.schema)
+        select(cols, cols, names, stages)
     elif isinstance(node, HStack):
         computed = compute(node.columns, names, stages)
         by_name = dict(zip((ne.name for ne in node.columns), computed, strict=True))
@@ -215,7 +229,7 @@ def _translate(
 
 def translate_chunkwise(nodes: tuple[IR, ...]) -> list[dict[str, Any]]:
     """
-    The native stages of a chain of projections, selections and column expressions.
+    The native stages of a chain of projections, selections, filters and column expressions.
 
     ``nodes`` run in order, each on the previous one's output, the first on its child's.
 
@@ -229,7 +243,10 @@ def translate_chunkwise(nodes: tuple[IR, ...]) -> list[dict[str, Any]]:
     names = list(nodes[0].children[0].schema)
     stages: list[dict[str, Any]] = []
     for node in nodes:
-        if not isinstance(node, (Projection, Select, HStack)):
+        if not isinstance(node, (Projection, Select, HStack, Filter)) or (
+            isinstance(node, Filter)
+            and os.environ.get("CUDF_POLARS_NATIVE_FILTER") != "1"
+        ):
             raise NoMatch(type(node).__name__)
         _translate(node, names, stages, [], [], scan=None)  # type: ignore[arg-type]
     if names != list(nodes[-1].schema):

@@ -112,7 +112,10 @@ def compile_expr(e: E.Expr, names: list[str], nodes: list[dict[str, Any]]) -> in
         lhs = compile_expr(e.children[0], names, nodes)
         nodes.append({"op": "cast", "binop": int(e.dtype.plc_type.id()), "lhs": lhs})
     else:
-        raise NoMatch(f"expression {type(e).__name__}")
+        name = getattr(e, "name", None)
+        raise NoMatch(
+            f"expression {type(e).__name__}" + (f" {name}" if name is not None else "")
+        )
     return len(nodes) - 1
 
 

@@ -310,7 +310,7 @@ _EXPR_OPS = {
     "str_literal": 5,
     "ternary": 6,
 }
-_STAGE_OPS = {"join": 0, "compute": 1, "select": 2, "groupby": 3}
+_STAGE_OPS = {"join": 0, "compute": 1, "select": 2, "groupby": 3, "filter": 4}
 
 
 cdef vector[expr_node] _expr(list nodes):

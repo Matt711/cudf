@@ -69,7 +69,7 @@ inline std::unique_ptr<cudf::column> evaluate_expression_on(std::vector<expr_nod
 
 /** @brief One step of a chain, applied to each chunk in order. */
 struct stage {
-  enum kind : int { join = 0, compute = 1, select = 2, groupby = 3 };
+  enum kind : int { join = 0, compute = 1, select = 2, groupby = 3, filter = 4 };
   int op{select};
   // join: inner join against a build table; the output is the kept probe columns, then the kept
   // build columns.
@@ -79,7 +79,8 @@ struct stage {
   std::vector<int> keep_build;
   // compute: one appended column per expression
   std::vector<std::vector<expr_node>> exprs;
-  // select
+  // select: the columns to keep, in order; filter: the boolean mask column (rows where it is
+  // false or null are dropped, every column is kept)
   std::vector<int> columns;
   // groupby (last stage): an aggregation of each value column per key; a sum unless `aggs` names
   // another kind per value (0 sum, 1 count of non-nulls, 2 count of rows), cast to `agg_types`

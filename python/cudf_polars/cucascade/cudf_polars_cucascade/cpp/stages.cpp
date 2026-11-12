@@ -12,6 +12,7 @@
 #include <cudf/datetime.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -227,6 +228,14 @@ std::unique_ptr<cudf::table> run_stages(std::vector<stage> const& stages,
       case stage::select: {
         view  = select_columns(view, s.columns);
         owned = false;
+        break;
+      }
+      case stage::filter: {
+        CUDF_EXPECTS(s.columns.size() == 1, "native stages: a filter has one mask column");
+        current = cudf::apply_boolean_mask(view, view.column(s.columns.front()), stream);
+        view    = current->view();
+        owned   = true;
+        if (counters != nullptr) { timer = &counters->compute_s; }
         break;
       }
       case stage::groupby: {
