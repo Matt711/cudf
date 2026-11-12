@@ -362,3 +362,19 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
   (row-group and per-file tasks, two concurrent projections of the same files, clears every 50 ms during in-flight reads).
   Ruled out: pin lifetime (stream synced before release), leftover tasks at clear, double free in reclaim (CAS), per-op
   completion publishing. Do not use cache mode for results until this is found.
+
+### io217 follow-up (12 Nov 2026)
+
+- dfc1..dfc8: eight more cache-mode runs (io2z: current code + `CUCASCADE_POOL_CHECK=1`), all valid; no chunk
+  buffer was handed out twice or returned twice. Cache-mode total: 14 valid of 15. Times 116.7 to 137.9 s.
+- No clear ever overlapped a live task (528 clears, all `live tasks at clear 0`), so the clear-wait changed nothing.
+- io217 failed both Q4 iterations with a cache clear between them, while Q3 (same `orders` files, other columns)
+  passed twice. Footers are cleared each query (`begin_query`), so they are not the persistent state. What
+  survives a clear: fs_cache generations (strong S3 ETags keep them across queries), the buffer pool,
+  completion lanes, reactor connections.
+- Reviewed, no defect found: pin_resident_ranges addressing (same as the existing device path), REST fill
+  mapping of coalesced slices (fills are fixed while loading), stream_copy (ends in sfence), eviction-loop
+  buffer lists (cleared each round), every `release()` caller (all synchronize first).
+- Tools for the next occurrence: `CUCASCADE_POOL_CHECK=1` (cheap, keep on) and `CUDF_POLARS_SCAN_IO_VERIFY=1`
+  (names the file, range, chunk and whether the chunk or the copy was wrong; about 6x slower, so only for a
+  targeted repro).
