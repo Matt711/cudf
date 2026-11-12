@@ -32,4 +32,6 @@ std::vector<cucascade::io::column_stats> scan_cache::stats() const { return _cor
 
 std::string scan_cache::summary() const { return _core.summary(); }
 
+std::size_t scan_cache::clear() { return _core.clear(); }
+
 }  // namespace cudf_polars_cucascade

@@ -57,3 +57,4 @@ cdef extern from "scan_cache.hpp" namespace "cudf_polars_cucascade" nogil:
         ) except +libcucascade_exception_handler
         vector[column_stats] stats() except +libcucascade_exception_handler const
         string summary() except +libcucascade_exception_handler const
+        size_t clear() except +libcucascade_exception_handler

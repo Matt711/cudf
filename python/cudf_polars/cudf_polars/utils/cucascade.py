@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 __all__ = [
+    "clear_cache",
     "configure_cucascade",
     "register_layouts",
     "register_layouts_from_sources",
@@ -106,6 +107,17 @@ def configure_cucascade(cache_bytes: int) -> None:
                 session_token=os.environ.get("AWS_SESSION_TOKEN", ""),
             )
         )
+
+
+def clear_cache() -> int:
+    """
+    Empty the cuCascade cache, if there is one, for a cold query.
+
+    Returns
+    -------
+    Bytes returned to the cache's pool (0 without a cache).
+    """
+    return 0 if _cache is None else int(_cache.clear())
 
 
 def _is_remote(path: str) -> bool:

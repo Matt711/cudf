@@ -301,3 +301,23 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
 - To make it real: (1) inference off the critical path (footers already in flight; bounds cheap), (2) ordered join of
   mismatched chunk boundaries that streams (lineitem files nest 4:1 in orders files), (3) a correct rule for when a scan may
   reorder its tasks. Overlaps rjzamora's upstream work: coordinate before going further.
+
+## 13 Nov: the download is CPU-bound in the I/O stack itself (io192, standalone svc_rate.py)
+- Causal test (scan service alone, engine settings, 64 GB of lineitem): alone 11.7-12.0 GB/s; next to 8 busy cores 10.4-10.7;
+  next to 16 busy cores 9.7-10.1 (in-engine: 10.3). CPU contention alone reproduces the in-engine rate.
+- Full control run with per-thread CPU (io192, 130.2 s): engine (python + rmpf) ~2.6 cores; REST reactor threads 18.8 cores;
+  machine softirq 7.9 cores; machine busy p50 27.7 / p90 31.7 of 32. The I/O stack, not the engine, saturates the box.
+- Standalone service: ~19-23 cores for 11-12 GB/s. Each reactor thread tops out at ~0.8 GB/s on ~1 core; connections per reactor
+  do not matter (32x8 = 32x32). TLS read-ahead (OpenSSL, via CURLOPT_SSL_CTX_FUNCTION; worktree cucascade-readahead, opt-in
+  CUCASCADE_TLS_READ_AHEAD) made it worse: 256 KiB 9.7 GB/s, 1 MiB 6.0 GB/s. Rejected.
+- Kernel profile (kptr_restrict=0 by Matt): copy to user 19%; page zeroing on allocation (kernel_init_pages + page alloc) ~11.5%
+  of the service's CPU (ENA RX ring refill pages are zeroed: CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y); ENA refill/descriptors/DMA ~6%;
+  hardened usercopy checks (check_heap_object, __virt_addr_valid) ~4.3%; user memcpy (curl buffer -> ours) ~15%; AES-GCM ~5%.
+  Boot cmdline has no override. Candidate: boot with init_on_alloc=0 hardened_usercopy=off (needs root + reboot).
+- Streaming-store sink copy (cuCascade worktree cucascade-readahead, CUCASCADE_SINK_STREAM=1): standalone machine CPU 26.7 ->
+  18.7 cores (no-copy ceiling 14.2) at the same rate. glibc's non-temporal threshold never applied (callback chunks <= one TLS
+  record, under its 16 KiB minimum). Full cold pairs (io193-io196, io2m site): 120.4 / 125.4 s vs control 136.2 / 132.8 s, all
+  valid; download 11.26 / 10.65 vs 9.71 / 10.16 GB/s; tails unchanged (~24 s).
+- Matt: cold = cache cleared after every query; lukewarm = not cleared; hot = iteration 1 of lukewarm. The benchmark's
+  --io-mode cold never touched the cuCascade cache (it only drops the OS page cache of local files), so earlier "cold" cache
+  numbers were lukewarm. Added scan_cache::clear + ScanCache.clear + cucascade.clear_cache(), called by --io-mode cold.

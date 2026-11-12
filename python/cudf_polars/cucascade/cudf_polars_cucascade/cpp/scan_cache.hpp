@@ -51,6 +51,13 @@ class scan_cache {
   /** @brief Counters of the prefetching cache (reads, hits, misses, evictions) as text. */
   [[nodiscard]] std::string summary() const;
 
+  /**
+   * @brief Empty the cache (every cached chunk and opened object), for a cold query.
+   *
+   * @return Bytes returned to the pool.
+   */
+  std::size_t clear();
+
  private:
   cucascade::io::scan_cache _core;
 };

@@ -221,3 +221,20 @@ cdef class ScanCache:
         with nogil:
             c_summary = self.c_obj.get().summary()
         return c_summary.decode()
+
+    def clear(self) -> int:
+        """
+        Empty the cache: every cached chunk and every opened object.
+
+        The next reads, footers included, go to the object store, as for a
+        cold query. Call between queries.
+
+        Returns
+        -------
+        int
+            Bytes returned to the pool.
+        """
+        cdef size_t freed
+        with nogil:
+            freed = self.c_obj.get().clear()
+        return freed

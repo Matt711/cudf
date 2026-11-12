@@ -976,6 +976,10 @@ def execute_query(
     """Execute a query with NVTX annotation."""
     if run_config.io_mode == "cold":
         drop_file_page_cache_recursively(run_config.dataset_path)
+        # Cold: no bytes cached by an earlier query, in the cuCascade cache either.
+        from cudf_polars.utils import cucascade
+
+        cucascade.clear_cache()
 
     with nvtx.annotate(
         message=f"Query {q_id} - Iteration {i}",
