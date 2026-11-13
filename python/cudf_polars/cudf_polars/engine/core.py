@@ -31,9 +31,9 @@ from rapidsmpf.statistics import Statistics
 from rapidsmpf.streaming.core.actor import run_actor_network
 
 from cudf_polars.containers import DataFrame
-from cudf_polars.streaming import remote_io
 from cudf_polars.dsl.ir import IRExecutionContext
 from cudf_polars.quent._plan import build_quent_operator_map, emit_plan
+from cudf_polars.streaming import remote_io
 from cudf_polars.streaming.actor_graph.collectives import (
     ReserveOpIDs,
     collective_id_scope,
@@ -951,6 +951,7 @@ def _evaluate_on_rank(
     query_id: uuid.UUID,
 ) -> tuple[DataFrame, list[ChannelMetadata]]:
     stats = allgather_stats(comm, ctx.br(), ir, config_options, py_executor)
+    remote_io.mark("stats")
     # ``get_stable_plan_id`` is a deterministic function of the IR
     # structure, so every rank derives the same logical plan ID for a
     # given query (only rank 0 emits the declaration, but physical plans
@@ -968,6 +969,7 @@ def _evaluate_on_rank(
     lowering, node_map = lower_ir_graph_with_node_map(
         ir, config_options, stats, rank=comm.rank, nranks=comm.nranks
     )
+    remote_io.mark("lowered")
     optimized = lowering.optimized
     ir = lowering.lowered
     partition_info = lowering.partition_info

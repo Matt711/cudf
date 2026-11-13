@@ -41,30 +41,34 @@ class _CollectiveIDPool:
     """Pool of vacant collective IDs."""
 
     def __init__(self) -> None:
+        # The vacant IDs are the released ones plus all of [0, fresh). Every query
+        # makes a pool, and listing the million IDs up front cost ~80 ms each time.
         # Since 3.7, dict.popitem() is guaranteed LIFO.
-        self.vacancy: dict[int, None] = dict.fromkeys(
-            range(Shuffler.max_concurrent_shuffles)
-        )
+        self.released: dict[int, None] = {}
+        self.fresh = Shuffler.max_concurrent_shuffles
         self.lock = threading.Lock()
 
     def acquire_unsafe(self) -> int:
         # Not thread safe, must be called with self.lock held
-        try:
-            # All ranks must choose the same collective IDs during lowering.
-            collective_id, _ = self.vacancy.popitem()
-        except KeyError:
+        # All ranks must choose the same collective IDs during lowering: the most
+        # recently released ID first, then the highest never-used one.
+        if self.released:
+            collective_id, _ = self.released.popitem()
+            return collective_id
+        if self.fresh == 0:
             raise ValueError(
                 f"Cannot shuffle more than {Shuffler.max_concurrent_shuffles} "
                 "times in a single query."
-            ) from None
-        return collective_id
+            )
+        self.fresh -= 1
+        return self.fresh
 
     def release_unsafe(self, collective_id: int) -> None:
         """Release a collective ID back to the vacancy set."""
         # Not thread safe, must be called with self.lock held
-        if collective_id in self.vacancy:
+        if collective_id < self.fresh or collective_id in self.released:
             raise ValueError("Restoring ID that exists")
-        self.vacancy[collective_id] = None
+        self.released[collective_id] = None
 
 
 # Collective IDs are only meaningful relative to a communicator, and all ranks
