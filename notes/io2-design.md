@@ -454,3 +454,18 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
   already-aligned side is replayed in arrival order, and ready-order chunks arrive out of order). Needs: in-order
   delivery for ordered scans, inference off the event loop and vectorized, a streaming ordered join. Overlaps
   rjzamora's upstream work (#25143); diff kept in the scratchpad (ko2_experiment.diff).
+
+### Key-order inference, made to pay (13 Nov 2026, cudf 050a10b032, site io2co)
+- Inferred from footer min/max per row group (fetched inside the query), not declared. Env: CUDF_POLARS_INFER_KEY_ORDER=1
+  CUDF_POLARS_SCAN_IO_FOOTERS_FIRST=1 CUDF_POLARS_SCAN_IO_FOOTER_THREADS=128 (+ ready order).
+- What cost time and the fixes: bounds per task in Python on the event loop, scans one after another (fixed: a few device
+  calls per candidate, own threads); FileMetaData.row_groups builds Python objects per column chunk (~1.4 s per 60-file
+  scan; fixed: ScanIO.key_statistics_usable in C++); lineitem footers queued behind orders data (fixed: all footers first,
+  128 footer threads); ordered scans decoding ahead under ready-order budget -> 77 GB pool, spill packs (fixed: in-order
+  budget, 0.2 for ordered scans); a global DECODE_MEM_FRAC=0.2 cost Q1 ~1.9 s (now ordered scans only); ordered joins of
+  two scans lost to broadcast/shuffle (Q3/5/7/12 +0.3-1.3 s; fixed: only group-by keys, or a join whose other side is
+  that group-by); join pairing assumed in-order arrival (fixed: pair by sequence number).
+- Crash once (kf1, default batch copy): Xid 31 + illegal address in Q18; 12 Q18/Q21 runs and 4 full runs with
+  CUCASCADE_SAFE_COPY=1 clean. Treated as the batch-copy fault, not proven.
+- Full cold alternating (safe copy both): on 113.3 / 121.5 (Q10 outlier 10-12 s, untouched by inference) vs off 116.7 /
+  118.5. Q21 6.3 vs 9.0 s. Q18 even (~6 s): ordered join with orders still serial-ish.
