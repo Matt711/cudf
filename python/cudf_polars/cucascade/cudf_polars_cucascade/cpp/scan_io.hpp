@@ -124,6 +124,14 @@ class scan_io {
   std::vector<std::size_t> projected_bytes(std::vector<std::string> const& paths,
                                            std::vector<std::string> const& columns);
 
+  /**
+   * @brief Per path, from its footer (waiting for it), one byte per row group: 1 when the
+   * statistics of the top-level column @p column can bound it (min and max present and exact, no
+   * nulls), else 0. A path without the column gives 0 for each of its row groups.
+   */
+  std::vector<std::uint8_t> key_statistics_usable(std::vector<std::string> const& paths,
+                                                  std::string const& column);
+
   /** @brief Forget every footer and open object (so the next query fetches them again). */
   void clear_footers();
 

@@ -188,6 +188,18 @@ cdef class ScanIO:
             file = move(self.c_obj.get().footer_file(c_path))
         return (<char*>file.data())[:file.size()]
 
+    def key_statistics_usable(self, paths, str column) -> bytes:
+        """
+        One byte per row group of ``paths`` (in order, waiting for their footers): 1 when the
+        statistics of ``column`` can bound it (min and max present and exact, no nulls).
+        """
+        cdef vector[string] c_paths = [p.encode() for p in paths]
+        cdef string c_column = column.encode()
+        cdef vector[uint8_t] result
+        with nogil:
+            result = self.c_obj.get().key_statistics_usable(c_paths, c_column)
+        return bytes(result)
+
     def clear_cache(self) -> int:
         """Empty the cache, if there is one (a cold query); returns the bytes freed."""
         cdef size_t freed

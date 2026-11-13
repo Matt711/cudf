@@ -370,7 +370,11 @@ class RemoteFetchAhead:
     """Plans a scan's tasks ahead and has the service fetch them, in task order."""
 
     def __init__(
-        self, tasks: Sequence[ScanTask], ir_context: IRExecutionContext
+        self,
+        tasks: Sequence[ScanTask],
+        ir_context: IRExecutionContext,
+        *,
+        ordered: bool = False,
     ) -> None:
         self._tasks = tasks
         self._ir_context = ir_context
@@ -385,15 +389,25 @@ class RemoteFetchAhead:
         self._stream = 0
         self._waiter: ThreadPoolExecutor | None = None
         self._read: dict[int, asyncio.Future] = {}
+        # An ordered scan moves in step with the other side of its ordered join: decoding far
+        # ahead of it only parks chunks on the device (and makes the spill manager pack them).
         self._decode_budget = int(
-            float(os.environ.get("CUDF_POLARS_DECODE_MEM_FRAC", "0.45"))
+            float(
+                os.environ.get("CUDF_POLARS_ORDERED_DECODE_MEM_FRAC", "0.2")
+                if ordered
+                else os.environ.get("CUDF_POLARS_DECODE_MEM_FRAC", "0.45")
+            )
             * _device_total_bytes()
         )
         self._decoding = 0
         self._next_admit = 0
         # Experiment (CUDF_POLARS_SCAN_READY_ORDER): producers claim tasks in the order they land
         # rather than in task order (for a scan whose chunks need no order downstream).
-        self._ready_order = bool(os.environ.get("CUDF_POLARS_SCAN_READY_ORDER"))
+        # An ordered scan (its chunks go out in task order) decodes in task order: decoding ahead
+        # of the order only holds decoded chunks on the device until the earlier ones go.
+        self._ready_order = not ordered and bool(
+            os.environ.get("CUDF_POLARS_SCAN_READY_ORDER")
+        )
         self._claimed: set[int] = set()
         self._unclaimed_lo = 0
         # Plan and queue tasks in the service, without the GIL, in task order (one thread).

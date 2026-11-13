@@ -783,7 +783,9 @@ async def scan_node(
             producer_tasks[producer_id].append((task_idx, task))
 
         dfa = (
-            remote_fetch.RemoteFetchAhead(tasks, ir_context)
+            remote_fetch.RemoteFetchAhead(
+                tasks, ir_context, ordered=lineariser is not None
+            )
             if remote_fetch.enabled(tasks)
             else None
         )

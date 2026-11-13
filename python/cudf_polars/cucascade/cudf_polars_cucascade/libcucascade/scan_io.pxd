@@ -64,6 +64,9 @@ cdef extern from "scan_io.hpp" namespace "cudf_polars_cucascade" nogil:
             const vector[string]& paths, const vector[string]& columns
         ) except +libcucascade_exception_handler
         vector[uint8_t] footer_file(const string& path) except +libcucascade_exception_handler
+        vector[uint8_t] key_statistics_usable(
+            const vector[string]& paths, const string& column
+        ) except +libcucascade_exception_handler
         void clear_footers() except +libcucascade_exception_handler
         size_t clear_cache() except +libcucascade_exception_handler
         size_t arena_bytes()

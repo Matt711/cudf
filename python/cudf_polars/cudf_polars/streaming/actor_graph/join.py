@@ -991,6 +991,14 @@ def _make_ordered_strategy(
     reference = left_ordering if left_ordering.strict_boundaries else right_ordering
     if not reference.strict_boundaries:
         return None
+    if (
+        os.environ.get("CUDF_POLARS_INFER_KEY_ORDER") == "1"
+        and right_ordering.strict_boundaries
+        and right_ordering.num_boundaries > left_ordering.num_boundaries
+    ):
+        # Experiment: align to the finer side. Splitting the coarser side's chunks at its
+        # boundaries streams; merging the finer side's chunks makes partitions several chunks big.
+        reference = right_ordering
 
     reference_key_count = len(reference.keys)
     (
@@ -1095,33 +1103,43 @@ async def _join_chunks(
         future, seq = pending.popleft()
         await send_chunk(context, ch_out, await future, seq, tracer=tracer)
 
-    while True:
-        left_msg, right_msg = await gather_in_task_group(
-            ch_left.recv(context), ch_right.recv(context)
-        )
-        if left_msg is None or right_msg is None:
-            assert left_msg is None, (
-                "Mismatched chunk counts in shuffle join: left has unmatched chunk. "
-                f"Seq num: {left_msg.sequence_number}"
+    # Partitions pair by sequence number: either side may deliver them out of order (an
+    # upstream actor that works on several chunks at once sends each when it is done).
+    waiting: tuple[dict[int, Any], dict[int, Any]] = ({}, {})
+    left_open = right_open = True
+    while left_open or right_open:
+        receives = []
+        if left_open:
+            receives.append(ch_left.recv(context))
+        if right_open:
+            receives.append(ch_right.recv(context))
+        messages = await gather_in_task_group(*receives)
+        sides = [i for i, is_open in enumerate((left_open, right_open)) if is_open]
+        for side, msg in zip(sides, messages, strict=True):
+            if msg is None:
+                if side == 0:
+                    left_open = False
+                else:
+                    right_open = False
+                continue
+            seq = msg.sequence_number
+            other = waiting[1 - side].pop(seq, None)
+            if other is None:
+                waiting[side][seq] = msg
+                continue
+            left_msg, right_msg = (msg, other) if side == 0 else (other, msg)
+            pending.append(
+                (
+                    asyncio.ensure_future(_join_chunk_pair(left_msg, right_msg)),
+                    seq,
+                )
             )
-            assert right_msg is None, (
-                "Mismatched chunk counts in shuffle join: right has unmatched chunk. "
-                f"Seq num: {right_msg.sequence_number}"
-            )
-            break
-        assert left_msg.sequence_number == right_msg.sequence_number, (
-            "Mismatched chunk sequence numbers in shuffle join. "
-            f"Left: {left_msg.sequence_number}, Right: {right_msg.sequence_number}"
-        )
-
-        pending.append(
-            (
-                asyncio.ensure_future(_join_chunk_pair(left_msg, right_msg)),
-                left_msg.sequence_number,
-            )
-        )
-        if len(pending) >= concurrency:
-            await _send_oldest()
+            if len(pending) >= concurrency:
+                await _send_oldest()
+    assert not waiting[0] and not waiting[1], (
+        "Mismatched partitions in shuffle join: "
+        f"left only {sorted(waiting[0])}, right only {sorted(waiting[1])}"
+    )
     while pending:
         await _send_oldest()
 

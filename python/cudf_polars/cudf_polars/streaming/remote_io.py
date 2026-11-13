@@ -573,6 +573,27 @@ def _remote_scan_count(ir: Any) -> int:
     return count
 
 
+def _remote_scan_paths(ir: Any) -> list[str]:
+    """The paths of the plan's remote parquet scans, largest scan first."""
+    from cudf_polars.dsl.traversal import traversal
+    from cudf_polars.streaming.io import ParquetScanTask, StreamingScan
+    from cudf_polars.streaming.native import NativeRegion
+
+    scans: list[list[str]] = []
+    for node in traversal([ir]):
+        scan = node.scan if isinstance(node, NativeRegion) else node
+        if isinstance(scan, StreamingScan):
+            paths = [
+                path
+                for task in scan.tasks
+                if isinstance(task, ParquetScanTask) and eligible(task)
+                for path in task.paths
+            ]
+            scans.append(list(dict.fromkeys(paths)))
+    scans.sort(key=len, reverse=True)
+    return list(dict.fromkeys(path for paths in scans for path in paths))
+
+
 def clear_cache() -> int:
     """Empty the service's cache, if it has one, for a cold query; returns the bytes freed."""
     return 0 if _service is None else int(_service.clear_cache())
@@ -592,6 +613,11 @@ def begin_query(ir: Any = None) -> None:
             _service.set_expected_streams(expected)
         _service.clear_footers()
         _physical_types.cache_clear()
+        if ir is not None and os.environ.get("CUDF_POLARS_SCAN_IO_FOOTERS_FIRST") == "1":
+            # Experiment: every remote footer of the query in flight before any scan's data, so
+            # the scans that wait for all their footers (key-order inference) are not queued
+            # behind the data of the scans that started first.
+            _service.request_footers(_remote_scan_paths(ir))
         _query["index"] += 1
         _query["t0"] = time.perf_counter()
         _channels.clear()

@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import functools
 import os
 from typing import TYPE_CHECKING
 
@@ -67,15 +70,18 @@ def _get_ordering_candidates(
     """
     Return distinct leading keys from explicit ordering hints.
 
-    With ``CUDF_POLARS_INFER_KEY_ORDER=1``, the leading key of a join or group-by
-    (a strict partitioning request) is a candidate too, ascending: when the footer
-    statistics prove the scan is ordered on it with strict boundaries, the consumer
-    runs chunkwise or ordered instead of shuffling.
+    With ``CUDF_POLARS_INFER_KEY_ORDER=1``, the leading key of a group-by (a strict
+    partitioning request) is a candidate too, ascending: when the footer statistics
+    prove the scan is ordered on it with strict boundaries, the group-by runs
+    chunkwise, and joins on the key downstream may run ordered.
     """
     candidates: list[tuple[str, OrderKey]] = []
     for request in requests:
         if isinstance(request, StrictPartitioningRequest):
-            if not (_infer_key_order() and request.keys):
+            # Only a group-by's key: it then runs chunkwise instead of keeping partials of every
+            # key to the end. A join's ordered strategy did not beat broadcast or shuffle (Q3,
+            # Q5, Q7, Q12 at SF1000), and an ordered scan starts later and decodes in order.
+            if not (_infer_key_order() and request.keys and request.from_groupby):
                 continue
             name = request.keys[0]
             if name not in ir.schema:
@@ -105,6 +111,11 @@ def _get_ordering_candidates(
         if candidate not in candidates:
             candidates.append(candidate)
     return candidates
+
+
+@functools.cache
+def _inference_executor() -> concurrent.futures.ThreadPoolExecutor:
+    return concurrent.futures.ThreadPoolExecutor(8, thread_name_prefix="scan-ordering")
 
 
 def _infer_key_order() -> bool:
@@ -315,6 +326,157 @@ def _extract_local_task_bounds(
     return plc.Table(columns)
 
 
+def _key_statistics_usable(
+    paths: list[str],
+    file_metadata: list[plc.io.parquet_metadata.FileMetaData],
+    name: str,
+) -> bool:
+    """Whether every row group's statistics of ``name`` can bound it (exact min/max, no nulls)."""
+    from cudf_polars.streaming import remote_io
+
+    service = remote_io.scan_io()
+    if service is not None and hasattr(service, "key_statistics_usable"):
+        # From the service's parsed footers, without a Python object per column chunk.
+        return all(service.key_statistics_usable(paths, name))
+    if any(name not in metadata.columnchunk_metadata for metadata in file_metadata):
+        return False
+    for metadata in file_metadata:
+        row_groups = metadata.row_groups
+        if not row_groups:
+            continue
+        index = next(
+            (
+                i
+                for i, chunk in enumerate(row_groups[0].columns)
+                if ".".join(chunk.meta_data.path_in_schema) == name
+            ),
+            None,
+        )
+        if index is None:
+            return False
+        for row_group in row_groups:
+            stats = row_group.columns[index].meta_data.statistics
+            if (
+                stats is None
+                or stats.null_count != 0
+                or stats.is_min_value_exact is False
+                or stats.is_max_value_exact is False
+            ):
+                return False
+    return True
+
+
+def _row_group_bounds(
+    paths: list[str],
+    file_metadata: list[plc.io.parquet_metadata.FileMetaData],
+    row_group_count: int,
+    name: str,
+    key: OrderKey,
+    dtype: plc.DataType,
+    stream: Stream,
+) -> plc.Column | None:
+    """
+    Start then end bound (in ``key``'s order) of every rank-local row group, as one column.
+
+    Rows ``[0, n)`` are the starts and ``[n, 2n)`` the ends; None when the footer statistics
+    cannot bound the key (missing, inexact, nulls, or a cast that does not keep the order).
+    """
+    if not file_metadata or not _key_statistics_usable(paths, file_metadata, name):
+        return None
+    bounds = plc.io.parquet_metadata.read_parquet_column_chunk_bounds(
+        file_metadata, columns=[name], stream=stream
+    )
+    min_col, max_col = bounds.columns()[2:]
+    if min_col.size() != row_group_count:
+        return None
+    if min_col.null_count() or max_col.null_count():
+        return None
+    if min_col.type() != dtype:
+        if not is_order_preserving_cast(min_col.type(), dtype):
+            return None
+        min_col = plc.unary.cast(min_col, dtype, stream=stream)
+        max_col = plc.unary.cast(max_col, dtype, stream=stream)
+    start, end = (
+        (max_col, min_col)
+        if key.order == plc.types.Order.DESCENDING
+        else (min_col, max_col)
+    )
+    return plc.concatenate.concatenate([start, end], stream=stream)
+
+
+def _fast_local_task_bounds(
+    ir: StreamingScan,
+    tasks: list[ParquetScanTask],
+    candidates: list[tuple[str, OrderKey]],
+    rank_parquet_info_map: dict[str, CachedParquetInfo],
+    stream: Stream,
+) -> tuple[list[ParquetScanTask], plc.Table]:
+    """
+    Put the tasks in key order and return their bounds, in a few device calls per candidate.
+
+    Like ``_extract_local_task_bounds`` after reordering (experiment, CUDF_POLARS_INFER_KEY_ORDER).
+
+    A candidate's bounds are null unless every row group's ``[start, end]``, in task order, is
+    sorted: each task is then ordered inside and the tasks are ordered among themselves.
+    """
+    paths = list(dict.fromkeys(path for task in tasks for path in task.paths))
+    offsets: dict[str, int] = {}
+    n = 0
+    for path in paths:
+        offsets[path] = n
+        n += len(rank_parquet_info_map[path].file_metadata.row_group_num_rows)
+    groups = [
+        task.absolute_row_group_indices(rank_parquet_info_map, offsets)
+        for task in tasks
+    ]
+    file_metadata = [rank_parquet_info_map[path].file_metadata for path in paths]
+    bounds = [
+        None
+        if any(g is None or not g for g in groups)
+        else _row_group_bounds(
+            paths,
+            file_metadata,
+            n,
+            name,
+            key,
+            ir.schema[name].plc_type,
+            stream,
+        )
+        for name, key in candidates
+    ]
+    if len(tasks) > 1 and bounds[0] is not None:
+        # Files are listed in name order (part.10 before part.2): read them in key order.
+        (first_starts,) = _gather_rows(
+            plc.Table([bounds[0]]), [g[0] for g in groups], stream
+        ).columns()
+        values = first_starts.to_arrow().to_pylist()
+        order = sorted(range(len(tasks)), key=values.__getitem__)
+        if candidates[0][1].order == plc.types.Order.DESCENDING:
+            order.reverse()
+        tasks = [tasks[i] for i in order]
+        groups = [groups[i] for i in order]
+    columns: list[plc.Column] = []
+    for (name, key), column in zip(candidates, bounds, strict=True):
+        if column is not None:
+            (sequence,) = _gather_rows(
+                plc.Table([column]),
+                [i for g in groups for r in g for i in (r, n + r)],
+                stream,
+            ).columns()
+            if plc.sorting.is_sorted(
+                plc.Table([sequence]), [key.order], [key.null_order], stream=stream
+            ):
+                (task_bounds,) = _gather_rows(
+                    plc.Table([column]),
+                    [i for g in groups for i in (g[0], n + g[-1])],
+                    stream,
+                ).columns()
+                columns.append(task_bounds)
+                continue
+        columns.append(_null_column(ir, name, 2 * len(tasks), stream))
+    return tasks, plc.Table(columns)
+
+
 def _partitioning_from_task_bounds(
     context: Context,
     candidates: list[tuple[str, OrderKey]],
@@ -400,24 +562,37 @@ async def parquet_metadata_ordering(
     if not (candidates := _get_ordering_candidates(ir, requests)):
         return None, tasks
 
+    from cudf_polars.streaming import remote_io
+
     paths = list(dict.fromkeys(path for task in tasks for path in task.paths))
-    rank_parquet_info_map = await ir_context.to_thread(
-        _get_rank_parquet_info_map, ir.base_scan, paths
-    )
+    remote_io.trace("ord_begin", -1, len(paths), 0)
+    if _infer_key_order():
+        # Its own threads: the shared executor is busy decoding the scans already started.
+        loop = asyncio.get_running_loop()
+        rank_parquet_info_map = await loop.run_in_executor(
+            _inference_executor(), _get_rank_parquet_info_map, ir.base_scan, paths
+        )
+    else:
+        rank_parquet_info_map = await ir_context.to_thread(
+            _get_rank_parquet_info_map, ir.base_scan, paths
+        )
+    remote_io.trace("ord_footers", -1, len(paths), 0)
     stream = ir_context.get_cuda_stream()
-    local_task_bounds = _extract_local_task_bounds(
-        ir, tasks, candidates, rank_parquet_info_map, stream
-    )
-    if _infer_key_order() and comm.nranks == 1 and len(tasks) > 1:
-        starts = local_task_bounds.columns()[0]
-        if not starts.null_count():
-            values = starts.to_arrow().to_pylist()[0::2]
-            order = sorted(range(len(tasks)), key=values.__getitem__)
-            if order != list(range(len(tasks))):
-                tasks = [tasks[i] for i in order]
-                local_task_bounds = _extract_local_task_bounds(
-                    ir, tasks, candidates, rank_parquet_info_map, stream
-                )
+    if _infer_key_order() and comm.nranks == 1:
+        tasks, local_task_bounds = await loop.run_in_executor(
+            _inference_executor(),
+            _fast_local_task_bounds,
+            ir,
+            tasks,
+            candidates,
+            rank_parquet_info_map,
+            stream,
+        )
+    else:
+        local_task_bounds = _extract_local_task_bounds(
+            ir, tasks, candidates, rank_parquet_info_map, stream
+        )
+    remote_io.trace("ord_bounds", -1, len(paths), 0)
     global_task_bounds = local_task_bounds
     if comm.nranks > 1:
         local_chunk = TableChunk.from_pylibcudf_table(

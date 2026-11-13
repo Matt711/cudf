@@ -16,7 +16,7 @@ tracked separately in ``ChannelMetadata``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from cudf_polars.dsl import expr
@@ -57,6 +57,11 @@ class StrictPartitioningRequest:
     """Request for upstream output to strictly partition equal keys."""
 
     keys: tuple[str, ...]
+    from_groupby: bool = field(default=False, compare=False)
+    """
+    Whether a group-by on the keys asks for it, or a join whose other input is the output of
+    such a group-by (so producing it would let the two meet chunk by chunk).
+    """
 
 
 type OrderRequestSource = Literal["consumer", "hint"]
@@ -117,16 +122,40 @@ def _direct_child_requests(ir: IR) -> list[tuple[IR, PartitioningRequest]]:
         right_keys = _column_names(ir.right_on)
         if left_keys is not None and right_keys is not None:
             return [
-                (ir.children[0], StrictPartitioningRequest(left_keys)),
-                (ir.children[1], StrictPartitioningRequest(right_keys)),
+                (
+                    ir.children[0],
+                    StrictPartitioningRequest(
+                        left_keys,
+                        from_groupby=_grouped_by(ir.children[1], right_keys[0]),
+                    ),
+                ),
+                (
+                    ir.children[1],
+                    StrictPartitioningRequest(
+                        right_keys,
+                        from_groupby=_grouped_by(ir.children[0], left_keys[0]),
+                    ),
+                ),
             ]
 
     if isinstance(ir, GroupBy) and not ir.maintain_order:
         keys = _column_names(ir.keys)
         if keys is not None:
-            return [(ir.children[0], StrictPartitioningRequest(keys))]
+            return [
+                (ir.children[0], StrictPartitioningRequest(keys, from_groupby=True))
+            ]
 
     return []
+
+
+def _grouped_by(ir: IR, name: str) -> bool:
+    """Whether ``ir`` is a group-by led by column ``name``, under row-wise operators."""
+    while isinstance(ir, (Projection, Select, Filter)) and name in ir.schema:
+        ir = ir.children[0]
+    if not isinstance(ir, GroupBy) or ir.maintain_order:
+        return False
+    keys = _column_names(ir.keys)
+    return keys is not None and keys[0] == name
 
 
 def _propagated_child_requests(
@@ -214,7 +243,9 @@ def _remap_request(
             if (new_name := remapping.get(name)) is None:
                 return None
             remapped_names.append(new_name)
-        return StrictPartitioningRequest(tuple(remapped_names))
+        return StrictPartitioningRequest(
+            tuple(remapped_names), from_groupby=request.from_groupby
+        )
 
     remapped_keys = []
     for key in request.keys:
@@ -233,10 +264,11 @@ def _merge_requests(
     """Merge compatible requests, or keep both candidates if incompatible."""
     if isinstance(left, StrictPartitioningRequest):
         if isinstance(right, StrictPartitioningRequest):
+            from_groupby = left.from_groupby or right.from_groupby
             if _is_prefix(left.keys, right.keys):
-                return left
+                return StrictPartitioningRequest(left.keys, from_groupby=from_groupby)
             if _is_prefix(right.keys, left.keys):
-                return right
+                return StrictPartitioningRequest(right.keys, from_groupby=from_groupby)
             return None
         return _merge_order_with_strict(right, left)
 

@@ -328,6 +328,31 @@ std::vector<std::size_t> scan_io::projected_bytes(std::vector<std::string> const
   return result;
 }
 
+std::vector<std::uint8_t> scan_io::key_statistics_usable(std::vector<std::string> const& paths,
+                                                         std::string const& column)
+{
+  std::vector<std::uint8_t> result;
+  for (auto const& path : paths) {
+    auto entry = wait_footer(path);
+    for (auto const& group : entry->metadata->row_groups) {
+      auto const chunk = std::find_if(group.columns.begin(), group.columns.end(), [&](auto const& c) {
+        auto const& name = c.meta_data.path_in_schema;
+        return name.size() == 1 && name.front() == column;
+      });
+      bool usable = false;
+      if (chunk != group.columns.end()) {
+        auto const& stats = chunk->meta_data.statistics;
+        usable = stats.null_count.has_value() && *stats.null_count == 0 &&
+                 (stats.min_value.has_value() || stats.min.has_value()) &&
+                 (stats.max_value.has_value() || stats.max.has_value()) &&
+                 stats.is_min_value_exact.value_or(true) && stats.is_max_value_exact.value_or(true);
+      }
+      result.push_back(usable ? 1 : 0);
+    }
+  }
+  return result;
+}
+
 void scan_io::clear_footers()
 {
   std::lock_guard lock(_footer_mutex);
