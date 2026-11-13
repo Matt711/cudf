@@ -469,3 +469,13 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
   CUCASCADE_SAFE_COPY=1 clean. Treated as the batch-copy fault, not proven.
 - Full cold alternating (safe copy both): on 113.3 / 121.5 (Q10 outlier 10-12 s, untouched by inference) vs off 116.7 /
   118.5. Q21 6.3 vs 9.0 s. Q18 even (~6 s): ordered join with orders still serial-ish.
+
+### Q18 (13 Nov 2026, late): chunkwise concurrency (cudf dd188b4610)
+- With inference Q18 is a chain of chunkwise stages; chunkwise_evaluate ran one chunk at a time per stage (~90 ms per
+  chunk, 60 chunks). CUDF_POLARS_CHUNKWISE_CONCURRENCY=4: Q18 4.88 vs 5.95 s; full cold cw1/cw2 108.1 / 111.6 vs
+  cx1/cx2 114.2 / 108.6 (all valid). Best pass so far 108.1 s; average 109.8: last byte 97.3, byte->decode 5.3,
+  decode->end 7.2 (Q13 1.9, Q18 2.0, Q21 1.0, Q20 0.8).
+- Q18 now waits on the ordered scans' decode admission (shared budget, 0.2 of the device): 0.3 no better, 0.45 worse
+  (9.4-9.8 s, memory pressure). Copy kernel blocks 16/32/64 and the batch copy: no difference (not copy-bound). Both
+  lineitem scans decode the same two columns (the bytes are shared through the cache, the decodes are not).
+- Tag accident: bk1-bk4 (Matt's 9 Nov runs) were overwritten by Q1/Q18/Q21 block tests; only leak-ledger lines remain.
