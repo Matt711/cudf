@@ -429,3 +429,28 @@ C. Full cold runs vs control, tune (reactors/connections, ring size, page size, 
   of the fetch window (any producer), decode budget in claim order, 8 waiter threads per scan. Unordered alone
   (ro1, 130.1 s) does nothing. Cold per pass, alternating, all valid: ready 118.2 / 123.3 / 115.7 (avg 119.1)
   vs control 122.1 / 130.9 / 120.7 (avg 124.6); last byte -> last decode 9.2-10.1 vs 13.1-13.5 s.
+
+### Cold tails and fixed overhead (13 Nov 2026)
+- Fixed overhead per pass (rr4, ready order): planning 1.84 s, polars before the engine 1.0 s, result 0.32 s. The
+  actor network itself ends within ~0.01 s of its last operator.
+- Planning was almost all `_CollectiveIDPool()` (upstream #24547 makes one per query): a dict of all 2^20 collective
+  IDs, ~85 ms to build and ~12 ms to free per query. Lazy pool (same IDs, same order, same errors; fuzzed against
+  the old one), cudf 5cf10d5732: planning 0.69 s, result 0.05 s per pass. Cold cid1 / cid2 114.1 / 116.8 s
+  (all valid, no Xid) vs 115.7-123.3 s. Worth sending upstream.
+- Polars before the engine: ~90 ms per query in iteration 0 only (S3 listing and schema; cached afterwards).
+- Fetch vs line rate (11.7 GB/s): last byte 96.6-98.2 s vs ideal 91.5 s per pass, ~0.3 s per query, mostly the
+  start: first GET ~0.06 s, first bytes ~0.17 s, full rate by ~0.5 s.
+- Q13 (shuffle join after the scan): experiment CUDF_POLARS_LEFT_JOIN_BUILD_LEFT=1 (branch
+  exp/left-join-build-left, bf117fe84c): a left join whose kept side is small builds on it, probes each right chunk
+  during the scan, and sends the unmatched left rows last. Joins do move into the scan, but Q13 ends when the
+  orders decode (o_comment filter) finishes ~1.1 s after its last byte either way: 5.15-8.47 vs 4.91-5.45 s. If
+  the small side's last task lands late, every probe waits for it. Not adopted. Found on the way: broadcast joins
+  passed prebuilt= to JoinWithPrefilter (13 filter-pushdown tests failed), fixed in 6060760fa8.
+- Q18 and Q21 tails (2.6 / 4.1 s): group-bys by l_orderkey over all of lineitem block until the scan ends. Key-order
+  inference (CUDF_POLARS_INFER_KEY_ORDER=1) with ready order: Q21 8.07 / 7.67 s (vs ~8.6) even though inference
+  holds the scans ~1.9 s (footers 0.08-0.3 s; bounds 0.4-0.9 s per 60-file scan in Python on the event loop, and the
+  scans infer one after another). Q18 16.4 / 14.5 s. Aligning ordered joins to the finer side (60 not 15
+  partitions) takes Q18 to 10-11 s, but Q21 then fails: "Mismatched chunk sequence numbers in shuffle join" (an
+  already-aligned side is replayed in arrival order, and ready-order chunks arrive out of order). Needs: in-order
+  delivery for ordered scans, inference off the event loop and vectorized, a streaming ordered join. Overlaps
+  rjzamora's upstream work (#25143); diff kept in the scratchpad (ko2_experiment.diff).
