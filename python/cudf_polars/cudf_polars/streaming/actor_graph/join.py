@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import os
+import threading
 
 from dataclasses import dataclass, replace
 from functools import partial
@@ -563,10 +564,11 @@ async def _broadcast_join_large_chunk_compute(
                 *ir._non_child_args,
                 *([large_df, sdf] if broadcast_side == "right" else [sdf, large_df]),
                 context=ir_context,
-                prebuilt=(
-                    prebuilt[i]
+                # Only Join takes a prebuilt table (not JoinWithPrefilter).
+                **(
+                    {"prebuilt": prebuilt[i]}
                     if prebuilt is not None and dfs_to_join is small_dfs
-                    else None
+                    else {}
                 ),
             )
             join_results.append(result)
@@ -579,6 +581,173 @@ async def _broadcast_join_large_chunk_compute(
     )
     del df, large_df
     return output_chunk
+
+
+async def _left_join_build_left(
+    context: Context,
+    ir: Join,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    right_ch: Channel[TableChunk],
+    left_dfs: list[DataFrame],
+    left_child: IR,
+    right_child: IR,
+    *,
+    tracer: ActorTracer | None,
+) -> None:
+    """
+    Left join whose left side is broadcast (see ``_left_join_builds_left``).
+
+    Each right chunk is inner-joined against a hash table of the left side, and the left rows it
+    matched are or-ed into a mask; after the last chunk, the left rows never matched are sent with
+    null right columns.
+    """
+    stream = ir_context.get_cuda_stream()
+    left_df = (
+        left_dfs[0]
+        if left_dfs
+        else chunk_to_frame(empty_table_chunk(left_child, context, stream), left_child)
+    )
+    left_on, right_on, options, predicate_args = ir._non_child_args
+    inner_options = ("Inner", *options[1:])
+    bool8 = plc.DataType(plc.TypeId.BOOL8)
+
+    def _build() -> tuple[plc.join.HashJoin, plc.Column]:
+        keys = DataFrame(
+            broadcast(
+                *(e.evaluate(left_df) for e in left_on),
+                target_length=left_df.num_rows,
+                stream=left_df.stream,
+            ),
+            stream=left_df.stream,
+        )
+        hash_join = plc.join.HashJoin(
+            keys.table,
+            compare_nulls=plc.types.NullEquality.EQUAL
+            if options[1]
+            else plc.types.NullEquality.UNEQUAL,
+            stream=left_df.stream,
+        )
+        matched = plc.Column.from_scalar(
+            plc.Scalar.from_py(False, bool8, stream=stream),  # noqa: FBT003
+            left_df.num_rows,
+            stream=stream,
+        )
+        left_df.stream.synchronize()  # probes run on other streams
+        return hash_join, matched
+
+    hash_join, matched = await ir_context.to_thread(_build)
+    state = {"matched": matched}
+    lock = threading.Lock()
+    true = plc.Scalar.from_py(True, bool8, stream=stream)  # noqa: FBT003
+    stream.synchronize()
+
+    def _join(right_chunk: TableChunk) -> TableChunk:
+        right_df = chunk_to_frame(right_chunk, right_child)
+        hits: list[tuple[plc.Column, Any]] = []
+
+        def _mark(lg: plc.Column, join_stream: Any) -> None:
+            (hit,) = plc.copying.scatter(
+                [true],
+                lg,
+                plc.Table(
+                    [
+                        plc.Column.from_scalar(
+                            plc.Scalar.from_py(False, bool8, stream=join_stream),  # noqa: FBT003
+                            left_df.num_rows,
+                            stream=join_stream,
+                        )
+                    ]
+                ),
+                stream=join_stream,
+            ).columns()
+            hits.append((hit, join_stream))
+
+        df = _timed_evaluate(
+            ir.do_evaluate,
+            left_on,
+            right_on,
+            inner_options,
+            predicate_args,
+            left_df,
+            right_df,
+            context=ir_context,
+            prebuilt=(hash_join, True),
+            on_left_map=_mark,
+        )
+        for hit, join_stream in hits:
+            join_stream.synchronize()
+            with lock:
+                state["matched"] = plc.binaryop.binary_operation(
+                    state["matched"],
+                    hit,
+                    plc.binaryop.BinaryOperator.LOGICAL_OR,
+                    bool8,
+                    stream=stream,
+                )
+        return TableChunk.from_pylibcudf_table(
+            df.table, df.stream, exclusive_view=True, br=context.br()
+        )
+
+    concurrency = max(1, int(os.environ.get("CUDF_POLARS_JOIN_CONCURRENCY", "1")))
+    pending: collections.deque[tuple[asyncio.Future, int]] = collections.deque()
+    next_seq = 0
+
+    async def _send_oldest() -> None:
+        future, seq = pending.popleft()
+        await send_chunk(context, ch_out, await future, seq, tracer=tracer)
+
+    while (msg := await right_ch.recv(context)) is not None:
+        right_chunk, _ = await make_table_chunks_available_or_wait(
+            context,
+            TableChunk.from_message(msg, br=context.br()),
+            reserve_extra=0,
+            net_memory_delta=missing_net_memory_delta,
+        )
+        next_seq = max(next_seq, msg.sequence_number + 1)
+        pending.append(
+            (
+                asyncio.ensure_future(ir_context.to_thread(_join, right_chunk)),
+                msg.sequence_number,
+            )
+        )
+        if len(pending) >= concurrency:
+            await _send_oldest()
+    while pending:
+        await _send_oldest()
+
+    def _unmatched() -> TableChunk:
+        unmatched = plc.stream_compaction.apply_retention_mask(
+            left_df.table,
+            plc.unary.unary_operation(
+                state["matched"], plc.unary.UnaryOperator.NOT, stream=stream
+            ),
+            stream=stream,
+        )
+        rest = DataFrame.from_table(
+            unmatched, left_df.column_names, left_df.dtypes, stream=stream
+        )
+        empty_right = chunk_to_frame(
+            empty_table_chunk(right_child, context, stream), right_child
+        )
+        # A left join against no rows: the unmatched rows with null right columns.
+        df = ir.do_evaluate(
+            left_on,
+            right_on,
+            options,
+            predicate_args,
+            rest,
+            empty_right,
+            context=ir_context,
+        )
+        return TableChunk.from_pylibcudf_table(
+            df.table, df.stream, exclusive_view=True, br=context.br()
+        )
+
+    await send_chunk(
+        context, ch_out, await ir_context.to_thread(_unmatched), next_seq, tracer=tracer
+    )
+    await ch_out.drain(context)
 
 
 async def broadcast_join(
@@ -625,6 +794,36 @@ async def broadcast_join(
         small_metadata, large_metadata = left_metadata, right_metadata
         local_count = right_metadata.local_count
         partitioning = _remap_join_partitioning(ir, right_metadata, 1, context)
+
+    if ir.options[0] == "Left" and broadcast_side == "left":
+        small_dfs, _ = await _collect_small_side_for_broadcast(
+            context,
+            comm,
+            small_ch,
+            small_child,
+            need_allgather=False,
+            collective_id=collective_id,
+            ir_context=ir_context,
+            must_concatenate=True,
+        )
+        # The unmatched left rows add a chunk, and they follow no partitioning of the right side.
+        await send_metadata(
+            ch_out,
+            context,
+            ChannelMetadata(local_count=local_count + 1, partitioning=None),
+        )
+        await _left_join_build_left(
+            context,
+            ir,
+            ir_context,
+            ch_out,
+            large_ch,
+            small_dfs,
+            small_child,
+            large_child,
+            tracer=tracer,
+        )
+        return
 
     small_duplicated = small_metadata.duplicated
     need_allgather = comm.nranks > 1 and not small_duplicated
@@ -1464,6 +1663,27 @@ def _can_join_build_chunks_separately(
     return not need_allgather and ir.options[0] == "Inner" and ir.options[5] == "none"
 
 
+def _left_join_builds_left(comm: Communicator, ir: Join) -> bool:
+    """
+    Whether a left join may broadcast its left side (experiment, CUDF_POLARS_LEFT_JOIN_BUILD_LEFT=1).
+
+    Every right chunk probes a hash table of the left side as an inner join, marking the left rows
+    it matched; the left rows no chunk matched follow, with null right columns, in one last chunk.
+    One rank only (the matched rows would need a reduction across ranks), and no slice, row order
+    or predicate to honour.
+    """
+    how, _, zlice, _, _, maintain_order = ir.options
+    return (
+        os.environ.get("CUDF_POLARS_LEFT_JOIN_BUILD_LEFT") == "1"
+        and not isinstance(ir, JoinWithPrefilter)
+        and comm.nranks == 1
+        and how == "Left"
+        and zlice is None
+        and maintain_order == "none"
+        and ir._non_child_args[3] is None
+    )
+
+
 def _allow_decomposed_broadcast(
     comm: Communicator,
     ir: Join,
@@ -1551,6 +1771,15 @@ def _choose_strategy_from_samples(
             "Anti",
         )
     )
+
+    if (
+        not can_broadcast_right
+        and allow_broadcast
+        and left_size_ok
+        and _left_join_builds_left(comm, ir)
+    ):
+        # The rows a left join keeps are the small side: build on them instead of shuffling.
+        can_broadcast_left = True
 
     remote_io.trace(
         f"joinplan:{how}:L{int(left_size_ok)}R{int(right_size_ok)}",

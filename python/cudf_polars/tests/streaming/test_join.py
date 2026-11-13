@@ -771,3 +771,37 @@ def test_join_computed_expr_right_key(streaming_engine_factory) -> None:
         right_on=pl.col("full_zip").str.slice(0, 2),
     )
     assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+
+
+@pytest.mark.engine_params(["spmd"])
+@pytest.mark.parametrize("nulls_equal", [False, True])
+def test_left_join_builds_left(streaming_engine_factory, monkeypatch, nulls_equal):
+    """A left join whose left side is the small one builds on it (CUDF_POLARS_LEFT_JOIN_BUILD_LEFT)."""
+    import cudf_polars.streaming.actor_graph.join as join_module
+
+    monkeypatch.setenv("CUDF_POLARS_LEFT_JOIN_BUILD_LEFT", "1")
+    calls = []
+    real = join_module._left_join_build_left
+
+    async def counting(*args, **kwargs):
+        calls.append(1)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(join_module, "_left_join_build_left", counting)
+    engine = streaming_engine_factory(
+        StreamingOptions(max_rows_per_partition=16, broadcast_limit=2_000)
+    )
+    # Left keys 0..29 and a null: some match several right rows, some none.
+    left = pl.LazyFrame(
+        {"k": [*range(30), None], "v": range(31), "a": [i * 10 for i in range(31)]}
+    )
+    right = pl.LazyFrame(
+        {
+            "k": [None if i % 37 == 0 else (i * 7) % 23 for i in range(400)],
+            "v": range(400),
+            "b": [i % 5 for i in range(400)],
+        }
+    )
+    q = left.join(right, on="k", how="left", nulls_equal=nulls_equal)
+    assert_gpu_result_equal(q, engine=engine, check_row_order=False)
+    assert calls

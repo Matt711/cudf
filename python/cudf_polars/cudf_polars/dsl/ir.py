@@ -267,7 +267,6 @@ _BINOPS = {
 }
 
 
-
 _JOIN_PHASES = __import__("os").environ.get("CUDF_POLARS_JOIN_PHASES")
 _join_phase_stats: dict[str, list[float]] = {}
 
@@ -3605,12 +3604,14 @@ class Join(IR):
         *,
         context: IRExecutionContext,
         prebuilt: tuple[plc.join.HashJoin, bool] | None = None,
+        on_left_map: Callable[[plc.Column, Stream], None] | None = None,
     ) -> DataFrame:
         """
         Evaluate and return a dataframe.
 
         ``prebuilt`` is a hash table already built on the build side's keys and whether the build
         side is the left input (an inner or left join probes it instead of building one).
+        ``on_left_map`` is called with the left gather map (and its stream) before the gathers.
         """
         how, nulls_equal, zlice, suffix, coalesce, maintain_order = options
         if how == "Cross":
@@ -3738,7 +3739,9 @@ class Join(IR):
                         hash_join, swap = prebuilt
                         probe = (right_on if swap else left_on).table
                         probe_join = (
-                            hash_join.left_join if how == "Left" else hash_join.inner_join
+                            hash_join.left_join
+                            if how == "Left"
+                            else hash_join.inner_join
                         )
                         maps = probe_join(probe, stream=stream)
                         lg, rg = (maps[1], maps[0]) if swap else maps
@@ -3772,6 +3775,8 @@ class Join(IR):
                             stream=stream,
                         )
                     _join_phase("4 reorder", _t)
+                    if on_left_map is not None:
+                        on_left_map(lg, stream)
                     if coalesce:
                         if how == "Full":
                             # In this case, keys must be column references,
