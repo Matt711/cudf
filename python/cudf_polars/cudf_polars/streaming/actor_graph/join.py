@@ -563,10 +563,11 @@ async def _broadcast_join_large_chunk_compute(
                 *ir._non_child_args,
                 *([large_df, sdf] if broadcast_side == "right" else [sdf, large_df]),
                 context=ir_context,
-                prebuilt=(
-                    prebuilt[i]
+                # Only Join takes a prebuilt table (not JoinWithPrefilter).
+                **(
+                    {"prebuilt": prebuilt[i]}
                     if prebuilt is not None and dfs_to_join is small_dfs
-                    else None
+                    else {}
                 ),
             )
             join_results.append(result)
