@@ -721,6 +721,15 @@ def _sample_channels(t: float) -> None:
             _trace.append((_query["index"], t, "chan", cid, messages, occupancy >> 10))
 
 
+_device_mr: list[Any] = []
+
+
+def track_device_memory(br: Any) -> None:
+    """Sample the device bytes allocated through ``br`` with the I/O trace (when tracing)."""
+    if _TRACE_PATH and not _device_mr:
+        _device_mr.append(br.device_mr_adaptor())
+
+
 def _start_sampler(service: Any) -> None:
     # Every 10 ms: tasks waiting for a block, bytes in flight, bytes queued, free arena bytes.
     if not _TRACE_PATH or _sampler or not hasattr(service, "snapshot"):
@@ -743,6 +752,15 @@ def _start_sampler(service: Any) -> None:
                     )
                 )
                 _sample_channels(t)
+                if _device_mr:
+                    # Device bytes allocated through the engine's resource (MiB).
+                    try:
+                        allocated = _metric(_device_mr[0], "current_allocated")
+                    except Exception:  # noqa: BLE001  (tracing must not stop the sampler)
+                        allocated = -1
+                    _trace.append(
+                        (_query["index"], t, "devmem", -1, -1, int(allocated) >> 20)
+                    )
 
     t = threading.Thread(target=_run, daemon=True, name="io-sampler")
     _sampler.append(t)

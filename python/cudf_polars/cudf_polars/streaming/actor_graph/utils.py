@@ -9,6 +9,7 @@ import contextlib
 import itertools
 import math
 import operator
+import os
 import struct
 import time
 from collections import deque
@@ -821,6 +822,15 @@ async def chunkwise_evaluate(
     )
 
     received_any = False
+    # Experiment (CUDF_POLARS_CHUNKWISE_CONCURRENCY): up to that many chunks evaluate at once
+    # (they are independent); results are still sent in the order the chunks arrived.
+    concurrency = max(1, int(os.environ.get("CUDF_POLARS_CHUNKWISE_CONCURRENCY", "1")))
+    pending: deque[tuple[asyncio.Future, int]] = deque()
+
+    async def _send_oldest() -> None:
+        future, seq = pending.popleft()
+        await send_chunk(context, ch_out, await future, seq, tracer=tracer)
+
     while (msg := await ch_in.recv(context)) is not None:
         received_any = True
         cd = msg.get_content_description()
@@ -836,16 +846,26 @@ async def chunkwise_evaluate(
                     spillable=cd.spillable,
                 ),
             )
-        result = await evaluate_chunk(
-            context,
-            TableChunk.from_message(msg, br=context.br()),
-            *fused,
-            ir,
-            ir_context=chunk_ir_context,
-            ordering_metadata=input_ordering_metadata,
+        pending.append(
+            (
+                asyncio.ensure_future(
+                    evaluate_chunk(
+                        context,
+                        TableChunk.from_message(msg, br=context.br()),
+                        *fused,
+                        ir,
+                        ir_context=chunk_ir_context,
+                        ordering_metadata=input_ordering_metadata,
+                    )
+                ),
+                seq_num,
+            )
         )
         del msg, cd
-        await send_chunk(context, ch_out, result, seq_num, tracer=tracer)
+        if len(pending) >= concurrency:
+            await _send_oldest()
+    while pending:
+        await _send_oldest()
 
     if handle_empty_input and not received_any:
         chunk = empty_table_chunk(
