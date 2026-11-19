@@ -27,7 +27,7 @@ function(find_and_configure_cucascade)
     GIT_REPOSITORY
     https://github.com/Matt711/cuCascade.git
     GIT_TAG
-    6aa45ad9bcb14e85ce3b06e708b675cf70e02485
+    bf46dac66d80ed753e433e8eb127904ee724cdf6
     GIT_SHALLOW
     FALSE
     OPTIONS
