@@ -7,11 +7,11 @@ from __future__ import annotations
 import asyncio
 import collections
 import os
-
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, assert_never
 
+import pylibcudf as plc
 from cudf_streaming import CardinalityEstimator
 from cudf_streaming.channel_metadata import (
     ChannelMetadata,
@@ -33,17 +33,15 @@ from rapidsmpf.streaming.core.memory_reserve_or_wait import (
 )
 from rapidsmpf.streaming.core.message import Message
 
-import pylibcudf as plc
-
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.utils.reshape import broadcast
 from cudf_polars.dsl.ir import IR, Join, Projection
-from cudf_polars.streaming import remote_io
 from cudf_polars.dsl.utils.naming import names_to_indices
+from cudf_polars.dsl.utils.reshape import broadcast
+from cudf_polars.streaming import remote_io
+from cudf_polars.streaming.actor_graph import native
 from cudf_polars.streaming.actor_graph.collectives.allgather import (
     AllGatherManager,
 )
-from cudf_polars.streaming.actor_graph import native
 from cudf_polars.streaming.actor_graph.collectives.ordering import adjust_ordering
 from cudf_polars.streaming.actor_graph.collectives.shuffle import (
     _global_shuffle,
@@ -71,10 +69,10 @@ from cudf_polars.streaming.actor_graph.tracing import send_chunk
 from cudf_polars.streaming.actor_graph.utils import (
     CUDF_ROW_LIMIT,
     MAX_ROWS_PER_PARTITION,
-    PostChannel,
     ChannelManager,
     ChunkSampler,
     ChunkStore,
+    PostChannel,
     TableSample,
     TableSizeStats,
     allgather_reduce,
@@ -476,7 +474,6 @@ async def _collect_small_side_for_broadcast(
                 rows += chunk_rows
             if group:
                 groups.append(group)
-            del chunks
             for group in groups:
                 group_size = sum(chunk.data_alloc_size() for chunk in group)
                 group, extra = await make_table_chunks_available_or_wait(  # noqa: PLW2901
@@ -492,6 +489,7 @@ async def _collect_small_side_for_broadcast(
                             context=ir_context,
                         )
                     )
+                del group
 
     return dfs, size
 
@@ -571,6 +569,7 @@ async def _broadcast_join_large_chunk_compute(
                 ),
             )
             join_results.append(result)
+            del result
 
         df = _concat(*join_results, context=ir_context)
         del join_results
@@ -977,15 +976,11 @@ def _make_ordered_strategy(
     if ir.options[0] not in ("Inner", "Left", "Semi", "Anti"):
         return None
 
-    left_scheme = left_partitioning.inter_rank_scheme
-    right_scheme = right_partitioning.inter_rank_scheme
-    if not isinstance(left_scheme, OrderScheme) or not isinstance(
-        right_scheme, OrderScheme
-    ):
+    left_ordering = left_partitioning.get_ordering(level="flat")
+    right_ordering = right_partitioning.get_ordering(level="flat")
+    if left_ordering is None or right_ordering is None:
         return None
 
-    left_ordering = left_scheme.orderings[0]
-    right_ordering = right_scheme.orderings[0]
     # adjust_ordering needs a strict target partitioning. Prefer the left side
     # for output metadata, then fall back to the right side if only it is strict.
     reference = left_ordering if left_ordering.strict_boundaries else right_ordering

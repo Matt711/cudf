@@ -1005,7 +1005,10 @@ def _evaluate_on_rank(
     if os.environ.get("CUDF_POLARS_PRIORITY_STREAMS"):
         get_cuda_stream = remote_io.priority_streams(get_cuda_stream)
     ir_context = IRExecutionContext(
-        py_executor, get_cuda_stream=get_cuda_stream, query_id=query_id
+        py_executor,
+        get_cuda_stream=get_cuda_stream,
+        query_id=query_id,
+        rank_local_cpu_compute=config_options.executor.rank_local_cpu_compute,
     )
 
     # Remote parquet footers are fetched by the scans themselves, in parallel and without a stage

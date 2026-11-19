@@ -44,7 +44,6 @@ from cudf_polars.streaming.utils import partition_range
 from cudf_polars.utils import cucascade
 from cudf_polars.utils.config import Cluster, HybridScanPassMode
 from cudf_polars.utils.cuda_stream import get_cuda_stream
-from cudf_polars.utils.dtypes import make_empty_column
 
 if TYPE_CHECKING:
     from collections.abc import Hashable, Iterable, Mapping, MutableMapping, Sequence
@@ -1483,7 +1482,7 @@ def _sample_rg_sizes(
     options.set_row_groups(list(samples.values()))
     stream = get_cuda_stream()
     tbl_w_meta = plc.io.parquet.read_parquet(options, stream=stream)
-    result = {
+    return {
         name: column.device_buffer_size() // n_sampled
         for name, column in zip(
             tbl_w_meta.column_names(include_children=False),
@@ -1491,8 +1490,6 @@ def _sample_rg_sizes(
             strict=True,
         )
     }
-    stream.synchronize()
-    return result
 
 
 def _is_fixed_width(dtype: DataType) -> bool:

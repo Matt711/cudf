@@ -40,7 +40,6 @@ if TYPE_CHECKING:
 
     from cudf_polars.dsl.expr import Expr
     from cudf_polars.streaming.io import ParquetScanTask
-    from cudf_polars.typing import Schema
 
 __all__ = [
     "RemotePlan",
@@ -513,6 +512,7 @@ def priority_streams(pool_get: Any) -> Any:
     Returns the operators' stream getter.
     """
     from cuda.bindings import runtime as rt  # noqa: PLC0415
+
     from rmm.pylibrmm.stream import Stream  # noqa: PLC0415
 
     _decode_streams[:] = [pool_get]

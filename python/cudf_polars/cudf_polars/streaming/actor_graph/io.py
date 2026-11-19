@@ -5,11 +5,11 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import dataclasses
 import functools
 import io
 import math
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import polars as pl
@@ -27,18 +27,18 @@ from rapidsmpf.streaming.core.message import Message
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, CallbackSink, DataFrameScan, PythonScan, Sink
+from cudf_polars.streaming import remote_io
+from cudf_polars.streaming.actor_graph import remote_fetch
 from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
     ir_context_for_node,
 )
-from cudf_polars.streaming import remote_io
-from cudf_polars.streaming.actor_graph import remote_fetch
 from cudf_polars.streaming.actor_graph.nodes import define_actor, shutdown_on_error
+from cudf_polars.streaming.actor_graph.partitioning import maybe_remap_partitioning
 from cudf_polars.streaming.actor_graph.scan_ordering import (
     parquet_metadata_ordering,
 )
 from cudf_polars.streaming.actor_graph.tracing import send_chunk
-from cudf_polars.streaming.actor_graph.partitioning import maybe_remap_partitioning
 from cudf_polars.streaming.actor_graph.utils import (
     ChannelManager,
     _evaluate_chunk_sync,
@@ -445,6 +445,7 @@ async def _process_and_send_chunk(
     chunk_out = TableChunk.from_pylibcudf_table(
         df.table, df.stream, exclusive_view=True, br=context.br()
     )
+    del df
     await send_chunk(context, ch_out, chunk_out, seq_num, tracer=tracer)
 
 
@@ -1050,9 +1051,10 @@ async def callback_sink_actor(
 
         try:
             while (msg := await ch_in.recv(context)) is not None:
-                if metadata.duplicated and comm.rank != 0:
-                    continue
-                if consumer is not None and consumer.stopped:
+                if (metadata.duplicated and comm.rank != 0) or (
+                    consumer is not None and consumer.stopped
+                ):
+                    del msg
                     continue
                 chunk = TableChunk.from_message(msg, br=context.br())
                 if consumer is not None:
@@ -1209,6 +1211,7 @@ async def sink_node(
                         df,
                         context=ir_context,
                     )
+                    del chunk, df
                     i += 1
             else:
                 # Write chunks to a single file
@@ -1233,6 +1236,7 @@ async def sink_node(
                         writer_state=writer_state,
                         df=df,
                     )
+                    del chunk, df
 
                 # Finalize the writer after all chunks are processed
                 if writer_state and ir.sink.kind == "Parquet":

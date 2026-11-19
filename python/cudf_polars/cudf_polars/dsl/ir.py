@@ -61,6 +61,7 @@ from cudf_polars.dsl.utils.windows import (
     range_window_bounds,
 )
 from cudf_polars.utils import cucascade, dtypes, sorting
+from cudf_polars.utils.config import RankLocalCPUComputeMode
 from cudf_polars.utils.cuda_stream import (
     get_cuda_stream,
     stream_ordered_after,
@@ -148,6 +149,8 @@ class IRExecutionContext:
         Optional pre-actor Quent tracing context bound to a physical operator.
     tracer
         The actor tracer. Used to propagate statistics.
+    rank_local_cpu_compute
+        When the streaming executor evaluates IR nodes on the CPU with Polars.
     """
 
     py_executor: concurrent.futures.ThreadPoolExecutor | None = field(default=None)
@@ -156,6 +159,7 @@ class IRExecutionContext:
     actor_bound_quent_ir_execution_state: ActorBoundQuentIRExecutionState | None = None
     unbound_quent_ir_execution_state: UnboundQuentIRExecutionState | None = None
     tracer: ActorTracer | None = None
+    rank_local_cpu_compute: RankLocalCPUComputeMode = RankLocalCPUComputeMode.NEVER
 
     async def to_thread[**P, T](
         self, func: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
@@ -267,7 +271,6 @@ _BINOPS = {
 }
 
 
-
 _JOIN_PHASES = __import__("os").environ.get("CUDF_POLARS_JOIN_PHASES")
 _join_phase_stats: dict[str, list[float]] = {}
 
@@ -364,6 +367,14 @@ class IR(Node["IR"]):
     NotImplementedError
         If evaluation fails. Ideally this should not occur, since the
         translation phase should fail earlier.
+
+    Notes
+    -----
+    Implementations must not modify the device data of the input
+    dataframes, and must not add, remove or rename their columns. The
+    only permitted change to an input is recording sortedness metadata
+    that is true of the data, as :meth:`Column.check_sorted` does. The
+    result may share device memory with the inputs.
     """
 
     def evaluate(self, *, cache: CSECache, context: IRExecutionContext) -> DataFrame:
@@ -3208,6 +3219,7 @@ class ConditionalJoin(IR):
             self.predicate = predicate
             stream = get_cuda_stream()
             ast_result = to_ast(predicate, stream=stream)
+            # The AST's literal scalars are later read on other streams.
             stream.synchronize()
             if ast_result is None:
                 raise NotImplementedError(
@@ -3738,7 +3750,9 @@ class Join(IR):
                         hash_join, swap = prebuilt
                         probe = (right_on if swap else left_on).table
                         probe_join = (
-                            hash_join.left_join if how == "Left" else hash_join.inner_join
+                            hash_join.left_join
+                            if how == "Left"
+                            else hash_join.inner_join
                         )
                         maps = probe_join(probe, stream=stream)
                         lg, rg = (maps[1], maps[0]) if swap else maps
