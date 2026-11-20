@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
@@ -776,6 +777,9 @@ def _rescan_instead_of_fanout(
     """
     from cudf_polars.streaming.io import StreamingScan
 
+    # Experiment: CUDF_POLARS_RESCAN=0 turns the rule off (always fan out).
+    if os.environ.get("CUDF_POLARS_RESCAN") == "0":
+        return False
     if not (
         isinstance(ir, StreamingScan)
         and fanout_info.unbounded
