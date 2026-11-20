@@ -278,7 +278,7 @@ _join_phase_stats: dict[str, list[float]] = {}
 def _join_phase(name: str, t: list[float]) -> None:
     # Experiment: wall and thread CPU seconds per Join.do_evaluate phase.
     if _JOIN_PHASES:
-        import time  # noqa: PLC0415
+        import time
 
         now, cpu = time.perf_counter(), time.thread_time()
         rec = _join_phase_stats.setdefault(name, [0.0, 0.0, 0])
@@ -3688,7 +3688,7 @@ class Join(IR):
         else:
             # how != "Cross"
             # TODO: Waiting on clarity based on https://github.com/pola-rs/polars/issues/17184
-            import time as _time  # noqa: PLC0415
+            import time as _time
 
             _t = [_time.perf_counter(), _time.thread_time()]
             left_on = DataFrame(

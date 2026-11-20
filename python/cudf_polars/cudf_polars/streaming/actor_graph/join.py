@@ -126,12 +126,12 @@ _eval_stats = collections.Counter()
 def _timed_evaluate(fn: Any, *args: Any, **kwargs: Any) -> Any:
     # Experiment: wall vs this thread's CPU time per join evaluation (CPU << wall: waiting on the
     # GIL or on a stream; CPU ~ wall: busy in Python or host code).
-    import time  # noqa: PLC0415
+    import time
 
     t0, c0 = time.perf_counter(), time.thread_time()
     profile = None
     if os.environ.get("CUDF_POLARS_JOIN_CPROFILE") and _eval_stats["calls"] % 10 == 0:
-        import cProfile  # noqa: PLC0415
+        import cProfile
 
         profile = cProfile.Profile()
         profile.enable()
@@ -159,7 +159,7 @@ _profiles_lock = __import__("threading").Lock()
 
 def _dump_eval_stats() -> None:
     if (path := os.environ.get("CUDF_POLARS_JOIN_CPROFILE")) and _profiles:
-        import pstats  # noqa: PLC0415
+        import pstats
 
         stats = pstats.Stats(_profiles[0])
         for profile in _profiles[1:]:

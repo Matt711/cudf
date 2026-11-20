@@ -610,7 +610,7 @@ class PostChannel:
         return getattr(self._ch, name)
 
     async def send_metadata(self, ctx: Context, msg: Message) -> None:
-        from cudf_polars.streaming.actor_graph.partitioning import (  # noqa: PLC0415
+        from cudf_polars.streaming.actor_graph.partitioning import (
             maybe_remap_partitioning,
         )
 

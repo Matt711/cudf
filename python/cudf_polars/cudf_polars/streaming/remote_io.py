@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
 Remote parquet scans read with cuCascade's REST engine, fetched ahead of their decode.
@@ -74,7 +74,7 @@ def configure_scan_io(
     global _service  # noqa: PLW0603
     with _service_lock:
         if _service is None:
-            from cudf_polars_cucascade.scan_io import ScanIO  # noqa: PLC0415
+            from cudf_polars_cucascade.scan_io import ScanIO
 
             region = os.environ.get("AWS_REGION") or os.environ.get(
                 "AWS_DEFAULT_REGION", "us-east-1"
@@ -140,7 +140,7 @@ def _physical_types(path: str) -> dict[str, plc.DataType]:
 
 
 def _predicate(task: ParquetScanTask, columns: list[str] | None) -> Expr:
-    import polars as pl  # noqa: PLC0415
+    import polars as pl
 
     base_scan = task.base_scan
     predicate = base_scan.predicate.value
@@ -285,7 +285,7 @@ def plan(task: ParquetScanTask, stream: Stream) -> RemotePlan:
         for name in columns:
             try:
                 fixed = rows * plc.types.size_of(base_scan.schema[name].plc_type)
-            except Exception:  # noqa: BLE001  (strings and nested types: offsets plus data)
+            except Exception:
                 fixed = rows * 16
             sizes = uncompressed.get(name, ())
             decoded += max(fixed, sum(sizes[rg] for rg in rgs if rg < len(sizes)))
@@ -370,8 +370,8 @@ def materialize_native(
     task: ParquetScanTask, plan: NativePlan, stream: Stream
 ) -> DataFrame:
     """Decode a natively planned task (in the service, without the GIL)."""
-    from cudf_polars.dsl.expr import NamedExpr  # noqa: PLC0415
-    from cudf_polars.dsl.ir import apply_predicate  # noqa: PLC0415
+    from cudf_polars.dsl.expr import NamedExpr
+    from cudf_polars.dsl.ir import apply_predicate
 
     base_scan = task.base_scan
     schema = base_scan.schema
@@ -416,8 +416,8 @@ def materialize(
     task: ParquetScanTask, plan: RemotePlan, block: Any, stream: Stream
 ) -> DataFrame:
     """Decode a task from its staged bytes, copied to the device buffer ``block``."""
-    from cudf_polars.dsl.expr import NamedExpr  # noqa: PLC0415
-    from cudf_polars.dsl.ir import apply_predicate  # noqa: PLC0415
+    from cudf_polars.dsl.expr import NamedExpr
+    from cudf_polars.dsl.ir import apply_predicate
 
     base_scan = task.base_scan
     schema = base_scan.schema
@@ -511,9 +511,9 @@ def priority_streams(pool_get: Any) -> Any:
     (the lowest priority), so join and aggregation kernels are not queued behind decodes.
     Returns the operators' stream getter.
     """
-    from cuda.bindings import runtime as rt  # noqa: PLC0415
+    from cuda.bindings import runtime as rt
 
-    from rmm.pylibrmm.stream import Stream  # noqa: PLC0415
+    from rmm.pylibrmm.stream import Stream
 
     _decode_streams[:] = [pool_get]
     if not _priority_pool:
@@ -613,7 +613,10 @@ def begin_query(ir: Any = None) -> None:
             _service.set_expected_streams(expected)
         _service.clear_footers()
         _physical_types.cache_clear()
-        if ir is not None and os.environ.get("CUDF_POLARS_SCAN_IO_FOOTERS_FIRST") == "1":
+        if (
+            ir is not None
+            and os.environ.get("CUDF_POLARS_SCAN_IO_FOOTERS_FIRST") == "1"
+        ):
             # Experiment: every remote footer of the query in flight before any scan's data, so
             # the scans that wait for all their footers (key-order inference) are not queued
             # behind the data of the scans that started first.
@@ -708,13 +711,13 @@ def _metric(m: Any, name: str) -> Any:
 
 def _sample_channels(t: float) -> None:
     # Per channel, when it changed: messages sent so far and bytes in it (sent - received).
-    for cid, channel, last in list(_channels):
+    for cid, channel, last in _channels:
         try:
             m = channel.metrics()
             sent = sum(_metric(m, "send_bytes").values())
             occupancy = sent - sum(_metric(m, "recv_bytes").values())
             messages = _metric(m, "message_count")
-        except Exception:  # noqa: BLE001  (a closed channel; tracing must not fail the query)
+        except Exception:
             continue
         if [messages, occupancy] != last:
             last[:] = [messages, occupancy]
@@ -756,7 +759,7 @@ def _start_sampler(service: Any) -> None:
                     # Device bytes allocated through the engine's resource (MiB).
                     try:
                         allocated = _metric(_device_mr[0], "current_allocated")
-                    except Exception:  # noqa: BLE001  (tracing must not stop the sampler)
+                    except Exception:
                         allocated = -1
                     _trace.append(
                         (_query["index"], t, "devmem", -1, -1, int(allocated) >> 20)
