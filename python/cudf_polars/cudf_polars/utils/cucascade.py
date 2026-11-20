@@ -97,8 +97,15 @@ def configure_cucascade(cache_bytes: int) -> None:
             or os.environ.get("AWS_REGION")
             or "us-east-1"
         )
+        # Experiment: override cuCascade's transport and admission defaults.
+        overrides = {
+            name: int(os.environ[f"CUDF_POLARS_CUCASCADE_{name.upper()}"])
+            for name in ("reactors", "connections", "min_advise_bytes")
+            if f"CUDF_POLARS_CUCASCADE_{name.upper()}" in os.environ
+        }
         _cache = module.ScanCache(
             module.ScanCacheConfig(
+                **overrides,
                 cache_bytes=cache_bytes,
                 endpoint=f"https://s3.{region}.amazonaws.com",
                 region=region,
